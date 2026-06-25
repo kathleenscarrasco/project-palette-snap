@@ -1,7 +1,9 @@
-import { createFileRoute, Link } from "@tanstack/react-router";
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { motion } from "framer-motion";
-import { ArrowRight, Sparkles, Heart, Shuffle, Upload, Wand2, Hand, Film } from "lucide-react";
+import { ArrowRight, Sparkles, Heart, Shuffle, Upload, Wand2, Hand, Film, LogOut } from "lucide-react";
+import { useEffect } from "react";
 import { BrandMark, BrandWordmark } from "@/components/dumpdeck/brand";
+import { useAuth } from "@/hooks/use-auth";
 
 export const Route = createFileRoute("/")({
   head: () => ({
