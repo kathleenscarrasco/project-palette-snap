@@ -11,8 +11,6 @@ import { useEffect, type ReactNode } from "react";
 
 import appCss from "../styles.css?url";
 import { reportLovableError } from "../lib/lovable-error-reporting";
-import { AuthProvider } from "@/hooks/use-auth";
-import { Toaster } from "@/components/ui/sonner";
 
 function NotFoundComponent() {
   return (
@@ -78,25 +76,24 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
   head: () => ({
     meta: [
       { charSet: "utf-8" },
-      { name: "viewport", content: "width=device-width, initial-scale=1" },
-      { title: "Lovable App" },
-      { name: "description", content: "Project Sanctuary allows users to securely save, view, edit, and delete personal projects using Supabase authentication and database." },
-      { name: "author", content: "Lovable" },
-      { property: "og:title", content: "Lovable App" },
-      { property: "og:description", content: "Project Sanctuary allows users to securely save, view, edit, and delete personal projects using Supabase authentication and database." },
+      { name: "viewport", content: "width=device-width, initial-scale=1, viewport-fit=cover" },
+      { title: "dumpify — Turn 200 photos into the perfect photo dump" },
+      { name: "description", content: "AI-powered photo dump curator. Upload, narrow down, swipe, and order the perfect Instagram carousel." },
+      { name: "author", content: "dumpify" },
+      { property: "og:title", content: "dumpify — Turn 200 photos into the perfect photo dump" },
+      { property: "og:description", content: "AI-powered photo dump curator. Upload, narrow down, swipe, and order the perfect Instagram carousel." },
       { property: "og:type", content: "website" },
-      { name: "twitter:card", content: "summary" },
-      { name: "twitter:site", content: "@Lovable" },
-      { name: "twitter:title", content: "Lovable App" },
-      { name: "twitter:description", content: "Project Sanctuary allows users to securely save, view, edit, and delete personal projects using Supabase authentication and database." },
-      { property: "og:image", content: "https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/fc9381e8-83c1-4aef-a28b-40d2db9f387b/id-preview-b85315e2--14f054b9-4b86-4fb7-aab2-3c2f6b360e58.lovable.app-1782414287090.png" },
-      { name: "twitter:image", content: "https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/fc9381e8-83c1-4aef-a28b-40d2db9f387b/id-preview-b85315e2--14f054b9-4b86-4fb7-aab2-3c2f6b360e58.lovable.app-1782414287090.png" },
+      { name: "twitter:card", content: "summary_large_image" },
+      { name: "twitter:title", content: "dumpify — Turn 200 photos into the perfect photo dump" },
+      { name: "twitter:description", content: "AI-powered photo dump curator. Upload, narrow down, swipe, and order the perfect Instagram carousel." },
     ],
     links: [
-      {
-        rel: "stylesheet",
-        href: appCss,
-      },
+      { rel: "stylesheet", href: appCss },
+      { rel: "icon", href: "/favicon.svg", type: "image/svg+xml" },
+      { rel: "apple-touch-icon", href: "/favicon.svg" },
+      { rel: "preconnect", href: "https://fonts.googleapis.com" },
+      { rel: "preconnect", href: "https://fonts.gstatic.com", crossOrigin: "anonymous" },
+      { rel: "stylesheet", href: "https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&display=swap" },
     ],
   }),
   shellComponent: RootShell,
@@ -124,10 +121,8 @@ function RootComponent() {
 
   return (
     <QueryClientProvider client={queryClient}>
-      <AuthProvider>
-        <Outlet />
-        <Toaster />
-      </AuthProvider>
+      {/* Required: nested routes render here. Removing <Outlet /> breaks all child routes. */}
+      <Outlet />
     </QueryClientProvider>
   );
 }
