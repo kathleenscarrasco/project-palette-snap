@@ -1,237 +1,161 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
-import { supabase, type SavedProject } from "@/integrations/supabase/client";
-import { useAuth } from "@/hooks/use-auth";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Textarea } from "@/components/ui/textarea";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import {
-  Dialog,
-  DialogContent,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
-import { toast } from "sonner";
-import { Pencil, Trash2, Plus, LogOut } from "lucide-react";
+import { motion } from "framer-motion";
+import { ArrowRight, Sparkles, Heart, Shuffle, Upload, Wand2, Hand, Film } from "lucide-react";
+import { BrandMark, BrandWordmark } from "@/components/dumpdeck/brand";
 
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
-      { title: "Photo Perfector" },
-      { name: "description", content: "Save and manage your projects." },
+      { title: "dumpify — Turn 200 photos into the perfect photo dump" },
+      {
+        name: "description",
+        content:
+          "AI-powered photo dump curator. Upload many photos, narrow them down, swipe what stays, and let AI order your Instagram carousel.",
+      },
+      { property: "og:title", content: "dumpify — Curate your photo dump" },
+      {
+        property: "og:description",
+        content: "Turn 200 photos into the perfect 10-image Instagram carousel.",
+      },
     ],
   }),
-  component: Index,
+  component: Landing,
 });
 
-function Index() {
-  const { user, loading } = useAuth();
-
-  if (loading) {
-    return (
-      <div className="flex min-h-screen items-center justify-center text-muted-foreground">
-        Loading…
-      </div>
-    );
-  }
-
-  if (!user) {
-    return (
-      <div className="flex min-h-screen flex-col items-center justify-center bg-background p-6 text-center">
-        <h1 className="text-3xl font-bold tracking-tight">Photo Perfector</h1>
-        <p className="mt-2 max-w-md text-muted-foreground">
-          Sign in to view and manage your saved projects.
-        </p>
-        <Button asChild className="mt-6">
-          <Link to="/auth">Sign in</Link>
-        </Button>
-      </div>
-    );
-  }
-
-  return <Dashboard />;
-}
-
-function Dashboard() {
-  const { user } = useAuth();
-  const [projects, setProjects] = useState<SavedProject[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [createOpen, setCreateOpen] = useState(false);
-  const [editing, setEditing] = useState<SavedProject | null>(null);
-
-  const refresh = async () => {
-    setLoading(true);
-    const { data, error } = await supabase
-      .from("saved_projects")
-      .select("*")
-      .order("created_at", { ascending: false });
-    if (error) toast.error(error.message);
-    else setProjects((data ?? []) as SavedProject[]);
-    setLoading(false);
-  };
-
-  useEffect(() => {
-    refresh();
-  }, []);
-
-  const handleSignOut = async () => {
-    await supabase.auth.signOut();
-    toast.success("Signed out");
-  };
-
-  const handleDelete = async (id: string) => {
-    if (!confirm("Delete this project?")) return;
-    const { error } = await supabase.from("saved_projects").delete().eq("id", id);
-    if (error) return toast.error(error.message);
-    toast.success("Deleted");
-    refresh();
-  };
-
+function Landing() {
   return (
-    <div className="min-h-screen bg-background">
-      <header className="border-b">
-        <div className="mx-auto flex max-w-4xl items-center justify-between px-6 py-4">
-          <h1 className="text-xl font-semibold">Photo Perfector</h1>
-          <div className="flex items-center gap-3">
-            <span className="hidden text-sm text-muted-foreground sm:inline">{user?.email}</span>
-            <Button variant="outline" size="sm" onClick={handleSignOut}>
-              <LogOut className="mr-2 h-4 w-4" />
-              Sign out
-            </Button>
+    <main className="relative min-h-screen overflow-hidden px-5 pb-16 pt-8">
+      {/* floating blobs */}
+      <div className="pointer-events-none absolute -left-20 top-20 h-72 w-72 rounded-full bg-coral/30 blur-3xl animate-blob" />
+      <div className="pointer-events-none absolute -right-16 top-60 h-80 w-80 rounded-full bg-lavender/40 blur-3xl animate-blob" style={{ animationDelay: "-5s" }} />
+      <div className="pointer-events-none absolute bottom-0 left-1/3 h-72 w-72 rounded-full bg-mint/40 blur-3xl animate-blob" style={{ animationDelay: "-9s" }} />
+
+      <div className="mx-auto max-w-md">
+        <header className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <BrandMark className="h-9 w-9" />
+            <BrandWordmark size="text-xl" />
           </div>
-        </div>
-      </header>
+          <span className="chip">beta · v0.1</span>
+        </header>
 
-      <main className="mx-auto max-w-4xl px-6 py-8">
-        <div className="mb-6 flex items-center justify-between">
-          <h2 className="text-2xl font-semibold tracking-tight">Saved projects</h2>
-          <Dialog open={createOpen} onOpenChange={setCreateOpen}>
-            <DialogTrigger asChild>
-              <Button>
-                <Plus className="mr-2 h-4 w-4" /> New project
-              </Button>
-            </DialogTrigger>
-            <ProjectDialog
-              title="New project"
-              onClose={() => setCreateOpen(false)}
-              onSaved={refresh}
-            />
-          </Dialog>
-        </div>
+        <section className="mt-10">
+          <motion.span
+            initial={{ y: 10, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            className="chip bg-coral/15 text-coral"
+          >
+            <Sparkles className="h-3 w-3" /> AI photo dump curator
+          </motion.span>
 
-        {loading ? (
-          <p className="text-muted-foreground">Loading…</p>
-        ) : projects.length === 0 ? (
-          <Card>
-            <CardContent className="py-12 text-center text-muted-foreground">
-              No saved projects yet. Create your first one.
-            </CardContent>
-          </Card>
-        ) : (
-          <div className="grid gap-4">
-            {projects.map((p) => (
-              <Card key={p.id}>
-                <CardHeader className="flex flex-row items-start justify-between space-y-0">
-                  <div className="space-y-1">
-                    <CardTitle>{p.title}</CardTitle>
-                    <p className="text-xs text-muted-foreground">
-                      {new Date(p.created_at).toLocaleString()}
-                    </p>
-                  </div>
-                  <div className="flex gap-2">
-                    <Button variant="ghost" size="icon" onClick={() => setEditing(p)}>
-                      <Pencil className="h-4 w-4" />
-                    </Button>
-                    <Button variant="ghost" size="icon" onClick={() => handleDelete(p.id)}>
-                      <Trash2 className="h-4 w-4" />
-                    </Button>
-                  </div>
-                </CardHeader>
-                {p.description ? (
-                  <CardContent>
-                    <p className="whitespace-pre-wrap text-sm text-muted-foreground">
-                      {p.description}
-                    </p>
-                  </CardContent>
-                ) : null}
-              </Card>
-            ))}
+          <motion.h1
+            initial={{ y: 20, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            transition={{ delay: 0.05 }}
+            className="font-display mt-4 text-5xl leading-[0.95] tracking-tight"
+          >
+            Turn <em className="italic text-coral">200 photos</em> into the perfect{" "}
+            <span className="relative inline-block">
+              photo dump
+              <svg viewBox="0 0 200 12" className="absolute -bottom-1 left-0 h-2 w-full text-mint" fill="currentColor">
+                <path d="M0 8 Q 50 0 100 6 T 200 4 L 200 12 L 0 12 Z" />
+              </svg>
+            </span>
+            .
+          </motion.h1>
+
+          <motion.p
+            initial={{ y: 20, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            transition={{ delay: 0.15 }}
+            className="mt-5 text-base text-muted-foreground"
+          >
+            Upload your camera roll. We score every shot, kill the dupes, and help you swipe down to the ten that pop.
+          </motion.p>
+
+          <motion.div
+            initial={{ y: 20, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            transition={{ delay: 0.25 }}
+            className="mt-7"
+          >
+            <Link
+              to="/app"
+              className="group inline-flex h-14 w-full items-center justify-center gap-2 rounded-2xl bg-ink px-6 text-base font-semibold text-cream shadow-xl transition hover:bg-coral"
+            >
+              Start sorting
+              <ArrowRight className="h-5 w-5 transition group-hover:translate-x-0.5" />
+            </Link>
+            <p className="mt-3 text-center text-xs text-muted-foreground">
+              Free · runs in your browser · no signup
+            </p>
+          </motion.div>
+        </section>
+
+        <section className="mt-14">
+          <h2 className="font-display text-2xl">How it works</h2>
+          <ol className="mt-4 space-y-3">
+            <Step n={1} title="Upload" body="Drop in 50, 200, 500 photos." Icon={Upload} tint="bg-coral/15 text-coral" />
+            <Step n={2} title="AI narrows them down" body="Bye blur, dupes, and the awkward ones." Icon={Wand2} tint="bg-lavender/60 text-ink" />
+            <Step n={3} title="Swipe to keep or kill" body="Tinder-style. Be ruthless." Icon={Hand} tint="bg-mint/60 text-ink" />
+            <Step n={4} title="AI orders your post" body="Strongest first, funny last, balanced flow." Icon={Film} tint="bg-coral/15 text-coral" />
+          </ol>
+        </section>
+
+        <section className="mt-12 grid grid-cols-3 gap-3">
+          <Stat icon={<Sparkles className="h-4 w-4" />} value="9" label="AI tags" />
+          <Stat icon={<Heart className="h-4 w-4" />} value="20" label="max slides" />
+          <Stat icon={<Shuffle className="h-4 w-4" />} value="∞" label="reorders" />
+        </section>
+
+        <footer className="mt-16 text-center text-xs text-muted-foreground">
+          <div className="mb-2">
+            <Link to="/todos" className="underline hover:text-ink">Todos</Link>
           </div>
-        )}
-
-        <Dialog open={!!editing} onOpenChange={(o) => !o && setEditing(null)}>
-          {editing && (
-            <ProjectDialog
-              title="Edit project"
-              project={editing}
-              onClose={() => setEditing(null)}
-              onSaved={refresh}
-            />
-          )}
-        </Dialog>
-      </main>
-    </div>
+          Made for the dump-deserving moments.
+        </footer>
+      </div>
+    </main>
   );
 }
 
-function ProjectDialog({
+function Step({
+  n,
   title,
-  project,
-  onClose,
-  onSaved,
+  body,
+  Icon,
+  tint,
 }: {
+  n: number;
   title: string;
-  project?: SavedProject;
-  onClose: () => void;
-  onSaved: () => void;
+  body: string;
+  Icon: React.ComponentType<{ className?: string }>;
+  tint: string;
 }) {
-  const { user } = useAuth();
-  const [t, setT] = useState(project?.title ?? "");
-  const [d, setD] = useState(project?.description ?? "");
-  const [saving, setSaving] = useState(false);
-
-  const handleSave = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!user) return;
-    setSaving(true);
-    const payload = { title: t.trim(), description: d.trim() || null };
-    const { error } = project
-      ? await supabase.from("saved_projects").update(payload).eq("id", project.id)
-      : await supabase.from("saved_projects").insert({ ...payload, user_id: user.id });
-    setSaving(false);
-    if (error) return toast.error(error.message);
-    toast.success(project ? "Updated" : "Created");
-    onClose();
-    onSaved();
-  };
-
   return (
-    <DialogContent>
-      <DialogHeader>
-        <DialogTitle>{title}</DialogTitle>
-      </DialogHeader>
-      <form onSubmit={handleSave} className="space-y-4">
-        <div className="space-y-2">
-          <Label htmlFor="title">Title</Label>
-          <Input id="title" required value={t} onChange={(e) => setT(e.target.value)} />
+    <li className="glass-card flex items-start gap-3 rounded-2xl p-4">
+      <div className={`grid h-10 w-10 shrink-0 place-items-center rounded-xl ${tint}`}>
+        <Icon className="h-5 w-5" />
+      </div>
+      <div className="min-w-0">
+        <div className="flex items-center gap-2">
+          <span className="text-[10px] font-bold text-coral">STEP {n}</span>
         </div>
-        <div className="space-y-2">
-          <Label htmlFor="desc">Description</Label>
-          <Textarea id="desc" rows={4} value={d} onChange={(e) => setD(e.target.value)} />
-        </div>
-        <DialogFooter>
-          <Button type="button" variant="outline" onClick={onClose}>
-            Cancel
-          </Button>
-          <Button type="submit" disabled={saving}>
-            {saving ? "Saving…" : "Save"}
-          </Button>
-        </DialogFooter>
-      </form>
-    </DialogContent>
+        <div className="font-semibold">{title}</div>
+        <div className="text-sm text-muted-foreground">{body}</div>
+      </div>
+    </li>
+  );
+}
+
+function Stat({ icon, value, label }: { icon: React.ReactNode; value: string; label: string }) {
+  return (
+    <div className="glass-card rounded-2xl p-3 text-center">
+      <div className="mx-auto mb-1 grid h-7 w-7 place-items-center rounded-full bg-coral/15 text-coral">
+        {icon}
+      </div>
+      <div className="font-display text-2xl leading-none">{value}</div>
+      <div className="mt-1 text-[10px] uppercase tracking-wider text-muted-foreground">{label}</div>
+    </div>
   );
 }
