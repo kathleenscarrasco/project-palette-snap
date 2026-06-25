@@ -10,7 +10,7 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as TrustRouteImport } from './routes/trust'
-import { Route as TodosRouteImport } from './routes/todos'
+import { Route as ProjectsRouteImport } from './routes/projects'
 import { Route as AuthRouteImport } from './routes/auth'
 import { Route as AppRouteImport } from './routes/app'
 import { Route as IndexRouteImport } from './routes/index'
@@ -20,9 +20,9 @@ const TrustRoute = TrustRouteImport.update({
   path: '/trust',
   getParentRoute: () => rootRouteImport,
 } as any)
-const TodosRoute = TodosRouteImport.update({
-  id: '/todos',
-  path: '/todos',
+const ProjectsRoute = ProjectsRouteImport.update({
+  id: '/projects',
+  path: '/projects',
   getParentRoute: () => rootRouteImport,
 } as any)
 const AuthRoute = AuthRouteImport.update({
@@ -45,14 +45,14 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/app': typeof AppRoute
   '/auth': typeof AuthRoute
-  '/todos': typeof TodosRoute
+  '/projects': typeof ProjectsRoute
   '/trust': typeof TrustRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/app': typeof AppRoute
   '/auth': typeof AuthRoute
-  '/todos': typeof TodosRoute
+  '/projects': typeof ProjectsRoute
   '/trust': typeof TrustRoute
 }
 export interface FileRoutesById {
@@ -60,22 +60,22 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/app': typeof AppRoute
   '/auth': typeof AuthRoute
-  '/todos': typeof TodosRoute
+  '/projects': typeof ProjectsRoute
   '/trust': typeof TrustRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/app' | '/auth' | '/todos' | '/trust'
+  fullPaths: '/' | '/app' | '/auth' | '/projects' | '/trust'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/app' | '/auth' | '/todos' | '/trust'
-  id: '__root__' | '/' | '/app' | '/auth' | '/todos' | '/trust'
+  to: '/' | '/app' | '/auth' | '/projects' | '/trust'
+  id: '__root__' | '/' | '/app' | '/auth' | '/projects' | '/trust'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AppRoute: typeof AppRoute
   AuthRoute: typeof AuthRoute
-  TodosRoute: typeof TodosRoute
+  ProjectsRoute: typeof ProjectsRoute
   TrustRoute: typeof TrustRoute
 }
 
@@ -88,11 +88,11 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof TrustRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/todos': {
-      id: '/todos'
-      path: '/todos'
-      fullPath: '/todos'
-      preLoaderRoute: typeof TodosRouteImport
+    '/projects': {
+      id: '/projects'
+      path: '/projects'
+      fullPath: '/projects'
+      preLoaderRoute: typeof ProjectsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/auth': {
@@ -123,7 +123,7 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AppRoute: AppRoute,
   AuthRoute: AuthRoute,
-  TodosRoute: TodosRoute,
+  ProjectsRoute: ProjectsRoute,
   TrustRoute: TrustRoute,
 }
 export const routeTree = rootRouteImport
