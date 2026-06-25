@@ -1,7 +1,9 @@
-import { createFileRoute, Link } from "@tanstack/react-router";
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { motion } from "framer-motion";
-import { ArrowRight, Sparkles, Heart, Shuffle, Upload, Wand2, Hand, Film } from "lucide-react";
+import { ArrowRight, Sparkles, Heart, Shuffle, Upload, Wand2, Hand, Film, LogOut } from "lucide-react";
+import { useEffect } from "react";
 import { BrandMark, BrandWordmark } from "@/components/dumpdeck/brand";
+import { useAuth } from "@/hooks/use-auth";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -23,8 +25,33 @@ export const Route = createFileRoute("/")({
 });
 
 function Landing() {
+  const navigate = useNavigate();
+  const { isAuthed, loading, bypassed, user, signOut } = useAuth();
+
+  useEffect(() => {
+    if (!loading && !isAuthed) navigate({ to: "/auth" });
+  }, [loading, isAuthed, navigate]);
+
+  if (loading || !isAuthed) {
+    return (
+      <main className="grid min-h-screen place-items-center text-sm text-muted-foreground">
+        Loading…
+      </main>
+    );
+  }
+
   return (
     <main className="relative min-h-screen overflow-hidden px-5 pb-16 pt-8">
+      <div className="absolute right-5 top-5 z-10 flex items-center gap-2">
+        <span className="chip">{bypassed ? "bypass mode" : user?.email}</span>
+        <button
+          onClick={async () => { await signOut(); navigate({ to: "/auth" }); }}
+          className="chip hover:bg-coral hover:text-white"
+          aria-label="Sign out"
+        >
+          <LogOut className="h-3 w-3" /> Sign out
+        </button>
+      </div>
       {/* floating blobs */}
       <div className="pointer-events-none absolute -left-20 top-20 h-72 w-72 rounded-full bg-coral/30 blur-3xl animate-blob" />
       <div className="pointer-events-none absolute -right-16 top-60 h-80 w-80 rounded-full bg-lavender/40 blur-3xl animate-blob" style={{ animationDelay: "-5s" }} />
