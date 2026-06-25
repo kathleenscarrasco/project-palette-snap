@@ -139,9 +139,6 @@ function Landing() {
         </section>
 
         <footer className="mt-16 text-center text-xs text-muted-foreground">
-          <div className="mb-2">
-            <Link to="/todos" className="underline hover:text-ink">Todos</Link>
-          </div>
           Made for the dump-deserving moments.
         </footer>
       </div>
