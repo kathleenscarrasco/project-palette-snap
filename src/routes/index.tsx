@@ -26,7 +26,7 @@ export const Route = createFileRoute("/")({
 
 function Landing() {
   const navigate = useNavigate();
-  const { isAuthed, loading, bypassed, user, signOut } = useAuth();
+  const { isAuthed, loading, user, signOut } = useAuth();
 
   useEffect(() => {
     if (!loading && !isAuthed) navigate({ to: "/auth" });
@@ -43,7 +43,10 @@ function Landing() {
   return (
     <main className="relative min-h-screen overflow-hidden px-5 pb-16 pt-8">
       <div className="absolute right-5 top-5 z-10 flex items-center gap-2">
-        <span className="chip">{bypassed ? "bypass mode" : user?.email}</span>
+        <Link to="/projects" className="chip hover:bg-ink hover:text-white">
+          <FolderOpen className="h-3 w-3" /> Projects
+        </Link>
+        <span className="chip max-w-[160px] truncate" title={user?.email ?? ""}>{user?.email}</span>
         <button
           onClick={async () => { await signOut(); navigate({ to: "/auth" }); }}
           className="chip hover:bg-coral hover:text-white"
