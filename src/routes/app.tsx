@@ -1,4 +1,4 @@
-import { createFileRoute, Link } from "@tanstack/react-router";
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { AnimatePresence, motion, type PanInfo } from "framer-motion";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -183,6 +183,7 @@ const FORMAT_ASPECT: Record<PostFormat, string> = {
 function Shell() {
   const { state, dispatch } = useDumpDeck();
   const { isAuthed, loading } = useAuth();
+  const navigate = useNavigate();
 
   useEffect(() => {
     if (!isAuthed) return;
@@ -240,6 +241,32 @@ function Shell() {
           >
             Sign in
           </Link>
+        </div>
+      </main>
+    );
+  }
+
+  if (!activeProjectId()) {
+    return (
+      <main className="grid min-h-screen place-items-center px-5 text-center">
+        <div className="max-w-sm">
+          <BrandMark className="mx-auto h-12 w-12" />
+          <h1 className="mt-4 font-display text-3xl">Choose a project first</h1>
+          <p className="mt-2 text-sm text-muted-foreground">
+            DumpDeck saves uploads, cuts, captions, and final order under a project.
+          </p>
+          <div className="mt-5 grid gap-2">
+            <button
+              type="button"
+              onClick={() => void navigate({ to: "/projects" })}
+              className="h-11 rounded-xl bg-ink px-4 font-semibold text-cream"
+            >
+              Back to home
+            </button>
+            <Link to="/projects" className="chip justify-center">
+              Saved projects
+            </Link>
+          </div>
         </div>
       </main>
     );
@@ -3336,6 +3363,7 @@ function ExportStage() {
       const result = await saveFinalDraft({
         draftId: activeDraftId(),
         projectId: activeProjectId(),
+        allPhotos: state.photos,
         finalOrder: state.finalOrder,
         removed: state.removed,
         settings: state.settings,
@@ -3352,10 +3380,9 @@ function ExportStage() {
         duplicateDecisions: state.duplicateDecisions,
         pinnedCoverPhotoId: state.pinnedCoverId,
       });
+      sessionStorage.setItem("dumpdeck:activeDraftId", result.id);
       toast.success(
-        result.storage === "supabase"
-          ? "Draft saved to your project."
-          : "Draft saved locally for this browser.",
+        result.storage === "supabase" ? "Project saved" : "Saved locally only for this browser.",
       );
     } catch (err) {
       console.error("[dumpdeck] draft save failed", err);
@@ -3442,7 +3469,7 @@ function ExportStage() {
             disabled={saving || state.finalOrder.length === 0}
             className="h-12 rounded-2xl border-ink/15 bg-white/70 font-semibold"
           >
-            <Save className="mr-2 h-4 w-4" /> {saving ? "Saving…" : "Save draft"}
+            <Save className="mr-2 h-4 w-4" /> {saving ? "Saving…" : "Save project"}
           </Button>
           <Button
             variant="outline"
@@ -3455,7 +3482,7 @@ function ExportStage() {
       </div>
 
       <p className="mt-6 text-center text-xs text-muted-foreground">
-        Drafts save to Supabase when signed in, with local fallback for dev/testing.
+        Projects save to Supabase when signed in. Local-only saves are only used in dev mode.
       </p>
       <DebugPanel />
     </section>

@@ -14,6 +14,7 @@ export type DuplicateDecisionDraft = {
 export type SaveDraftInput = {
   draftId?: string | null;
   projectId?: string | null;
+  allPhotos?: Photo[];
   finalOrder: Photo[];
   removed: RemovedPhoto[];
   settings: Settings;
@@ -50,7 +51,10 @@ export async function saveFinalDraft(input: SaveDraftInput): Promise<SaveDraftRe
 
   const { data: userData, error: userError } = await supabase.auth.getUser();
   if (userError || !userData.user) {
-    return saveLocalDraft(payload);
+    throw userError ?? new Error("Sign in before saving this project.");
+  }
+  if (!asUuid(input.projectId)) {
+    throw new Error("Choose or create a project before saving.");
   }
 
   const row = {
@@ -78,9 +82,10 @@ export async function saveFinalDraft(input: SaveDraftInput): Promise<SaveDraftRe
       .single();
 
     if (error) {
-      console.warn("[dumpdeck] Supabase draft update failed; falling back to local draft", error);
-      return saveLocalDraft(payload);
+      console.warn("[dumpdeck] Supabase draft update failed", error);
+      throw error;
     }
+    await touchProject(input.projectId, userData.user.id, payload.updatedAt);
 
     return {
       id: String((data as { id: string }).id),
@@ -97,9 +102,10 @@ export async function saveFinalDraft(input: SaveDraftInput): Promise<SaveDraftRe
       .single();
 
     if (error) {
-      console.warn("[dumpdeck] Supabase draft insert failed; falling back to local draft", error);
-      return saveLocalDraft(payload);
+      console.warn("[dumpdeck] Supabase draft insert failed", error);
+      throw error;
     }
+    await touchProject(input.projectId, userData.user.id, payload.updatedAt);
 
     return {
       id: String((data as { id: string }).id),
@@ -115,15 +121,31 @@ export async function saveFinalDraft(input: SaveDraftInput): Promise<SaveDraftRe
     .single();
 
   if (error) {
-    console.warn("[dumpdeck] Supabase draft save failed; falling back to local draft", error);
-    return saveLocalDraft(payload);
+    console.warn("[dumpdeck] Supabase draft save failed", error);
+    throw error;
   }
+  await touchProject(input.projectId, userData.user.id, payload.updatedAt);
 
   return {
     id: String((data as { id: string }).id),
     storage: "supabase",
     updatedAt: String((data as { updated_at: string }).updated_at),
   };
+}
+
+async function touchProject(
+  projectId: string | null | undefined,
+  userId: string,
+  updatedAt: string,
+) {
+  const id = asUuid(projectId);
+  if (!id) return;
+  const { error } = await supabase
+    .from("saved_projects")
+    .update({ updated_at: updatedAt })
+    .eq("id", id)
+    .eq("user_id", userId);
+  if (error) console.warn("[dumpdeck] project timestamp update failed", error);
 }
 
 export async function listFinalDrafts(projectId?: string | null): Promise<SavedFinalDraft[]> {
@@ -218,25 +240,28 @@ function buildDraftPayload(input: SaveDraftInput) {
   return {
     projectId: input.projectId ?? null,
     draftId: input.draftId ?? null,
+    uploadedPhotos: input.allPhotos ?? input.finalOrder,
     finalOrder: input.finalOrder,
     removed: input.removed,
+    restoredPhotoIds: input.finalOrder.map((photo) => photo.id),
     orderedPhotoIds: input.finalOrder.map((photo) => photo.id),
     pinnedCoverPhotoId: input.pinnedCoverPhotoId ?? null,
     rejectedPhotoIds: input.removed.map((entry) => entry.photo.id),
     duplicateDecisions: input.duplicateDecisions,
     selectedPreferences: input.settings,
-    scoresReasons: [...input.finalOrder, ...input.removed.map((entry) => entry.photo)].map(
-      (photo) => ({
-        id: photo.id,
-        name: photo.name,
-        score: photo.ranking?.overallScore ?? photo.overall,
-        ranking: photo.ranking,
-        tags: photo.tags,
-        reasons: photo.reasons,
-        duplicateClusterId: photo.duplicateClusterId ?? null,
-        sourceMetadata: photo.sourceMetadata,
-      }),
-    ),
+    scoresReasons: [
+      ...(input.allPhotos ?? input.finalOrder),
+      ...input.removed.map((entry) => entry.photo),
+    ].map((photo) => ({
+      id: photo.id,
+      name: photo.name,
+      score: photo.ranking?.overallScore ?? photo.overall,
+      ranking: photo.ranking,
+      tags: photo.tags,
+      reasons: photo.reasons,
+      duplicateClusterId: photo.duplicateClusterId ?? null,
+      sourceMetadata: photo.sourceMetadata,
+    })),
     createdAt: now,
     updatedAt: now,
   };

@@ -1,11 +1,12 @@
 import { createFileRoute, Link, Outlet, useLocation, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useState, type FormEvent } from "react";
-import { Loader2, Plus, Pencil, Trash2, LogOut, X } from "lucide-react";
+import { Copy, FolderOpen, Home, Loader2, LogOut, Pencil, Plus, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 
 import { isLocalDevAuth, supabase, type SavedProject } from "@/integrations/supabase/client";
 import { useAuth } from "@/hooks/use-auth";
 import { BrandMark, BrandWordmark } from "@/components/dumpdeck/brand";
+import { duplicateFinalDraft, listFinalDrafts, type SavedFinalDraft } from "@/lib/dumpdeck/drafts";
 
 export const Route = createFileRoute("/projects")({
   head: () => ({ meta: [{ title: "Your saved projects · dumpify" }] }),
@@ -14,6 +15,13 @@ export const Route = createFileRoute("/projects")({
 });
 
 const LOCAL_PROJECTS_KEY = "dumpdeck:dev-projects";
+
+type ProjectStatus = {
+  photoCount: number;
+  hasFinalOrder: boolean;
+  updatedAt: string | null;
+  draftId: string | null;
+};
 
 function loadLocalProjects(): SavedProject[] {
   try {
@@ -37,6 +45,43 @@ function loadLocalProjects(): SavedProject[] {
 
 function saveLocalProjects(projects: SavedProject[]) {
   localStorage.setItem(LOCAL_PROJECTS_KEY, JSON.stringify(projects));
+}
+
+function statusForProject(project: SavedProject, drafts: SavedFinalDraft[]): ProjectStatus {
+  const projectDrafts = drafts
+    .filter((draft) => draft.projectId === project.id)
+    .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+  const latest = projectDrafts[0];
+  return {
+    photoCount: latest ? new Set([...latest.orderedPhotoIds, ...latest.rejectedPhotoIds]).size : 0,
+    hasFinalOrder: Boolean(latest?.orderedPhotoIds.length),
+    updatedAt: latest?.updatedAt ?? project.updated_at ?? project.created_at,
+    draftId: latest?.id ?? null,
+  };
+}
+
+async function createProjectRecord(userId: string, title = "Untitled DumpDeck Project") {
+  const now = new Date().toISOString();
+  if (isLocalDevAuth) {
+    const saved: SavedProject = {
+      id: `local-${crypto.randomUUID()}`,
+      user_id: userId,
+      title,
+      description: null,
+      created_at: now,
+      updated_at: now,
+    };
+    saveLocalProjects([saved, ...loadLocalProjects()]);
+    return saved;
+  }
+
+  const { data, error } = await supabase
+    .from("saved_projects")
+    .insert({ user_id: userId, title, description: null })
+    .select("id, user_id, title, description, created_at, updated_at")
+    .single();
+  if (error) throw error;
+  return data as SavedProject;
 }
 
 function ProjectsError({ reset }: { reset: () => void }) {
@@ -69,11 +114,16 @@ function ProjectsPage() {
   const navigate = useNavigate();
   const { user, isAuthed, loading: authLoading, signOut } = useAuth();
   const [projects, setProjects] = useState<SavedProject[]>([]);
+  const [drafts, setDrafts] = useState<SavedFinalDraft[]>([]);
+  const [view, setView] = useState<"home" | "saved">("home");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [editing, setEditing] = useState<SavedProject | null>(null);
   const [pendingDelete, setPendingDelete] = useState<SavedProject | null>(null);
   const [showForm, setShowForm] = useState(false);
+  const [creatingProject, setCreatingProject] = useState(false);
+  const [autoCreatingFirstProject, setAutoCreatingFirstProject] = useState(false);
+  const [duplicatingProjectId, setDuplicatingProjectId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!authLoading && !isAuthed) navigate({ to: "/auth" });
@@ -83,22 +133,26 @@ function ProjectsPage() {
     if (!user) return;
     setLoading(true);
     if (isLocalDevAuth) {
-      setProjects(loadLocalProjects());
+      const localProjects = loadLocalProjects();
+      setProjects(localProjects);
+      setDrafts(await listFinalDrafts());
       setError(null);
       setLoading(false);
       return;
     }
     const { data, error } = await supabase
       .from("saved_projects")
-      .select("id, user_id, title, description, created_at")
+      .select("id, user_id, title, description, created_at, updated_at")
       .eq("user_id", user.id)
-      .order("created_at", { ascending: false });
+      .order("updated_at", { ascending: false, nullsFirst: false });
     if (error) {
       console.error("[saved_projects] load error:", error);
       setError(error.message);
+      setDrafts([]);
     } else {
       console.log("[saved_projects] loaded", data?.length ?? 0);
       setProjects((data ?? []) as SavedProject[]);
+      setDrafts(await listFinalDrafts());
       setError(null);
     }
     setLoading(false);
@@ -109,7 +163,87 @@ function ProjectsPage() {
   }, [user, load]);
 
   function openProject(id: string) {
+    sessionStorage.setItem("dumpdeck:activeProjectId", id);
     void navigate({ to: "/projects/$projectId", params: { projectId: id } });
+  }
+
+  async function startNewProject() {
+    if (!user || creatingProject) return;
+    setCreatingProject(true);
+    setError(null);
+    try {
+      const project = await createProjectRecord(user.id);
+      sessionStorage.setItem("dumpdeck:activeProjectId", project.id);
+      toast.success("Project created");
+      void navigate({ to: "/app" });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Could not create project";
+      console.error("[saved_projects] create project failed:", err);
+      setError(msg);
+      toast.error(msg);
+    } finally {
+      setCreatingProject(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!user || loading || error || projects.length > 0 || autoCreatingFirstProject) return;
+    setAutoCreatingFirstProject(true);
+    void (async () => {
+      try {
+        const project = await createProjectRecord(user.id, "My first DumpDeck Project");
+        sessionStorage.setItem("dumpdeck:activeProjectId", project.id);
+        toast.success("Project created. Add your first photos.");
+        void navigate({ to: "/app", replace: true });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Could not create your first project";
+        console.error("[saved_projects] auto-create first project failed:", err);
+        setError(msg);
+        toast.error(msg);
+      } finally {
+        setAutoCreatingFirstProject(false);
+      }
+    })();
+  }, [autoCreatingFirstProject, error, loading, navigate, projects.length, user]);
+
+  async function duplicateProject(project: SavedProject) {
+    if (duplicatingProjectId) return;
+    setDuplicatingProjectId(project.id);
+    try {
+      const status = statusForProject(project, drafts);
+      if (status.draftId) {
+        const result = await duplicateFinalDraft(status.draftId, project.title);
+        toast.success("Project duplicated");
+        await load();
+        openProject(result.projectId);
+        return;
+      }
+      const copy = await createProjectRecord(user!.id, `${project.title} copy`);
+      if (project.description) {
+        if (isLocalDevAuth) {
+          saveLocalProjects(
+            loadLocalProjects().map((item) =>
+              item.id === copy.id ? { ...item, description: project.description } : item,
+            ),
+          );
+        } else {
+          await supabase
+            .from("saved_projects")
+            .update({ description: project.description })
+            .eq("id", copy.id)
+            .eq("user_id", user!.id);
+        }
+      }
+      toast.success("Project duplicated");
+      await load();
+      openProject(copy.id);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Could not duplicate project";
+      console.error("[saved_projects] duplicate failed:", err);
+      toast.error(msg);
+    } finally {
+      setDuplicatingProjectId(null);
+    }
   }
 
   async function remove(id: string) {
@@ -147,7 +281,7 @@ function ProjectsPage() {
 
       <div className="mx-auto w-full max-w-2xl">
         <header className="flex flex-wrap items-center justify-between gap-3">
-          <Link to="/" className="flex items-center gap-2">
+          <Link to="/projects" className="flex items-center gap-2">
             <BrandMark className="h-9 w-9" />
             <BrandWordmark size="text-xl" />
           </Link>
@@ -167,20 +301,33 @@ function ProjectsPage() {
           </div>
         </header>
 
-        <section className="mt-10 flex items-center justify-between">
-          <div>
-            <h1 className="font-display text-4xl tracking-tight">Saved projects</h1>
-            <p className="mt-1 text-sm text-muted-foreground">Your curated decks, anytime.</p>
+        <section className="mt-10">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <h1 className="font-display text-4xl tracking-tight">
+                {view === "home" ? "Start a DumpDeck" : "Saved projects"}
+              </h1>
+              <p className="mt-1 text-sm text-muted-foreground">
+                {view === "home"
+                  ? "Create a fresh sort or continue an existing project."
+                  : "Open, edit, duplicate, or delete your saved DumpDeck projects."}
+              </p>
+            </div>
+            {view === "saved" && (
+              <button
+                onClick={startNewProject}
+                disabled={creatingProject}
+                className="inline-flex h-11 items-center gap-2 rounded-xl bg-ink px-4 font-semibold text-cream transition hover:bg-coral disabled:opacity-60"
+              >
+                {creatingProject ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Plus className="h-4 w-4" />
+                )}
+                New project
+              </button>
+            )}
           </div>
-          <button
-            onClick={() => {
-              setEditing(null);
-              setShowForm(true);
-            }}
-            className="inline-flex h-11 items-center gap-2 rounded-xl bg-ink px-4 font-semibold text-cream transition hover:bg-coral"
-          >
-            <Plus className="h-4 w-4" /> New
-          </button>
         </section>
 
         {error && (
@@ -189,84 +336,168 @@ function ProjectsPage() {
           </div>
         )}
 
-        <section className="mt-6 space-y-3">
-          {loading && (
-            <div className="flex items-center gap-2 text-sm text-muted-foreground">
-              <Loader2 className="h-4 w-4 animate-spin" /> Loading…
-            </div>
-          )}
+        {autoCreatingFirstProject && (
+          <div className="mt-6 flex items-center gap-2 rounded-2xl bg-white/70 px-4 py-3 text-sm text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" /> Creating your first project…
+          </div>
+        )}
 
-          {!loading && projects.length === 0 && (
-            <div className="glass-card rounded-2xl p-8 text-center">
-              <div className="font-display text-2xl">No saved projects yet</div>
+        {view === "home" && !autoCreatingFirstProject && (
+          <section className="mt-8 grid gap-3 sm:grid-cols-2">
+            <button
+              type="button"
+              onClick={startNewProject}
+              disabled={creatingProject}
+              className="glass-card rounded-3xl p-6 text-left transition hover:-translate-y-0.5 hover:shadow-lg disabled:opacity-60"
+            >
+              <span className="grid h-12 w-12 place-items-center rounded-2xl bg-coral/15 text-coral">
+                {creatingProject ? (
+                  <Loader2 className="h-5 w-5 animate-spin" />
+                ) : (
+                  <Plus className="h-5 w-5" />
+                )}
+              </span>
+              <div className="mt-5 font-display text-3xl">New project</div>
               <p className="mt-2 text-sm text-muted-foreground">
-                Create your first DumpDeck project, then upload photos and start sorting.
+                Create a project and jump into the upload and sorting flow.
               </p>
-              <button
-                onClick={() => {
-                  setEditing(null);
-                  setShowForm(true);
-                }}
-                className="mt-5 inline-flex h-11 items-center gap-2 rounded-xl bg-ink px-4 font-semibold text-cream hover:bg-coral"
-              >
-                <Plus className="h-4 w-4" /> Create your first project
-              </button>
-            </div>
-          )}
+            </button>
 
-          {!loading &&
-            projects.map((p) => (
-              <article
-                key={p.id}
-                role="button"
-                tabIndex={0}
-                onClick={() => openProject(p.id)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" || event.key === " ") {
-                    event.preventDefault();
-                    openProject(p.id);
-                  }
-                }}
-                className="glass-card flex cursor-pointer items-start gap-3 rounded-2xl p-4 text-left transition hover:-translate-y-0.5 hover:shadow-lg focus:outline-none focus:ring-2 focus:ring-coral"
-              >
-                <div className="min-w-0 flex-1">
-                  <div className="truncate font-semibold">{p.title}</div>
-                  {p.description && (
-                    <div className="mt-1 line-clamp-2 text-sm text-muted-foreground">
-                      {p.description}
-                    </div>
-                  )}
-                  <div className="mt-3 flex flex-wrap items-center gap-2">
-                    <span className="chip bg-ink text-cream">Continue project</span>
-                    <span className="text-[11px] uppercase tracking-wide text-muted-foreground">
-                      {new Date(p.created_at).toLocaleString()}
-                    </span>
-                  </div>
-                </div>
+            <button
+              type="button"
+              onClick={() => setView("saved")}
+              className="glass-card rounded-3xl p-6 text-left transition hover:-translate-y-0.5 hover:shadow-lg"
+            >
+              <span className="grid h-12 w-12 place-items-center rounded-2xl bg-mint/60 text-ink">
+                <FolderOpen className="h-5 w-5" />
+              </span>
+              <div className="mt-5 font-display text-3xl">Saved projects</div>
+              <p className="mt-2 text-sm text-muted-foreground">
+                Continue one of your {projects.length} saved project
+                {projects.length === 1 ? "" : "s"}.
+              </p>
+            </button>
+          </section>
+        )}
+
+        {view === "saved" && (
+          <div className="mt-5 flex flex-wrap gap-2">
+            <button type="button" onClick={() => setView("home")} className="chip">
+              <Home className="h-3 w-3" /> Back to home
+            </button>
+          </div>
+        )}
+
+        {view === "saved" && (
+          <section className="mt-6 space-y-3">
+            {loading && (
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin" /> Loading…
+              </div>
+            )}
+
+            {!loading && projects.length === 0 && (
+              <div className="glass-card rounded-2xl p-8 text-center">
+                <div className="font-display text-2xl">No saved projects yet</div>
+                <p className="mt-2 text-sm text-muted-foreground">
+                  Create your first DumpDeck project, then upload photos and start sorting.
+                </p>
                 <button
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    setEditing(p);
+                  onClick={() => {
+                    setEditing(null);
                     setShowForm(true);
                   }}
-                  className="grid h-9 w-9 place-items-center rounded-lg hover:bg-ink/5"
-                  aria-label="Edit"
+                  className="mt-5 inline-flex h-11 items-center gap-2 rounded-xl bg-ink px-4 font-semibold text-cream hover:bg-coral"
                 >
-                  <Pencil className="h-4 w-4" />
+                  <Plus className="h-4 w-4" /> Create your first project
                 </button>
-                <button
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    setPendingDelete(p);
+              </div>
+            )}
+
+            {!loading &&
+              projects.map((p) => (
+                <article
+                  key={p.id}
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => openProject(p.id)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      openProject(p.id);
+                    }
                   }}
-                  className="grid h-9 w-9 place-items-center rounded-lg text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
-                  aria-label="Delete"
+                  className="glass-card flex cursor-pointer items-start gap-3 rounded-2xl p-4 text-left transition hover:-translate-y-0.5 hover:shadow-lg focus:outline-none focus:ring-2 focus:ring-coral"
                 >
-                  <Trash2 className="h-4 w-4" />
-                </button>
-              </article>
-            ))}
-        </section>
+                  {(() => {
+                    const status = statusForProject(p, drafts);
+                    return (
+                      <>
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate font-semibold">{p.title}</div>
+                          {p.description && (
+                            <div className="mt-1 line-clamp-2 text-sm text-muted-foreground">
+                              {p.description}
+                            </div>
+                          )}
+                          <div className="mt-3 flex flex-wrap items-center gap-2">
+                            <span className="chip bg-ink text-cream">Continue project</span>
+                            <span className="chip bg-mint/40">
+                              {status.photoCount
+                                ? `${status.photoCount} photo${status.photoCount === 1 ? "" : "s"}`
+                                : "No saved photos yet"}
+                            </span>
+                            <span className="chip bg-white/80">
+                              {status.hasFinalOrder ? "Final order saved" : "No final order yet"}
+                            </span>
+                            <span className="text-[11px] uppercase tracking-wide text-muted-foreground">
+                              Updated {new Date(status.updatedAt ?? p.created_at).toLocaleString()}
+                            </span>
+                          </div>
+                        </div>
+                        <button
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void duplicateProject(p);
+                          }}
+                          disabled={duplicatingProjectId === p.id}
+                          className="grid h-9 w-9 place-items-center rounded-lg hover:bg-ink/5 disabled:opacity-60"
+                          aria-label="Duplicate"
+                        >
+                          {duplicatingProjectId === p.id ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <Copy className="h-4 w-4" />
+                          )}
+                        </button>
+                        <button
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setEditing(p);
+                            setShowForm(true);
+                          }}
+                          className="grid h-9 w-9 place-items-center rounded-lg hover:bg-ink/5"
+                          aria-label="Edit"
+                        >
+                          <Pencil className="h-4 w-4" />
+                        </button>
+                        <button
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setPendingDelete(p);
+                          }}
+                          className="grid h-9 w-9 place-items-center rounded-lg text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                          aria-label="Delete"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      </>
+                    );
+                  })()}
+                </article>
+              ))}
+          </section>
+        )}
       </div>
 
       {showForm && user && (
@@ -394,7 +625,7 @@ function ProjectForm({
           .from("saved_projects")
           .update({ title: title.trim(), description: description.trim() || null })
           .eq("id", initial.id)
-          .select("id, user_id, title, description, created_at")
+          .select("id, user_id, title, description, created_at, updated_at")
           .single();
         if (error) throw error;
         toast.success("Saved");
@@ -407,6 +638,7 @@ function ProjectForm({
             title: title.trim(),
             description: description.trim() || null,
             created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
           };
           saveLocalProjects([saved, ...loadLocalProjects()]);
           toast.success("Created");
@@ -416,7 +648,7 @@ function ProjectForm({
         const { data, error } = await supabase
           .from("saved_projects")
           .insert({ user_id: userId, title: title.trim(), description: description.trim() || null })
-          .select("id, user_id, title, description, created_at")
+          .select("id, user_id, title, description, created_at, updated_at")
           .single();
         if (error) throw error;
         toast.success("Created");

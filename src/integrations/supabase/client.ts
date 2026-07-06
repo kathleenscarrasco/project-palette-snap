@@ -11,6 +11,7 @@ export type SavedProject = {
   title: string;
   description: string | null;
   created_at: string;
+  updated_at?: string | null;
 };
 
 export const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
