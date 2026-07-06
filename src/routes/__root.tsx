@@ -78,14 +78,26 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1, viewport-fit=cover" },
       { title: "dumpify — Turn 200 photos into the perfect photo dump" },
-      { name: "description", content: "AI-powered photo dump curator. Upload, narrow down, swipe, and order the perfect Instagram carousel." },
+      {
+        name: "description",
+        content:
+          "AI-powered photo dump curator. Upload, narrow down, swipe, and order the perfect Instagram carousel.",
+      },
       { name: "author", content: "dumpify" },
       { property: "og:title", content: "dumpify — Turn 200 photos into the perfect photo dump" },
-      { property: "og:description", content: "AI-powered photo dump curator. Upload, narrow down, swipe, and order the perfect Instagram carousel." },
+      {
+        property: "og:description",
+        content:
+          "AI-powered photo dump curator. Upload, narrow down, swipe, and order the perfect Instagram carousel.",
+      },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
       { name: "twitter:title", content: "dumpify — Turn 200 photos into the perfect photo dump" },
-      { name: "twitter:description", content: "AI-powered photo dump curator. Upload, narrow down, swipe, and order the perfect Instagram carousel." },
+      {
+        name: "twitter:description",
+        content:
+          "AI-powered photo dump curator. Upload, narrow down, swipe, and order the perfect Instagram carousel.",
+      },
     ],
     links: [
       { rel: "stylesheet", href: appCss },
@@ -93,7 +105,10 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       { rel: "apple-touch-icon", href: "/favicon.svg" },
       { rel: "preconnect", href: "https://fonts.googleapis.com" },
       { rel: "preconnect", href: "https://fonts.gstatic.com", crossOrigin: "anonymous" },
-      { rel: "stylesheet", href: "https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&display=swap" },
+      {
+        rel: "stylesheet",
+        href: "https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&display=swap",
+      },
     ],
   }),
   shellComponent: RootShell,

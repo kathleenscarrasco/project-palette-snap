@@ -23,19 +23,38 @@ export async function analyzeImage(url: string): Promise<Analysis> {
     ctx.drawImage(img, 0, 0, W, H);
     const { data } = ctx.getImageData(0, 0, W, H);
 
-    let sumL = 0, sumL2 = 0, sumSat = 0, sumWarm = 0, skin = 0;
-    let sumR = 0, sumG = 0, sumB = 0;
+    let sumL = 0,
+      sumL2 = 0,
+      sumSat = 0,
+      sumWarm = 0,
+      skin = 0;
+    let sumR = 0,
+      sumG = 0,
+      sumB = 0;
     const grays: number[] = [];
-    const rs: number[] = [], gs: number[] = [], bs: number[] = [];
+    const rs: number[] = [],
+      gs: number[] = [],
+      bs: number[] = [];
     for (let i = 0; i < data.length; i += 4) {
-      const r = data[i] / 255, g = data[i + 1] / 255, b = data[i + 2] / 255;
-      const max = Math.max(r, g, b), min = Math.min(r, g, b);
+      const r = data[i] / 255,
+        g = data[i + 1] / 255,
+        b = data[i + 2] / 255;
+      const max = Math.max(r, g, b),
+        min = Math.min(r, g, b);
       const l = (max + min) / 2;
       const s = max === min ? 0 : (max - min) / (1 - Math.abs(2 * l - 1) || 1);
-      sumL += l; sumL2 += l * l; sumSat += s; sumWarm += r - b;
-      sumR += r; sumG += g; sumB += b;
+      sumL += l;
+      sumL2 += l * l;
+      sumSat += s;
+      sumWarm += r - b;
+      sumR += r;
+      sumG += g;
+      sumB += b;
       if (r > 0.35 && r > g && r > b && r - b > 0.05 && r - g < 0.4 && g > 0.2) skin++;
-      grays.push(l); rs.push(r); gs.push(g); bs.push(b);
+      grays.push(l);
+      rs.push(r);
+      gs.push(g);
+      bs.push(b);
     }
     const n = data.length / 4;
     const brightness = clamp(sumL / n);
@@ -44,7 +63,9 @@ export async function analyzeImage(url: string): Promise<Analysis> {
     const saturation = clamp(sumSat / n);
     const warmth = clamp((sumWarm / n) * 2, -1, 1);
     const faceish = clamp(skin / n);
-    const avgR = sumR / n, avgG = sumG / n, avgB = sumB / n;
+    const avgR = sumR / n,
+      avgG = sumG / n,
+      avgB = sumB / n;
     const sharpness = laplacianVariance(grays, W, H);
 
     const aHashHex = aHash(grays, W, H);
@@ -52,24 +73,44 @@ export async function analyzeImage(url: string): Promise<Analysis> {
     const feature = featureVector(grays, rs, gs, bs, W, H);
 
     return {
-      brightness, contrast, saturation, warmth,
-      aHash: aHashHex, dHash: dHashHex,
-      feature, avgR, avgG, avgB, faceish, sharpness,
-      detectedPeopleCount: -1, detectedFaceCount: -1,
-      detectionConfidence: 0, peopleUnsure: true,
+      brightness,
+      contrast,
+      saturation,
+      warmth,
+      aHash: aHashHex,
+      dHash: dHashHex,
+      feature,
+      avgR,
+      avgG,
+      avgB,
+      faceish,
+      sharpness,
+      detectedPeopleCount: -1,
+      detectedFaceCount: -1,
+      detectionConfidence: 0,
+      peopleUnsure: true,
     };
   } catch {
     return {
-      brightness: 0.5, contrast: 0.5, saturation: 0.5, warmth: 0,
-      aHash: "0000000000000000", dHash: "0000000000000000",
+      brightness: 0.5,
+      contrast: 0.5,
+      saturation: 0.5,
+      warmth: 0,
+      aHash: "0000000000000000",
+      dHash: "0000000000000000",
       feature: new Array(192 + 48 + 36).fill(0),
-      avgR: 0.5, avgG: 0.5, avgB: 0.5, faceish: 0, sharpness: 0.3,
-      detectedPeopleCount: -1, detectedFaceCount: -1,
-      detectionConfidence: 0, peopleUnsure: true,
+      avgR: 0.5,
+      avgG: 0.5,
+      avgB: 0.5,
+      faceish: 0,
+      sharpness: 0.3,
+      detectedPeopleCount: -1,
+      detectedFaceCount: -1,
+      detectionConfidence: 0,
+      peopleUnsure: true,
     };
   }
 }
-
 
 function loadImage(url: string): Promise<HTMLImageElement> {
   return new Promise((res, rej) => {
@@ -104,15 +145,20 @@ function dHash(grays: number[], w: number, h: number) {
 
 function downsample(src: number[], w: number, h: number, bw: number, bh: number) {
   const out: number[] = [];
-  const cw = w / bw, ch = h / bh;
+  const cw = w / bw,
+    ch = h / bh;
   for (let by = 0; by < bh; by++) {
     for (let bx = 0; bx < bw; bx++) {
-      let s = 0, c = 0;
-      const y0 = Math.floor(by * ch), y1 = Math.max(y0 + 1, Math.floor((by + 1) * ch));
-      const x0 = Math.floor(bx * cw), x1 = Math.max(x0 + 1, Math.floor((bx + 1) * cw));
+      let s = 0,
+        c = 0;
+      const y0 = Math.floor(by * ch),
+        y1 = Math.max(y0 + 1, Math.floor((by + 1) * ch));
+      const x0 = Math.floor(bx * cw),
+        x1 = Math.max(x0 + 1, Math.floor((bx + 1) * cw));
       for (let y = y0; y < y1; y++) {
         for (let x = x0; x < x1; x++) {
-          s += src[y * w + x]; c++;
+          s += src[y * w + x];
+          c++;
         }
       }
       out.push(s / Math.max(1, c));
@@ -143,13 +189,18 @@ function histogram(values: number[], bins: number) {
 }
 
 function laplacianVariance(g: number[], w: number, h: number) {
-  let s = 0, s2 = 0, n = 0;
+  let s = 0,
+    s2 = 0,
+    n = 0;
   for (let y = 1; y < h - 1; y++) {
     for (let x = 1; x < w - 1; x++) {
       const c = g[y * w + x];
-      const avg = (g[(y - 1) * w + x] + g[(y + 1) * w + x] + g[y * w + x - 1] + g[y * w + x + 1]) / 4;
+      const avg =
+        (g[(y - 1) * w + x] + g[(y + 1) * w + x] + g[y * w + x - 1] + g[y * w + x + 1]) / 4;
       const d = c - avg;
-      s += d; s2 += d * d; n++;
+      s += d;
+      s2 += d * d;
+      n++;
     }
   }
   const m = s / n;
@@ -162,14 +213,19 @@ export function hammingDistance(a: string, b: string) {
   let d = 0;
   for (let i = 0; i < a.length; i++) {
     let x = parseInt(a[i], 16) ^ parseInt(b[i], 16);
-    while (x) { d += x & 1; x >>= 1; }
+    while (x) {
+      d += x & 1;
+      x >>= 1;
+    }
   }
   return d;
 }
 
 export function cosineDistance(a: number[], b: number[]) {
   if (a.length !== b.length) return 2;
-  let dot = 0, na = 0, nb = 0;
+  let dot = 0,
+    na = 0,
+    nb = 0;
   for (let i = 0; i < a.length; i++) {
     dot += a[i] * b[i];
     na += a[i] * a[i];
@@ -193,8 +249,7 @@ export function classifyPhoto(
   peopleUnsure: boolean;
 } {
   const ratio = width / Math.max(1, height);
-  const orientation: Orientation =
-    ratio > 1.1 ? "landscape" : ratio < 0.92 ? "portrait" : "square";
+  const orientation: Orientation = ratio > 1.1 ? "landscape" : ratio < 0.92 ? "portrait" : "square";
 
   const f = a.faceish;
   const hasDetection = a.detectedPeopleCount >= 0 || a.detectedFaceCount >= 0;
@@ -210,9 +265,8 @@ export function classifyPhoto(
     peopleCount = Math.min(4, combined) as 0 | 1 | 2 | 3 | 4;
     peopleConfidence = a.detectionConfidence;
     if (!peopleUnsure) {
-      peopleUnsure = a.detectedPeopleCount >= 0 && a.detectedFaceCount >= 0
-        ? Math.abs(ppl - fac) > 1
-        : true;
+      peopleUnsure =
+        a.detectedPeopleCount >= 0 && a.detectedFaceCount >= 0 ? Math.abs(ppl - fac) > 1 : true;
     }
   } else {
     if (f >= 0.4) peopleCount = 4;
@@ -220,9 +274,7 @@ export function classifyPhoto(
     else if (f >= 0.16) peopleCount = 2;
     else if (f >= 0.06) peopleCount = 1;
     else peopleCount = 0;
-    const nearestEdge = Math.min(
-      ...[0.06, 0.16, 0.28, 0.4].map((t) => Math.abs(f - t)),
-    );
+    const nearestEdge = Math.min(...[0.06, 0.16, 0.28, 0.4].map((t) => Math.abs(f - t)));
     peopleConfidence = clamp(nearestEdge * 4);
     peopleUnsure = true;
   }
@@ -241,23 +293,36 @@ export function classifyPhoto(
     photoTypeConfidence = clamp(0.6 + peopleConfidence * 0.3);
   } else if (trustPeople && peopleCount >= 1) {
     if (orientation === "landscape" && peopleCount >= 2) {
-      photoType = "group"; photoTypeConfidence = clamp(0.55 + peopleConfidence * 0.3);
+      photoType = "group";
+      photoTypeConfidence = clamp(0.55 + peopleConfidence * 0.3);
     } else {
-      photoType = "selfie"; photoTypeConfidence = clamp(0.5 + peopleConfidence * 0.3);
+      photoType = "selfie";
+      photoTypeConfidence = clamp(0.5 + peopleConfidence * 0.3);
     }
-  } else if (trustPeople && peopleCount === 0 && (greenDom > 0.06 || blueDom > 0.06) && orientation !== "portrait") {
+  } else if (
+    trustPeople &&
+    peopleCount === 0 &&
+    (greenDom > 0.06 || blueDom > 0.06) &&
+    orientation !== "portrait"
+  ) {
     photoType = "landscape";
     photoTypeConfidence = clamp(0.55 + Math.max(greenDom, blueDom) * 4);
   } else if (
-    trustPeople && peopleCount === 0 &&
-    redWarmDom > 0.07 && a.saturation > 0.4 &&
-    a.brightness > 0.32 && a.brightness < 0.82
+    trustPeople &&
+    peopleCount === 0 &&
+    redWarmDom > 0.07 &&
+    a.saturation > 0.4 &&
+    a.brightness > 0.32 &&
+    a.brightness < 0.82
   ) {
     photoType = "food";
     photoTypeConfidence = clamp(0.5 + redWarmDom * 3);
   } else if (
-    trustPeople && peopleCount === 0 &&
-    orientation === "portrait" && a.contrast > 0.32 && a.sharpness > 0.3
+    trustPeople &&
+    peopleCount === 0 &&
+    orientation === "portrait" &&
+    a.contrast > 0.32 &&
+    a.sharpness > 0.3
   ) {
     photoType = "outfit";
     photoTypeConfidence = 0.45;
@@ -266,9 +331,15 @@ export function classifyPhoto(
     photoTypeConfidence = 0.5;
   }
 
-  return { photoType, photoTypeConfidence, peopleCount, peopleConfidence, orientation, peopleUnsure };
+  return {
+    photoType,
+    photoTypeConfidence,
+    peopleCount,
+    peopleConfidence,
+    orientation,
+    peopleUnsure,
+  };
 }
-
 
 export function scorePhoto(
   input: { width: number; height: number; analysis: Analysis },
@@ -287,29 +358,40 @@ export function scorePhoto(
   const brightnessPenalty = 1 - Math.abs(a.brightness - 0.55) * 1.8;
   const lighting = clamp(brightnessPenalty * 0.55 + a.contrast * 0.3 + a.sharpness * 0.15);
   const aesthetic = clamp(
-    a.contrast * 0.4 + a.saturation * 0.25 + (1 - Math.abs(a.brightness - 0.5)) * 0.2 + a.sharpness * 0.15,
+    a.contrast * 0.4 +
+      a.saturation * 0.25 +
+      (1 - Math.abs(a.brightness - 0.5)) * 0.2 +
+      a.sharpness * 0.15,
   );
   const quality = clamp(a.sharpness * 0.55 + a.contrast * 0.3 + (a.brightness > 0.15 ? 0.15 : 0));
 
-  const detectionPeople = a.detectedPeopleCount >= 0 || a.detectedFaceCount >= 0
-    ? Math.max(0, Math.max(a.detectedPeopleCount, a.detectedFaceCount))
-    : -1;
-  const peopleScore = detectionPeople >= 0
-    ? clamp(detectionPeople / 4)
-    : clamp(a.faceish * 4);
+  const detectionPeople =
+    a.detectedPeopleCount >= 0 || a.detectedFaceCount >= 0
+      ? Math.max(0, Math.max(a.detectedPeopleCount, a.detectedFaceCount))
+      : -1;
+  const peopleScore = detectionPeople >= 0 ? clamp(detectionPeople / 4) : clamp(a.faceish * 4);
 
   const fun = clamp(a.saturation * 0.4 + peopleScore * 0.35 + a.contrast * 0.25);
   const unique = 0.7;
 
   const w = vibeWeights(settings.vibes, classification.photoType);
   const postWorthy = clamp(
-    aesthetic * w.aesthetic + fun * w.fun + peopleScore * w.people + w.typeBonus * 0.4 + lighting * 0.1,
+    aesthetic * w.aesthetic +
+      fun * w.fun +
+      peopleScore * w.people +
+      w.typeBonus * 0.4 +
+      lighting * 0.1,
   );
 
   const formatBonus = formatMatch(input.width / Math.max(1, input.height), settings.formats);
   const scores: Scores = { aesthetic, fun, postWorthy, unique, quality, lighting };
   const overall = clamp(
-    aesthetic * 0.22 + fun * 0.12 + postWorthy * 0.28 + quality * 0.15 + lighting * 0.13 + formatBonus * 0.1,
+    aesthetic * 0.22 +
+      fun * 0.12 +
+      postWorthy * 0.28 +
+      quality * 0.15 +
+      lighting * 0.13 +
+      formatBonus * 0.1,
   );
 
   const tags: Tag[] = [];
@@ -327,8 +409,13 @@ export function scorePhoto(
   const peopleHigh = !unsure && classification.peopleConfidence >= 0.6;
 
   const typeTag: Record<PhotoType, Tag> = {
-    selfie: "Selfie", group: "Group", food: "Food", landscape: "Landscape",
-    outfit: "Outfit", detail: "Detail", random: "Random",
+    selfie: "Selfie",
+    group: "Group",
+    food: "Food",
+    landscape: "Landscape",
+    outfit: "Outfit",
+    detail: "Detail",
+    random: "Random",
   };
 
   if (classification.photoType === "selfie" || classification.photoType === "group") {
@@ -345,7 +432,8 @@ export function scorePhoto(
   }
 
   if (classification.orientation === "landscape") tags.push("Wide shot");
-  if (classification.orientation === "portrait" && classification.photoType === "detail") tags.push("Close up");
+  if (classification.orientation === "portrait" && classification.photoType === "detail")
+    tags.push("Close up");
 
   if (postWorthy > 0.78 && peopleHigh && classification.peopleCount >= 1) {
     tags.push("Main character");
@@ -362,7 +450,6 @@ export function scorePhoto(
     reasons.push("High color + people energy — fits your funny vibe.");
   }
 
-
   return { scores, overall, tags: dedupe(tags).slice(0, 3), reasons };
 }
 
@@ -371,24 +458,45 @@ function dedupe<T>(arr: T[]) {
 }
 
 function vibeWeights(vibes: VibeFocus[], type: PhotoType) {
-  let aesthetic = 0, fun = 0, people = 0, typeBonus = 0;
+  let aesthetic = 0,
+    fun = 0,
+    people = 0,
+    typeBonus = 0;
   const list = vibes.length ? vibes : (["random"] as VibeFocus[]);
   for (const v of list) {
     switch (v) {
       case "aesthetic":
-        aesthetic += 1; if (type === "landscape" || type === "detail" || type === "outfit") typeBonus += 1; break;
+        aesthetic += 1;
+        if (type === "landscape" || type === "detail" || type === "outfit") typeBonus += 1;
+        break;
       case "cute":
-        people += 0.6; aesthetic += 0.4; if (type === "selfie" || type === "group") typeBonus += 0.8; break;
+        people += 0.6;
+        aesthetic += 0.4;
+        if (type === "selfie" || type === "group") typeBonus += 0.8;
+        break;
       case "funny":
-        fun += 1; if (type === "selfie" || type === "group" || type === "random") typeBonus += 0.7; break;
+        fun += 1;
+        if (type === "selfie" || type === "group" || type === "random") typeBonus += 0.7;
+        break;
       case "vacation":
-        aesthetic += 0.6; people += 0.4; if (type === "landscape" || type === "group" || type === "food") typeBonus += 1; break;
+        aesthetic += 0.6;
+        people += 0.4;
+        if (type === "landscape" || type === "group" || type === "food") typeBonus += 1;
+        break;
       case "food":
-        aesthetic += 0.5; if (type === "food" || type === "detail") typeBonus += 1.2; break;
+        aesthetic += 0.5;
+        if (type === "food" || type === "detail") typeBonus += 1.2;
+        break;
       case "friends":
-        people += 1; if (type === "group" || type === "selfie") typeBonus += 1; break;
+        people += 1;
+        if (type === "group" || type === "selfie") typeBonus += 1;
+        break;
       case "random":
-        aesthetic += 0.34; fun += 0.33; people += 0.33; typeBonus += 0.3; break;
+        aesthetic += 0.34;
+        fun += 0.33;
+        people += 0.33;
+        typeBonus += 0.3;
+        break;
     }
   }
   const total = Math.max(1, list.length);
@@ -435,14 +543,17 @@ export function isSemanticallySimilar(a: Photo, b: Photo) {
   const ah = hammingDistance(a.analysis.aHash, b.analysis.aHash);
   if (ah > SEMANTIC_AHASH_MAX) return false;
   if (a.orientation !== b.orientation && a.photoType !== b.photoType) return false;
-  if (a.photoType !== "random" && b.photoType !== "random" && a.photoType !== b.photoType) return false;
+  if (a.photoType !== "random" && b.photoType !== "random" && a.photoType !== b.photoType)
+    return false;
   return paletteDistance(a, b) < 0.24 && histogramDistance(a, b) < 0.12;
 }
 
 function paletteDistance(a: Photo, b: Photo) {
-  return Math.abs(a.analysis.avgR - b.analysis.avgR) +
+  return (
+    Math.abs(a.analysis.avgR - b.analysis.avgR) +
     Math.abs(a.analysis.avgG - b.analysis.avgG) +
-    Math.abs(a.analysis.avgB - b.analysis.avgB);
+    Math.abs(a.analysis.avgB - b.analysis.avgB)
+  );
 }
 
 function histogramDistance(a: Photo, b: Photo) {
@@ -472,7 +583,11 @@ function cluster(
     let placed = false;
     for (const g of groups) {
       const anchor = g[0];
-      if (similar(p, anchor)) { g.push(p); placed = true; break; }
+      if (similar(p, anchor)) {
+        g.push(p);
+        placed = true;
+        break;
+      }
     }
     if (!placed) groups.push([p]);
   }
@@ -495,9 +610,10 @@ export function buildSimilarStage(photos: Photo[]): {
     const [best, ...rest] = g.photos;
     survivors.push(best);
     if (rest.length) {
-      const reason = best.scores.lighting >= 0.6
-        ? `Kept because it had better lighting & sharpness than ${rest.length} near-duplicate${rest.length === 1 ? "" : "s"}.`
-        : `Kept because it had the highest overall score among ${rest.length + 1} near-duplicates.`;
+      const reason =
+        best.scores.lighting >= 0.6
+          ? `Kept because it had better lighting & sharpness than ${rest.length} near-duplicate${rest.length === 1 ? "" : "s"}.`
+          : `Kept because it had the highest overall score among ${rest.length + 1} near-duplicates.`;
       removedNearDup.push({ kept: best, dropped: rest, reason });
       if (!best.reasons.includes(reason)) best.reasons.push(reason);
     }
@@ -521,7 +637,11 @@ export function buildAllSimilarGroups(photos: Photo[]): SimilarGroup[] {
   for (const p of photos) {
     let placed = false;
     for (const g of groups) {
-      if (similar(p, g[0])) { g.push(p); placed = true; break; }
+      if (similar(p, g[0])) {
+        g.push(p);
+        placed = true;
+        break;
+      }
     }
     if (!placed) groups.push([p]);
   }
@@ -538,8 +658,15 @@ export function groupBestBadges(photos: Photo[]): Record<string, string[]> {
   if (photos.length === 0) return out;
   photos.forEach((p) => (out[p.id] = []));
   const winner = (key: (p: Photo) => number, label: string) => {
-    let best = photos[0], v = key(photos[0]);
-    for (const p of photos) { const s = key(p); if (s > v) { v = s; best = p; } }
+    let best = photos[0],
+      v = key(photos[0]);
+    for (const p of photos) {
+      const s = key(p);
+      if (s > v) {
+        v = s;
+        best = p;
+      }
+    }
     if (!out[best.id].includes(label)) out[best.id].push(label);
   };
   winner((p) => p.scores.lighting, "Best lighting");
@@ -552,15 +679,22 @@ export function shortlist(photos: Photo[]): Photo[] {
   return [...photos].filter((p) => p.scores.quality > 0.18).sort((a, b) => b.overall - a.overall);
 }
 
-export function aiOrder(photos: Photo[], settings?: Settings): Photo[] {
+export function aiOrder(
+  photos: Photo[],
+  settings?: Settings,
+  options: { pinnedCoverId?: string | null } = {},
+): Photo[] {
   if (photos.length <= 2) return [...photos];
   const pool = [...photos];
-  pool.sort((a, b) => b.overall - a.overall);
+  pool.sort((a, b) => rankingScore(b) - rankingScore(a));
 
   const wantsFunny = settings?.vibes.includes("funny");
   const wantsFriends = settings?.vibes.includes("friends") || settings?.vibes.includes("cute");
 
-  const first = pool.shift()!;
+  const pinnedIndex = options.pinnedCoverId
+    ? pool.findIndex((photo) => photo.id === options.pinnedCoverId)
+    : -1;
+  const first = pinnedIndex >= 0 ? pool.splice(pinnedIndex, 1)[0] : pool.shift()!;
   first.tags = dedupe([
     ...first.tags.filter((t) => t !== "Good filler slide" && t !== "Best ending"),
     "Good first slide",
@@ -569,8 +703,8 @@ export function aiOrder(photos: Photo[], settings?: Settings): Photo[] {
   const finale = wantsFunny
     ? bestBy(pool, (p) => p.scores.fun + (p.tags.includes("Funny one") ? 0.2 : 0))
     : wantsFriends
-      ? bestBy(pool, (p) => p.scores.fun * 0.5 + p.scores.postWorthy * 0.5)
-      : bestBy(pool, (p) => p.scores.aesthetic);
+      ? bestBy(pool, (p) => peopleWeight(p) * 0.45 + rankingScore(p) * 0.55)
+      : bestBy(pool, (p) => p.scores.aesthetic * 0.45 + rankingScore(p) * 0.55);
   if (finale) {
     pool.splice(pool.indexOf(finale), 1);
     finale.tags = dedupe([
@@ -588,22 +722,35 @@ export function aiOrder(photos: Photo[], settings?: Settings): Photo[] {
     for (let i = 0; i < pool.length; i++) {
       const c = pool[i];
       let penalty = 0;
-      if (c.photoType === prev.photoType) penalty += 6;
+      if (sceneKey(c) === sceneKey(prev)) penalty += 7;
+      if (prev2 && sceneKey(c) === sceneKey(prev2)) penalty += 3;
+      if (c.photoType === prev.photoType) penalty += 4;
       if (prev2 && c.photoType === prev2.photoType) penalty += 2.5;
-      if (c.peopleCount === prev.peopleCount && c.peopleCount !== 0) {
-        penalty += c.peopleCount >= 2 ? 4 : 2;
-      }
+      if (peopleWeight(c) > 0.35 && peopleWeight(prev) > 0.35) penalty += 5;
+      if (prev2 && peopleWeight(c) > 0.35 && peopleWeight(prev2) > 0.35) penalty += 2;
+      if (c.duplicateClusterId && c.duplicateClusterId === prev.duplicateClusterId) penalty += 8;
       const cd = cosineDistance(c.analysis.feature, prev.analysis.feature);
-      if (cd < 0.05) penalty += 6;
-      else if (cd < 0.1) penalty += 3;
+      if (cd < 0.05) penalty += 8;
+      else if (cd < 0.1) penalty += 4;
       if (prev2) {
         const cd2 = cosineDistance(c.analysis.feature, prev2.analysis.feature);
-        if (cd2 < 0.05) penalty += 2;
+        if (cd2 < 0.05) penalty += 3;
       }
-      if (prev2 && c.orientation === prev.orientation && prev.orientation === prev2.orientation) penalty += 1.5;
-      const overallDelta = Math.abs(c.overall - prev.overall);
-      if (overallDelta < 0.05) penalty += 0.8;
+      if (c.orientation === prev.orientation) penalty += 1.5;
+      if (prev2 && c.orientation === prev.orientation && prev.orientation === prev2.orientation) {
+        penalty += 3;
+      }
+      const recent = ordered.slice(-3);
+      const recentPeople = recent.filter((p) => peopleWeight(p) > 0.35).length;
+      const recentScene = recent.filter((p) => sceneKey(p) === sceneKey(c)).length;
+      const recentType = recent.filter((p) => p.photoType === c.photoType).length;
+      if (peopleWeight(c) > 0.35 && recentPeople >= 2) penalty += 4;
+      if (recentScene >= 2) penalty += 3.5;
+      if (recentType >= 2) penalty += 2.5;
+      const scoreDrop = Math.max(0, rankingScore(prev) - rankingScore(c));
+      penalty += scoreDrop * 1.1;
       penalty += i * 0.01;
+      penalty += seededJitter(c.id, ordered.length) * 1.6;
 
       if (penalty < bestScore) {
         bestScore = penalty;
@@ -623,12 +770,40 @@ export function aiOrder(photos: Photo[], settings?: Settings): Photo[] {
   return ordered;
 }
 
+function seededJitter(id: string, slot: number) {
+  let hash = slot + 17;
+  for (let i = 0; i < id.length; i++) {
+    hash = (hash * 31 + id.charCodeAt(i)) % 9973;
+  }
+  return hash / 9973 - 0.5;
+}
+
+function rankingScore(photo: Photo) {
+  return (
+    photo.unifiedAnalysis?.analysis.rankingScore ?? photo.ranking?.overallScore ?? photo.overall
+  );
+}
+
+function peopleWeight(photo: Photo) {
+  return Math.min(1, (photo.unifiedAnalysis?.analysis.peopleCount ?? photo.peopleCount) / 3);
+}
+
+function sceneKey(photo: Photo) {
+  return (
+    photo.unifiedAnalysis?.analysis.scene ?? photo.sceneAnalysis?.primaryScene ?? photo.photoType
+  );
+}
+
 function bestBy<T>(arr: T[], score: (t: T) => number): T | undefined {
   if (!arr.length) return undefined;
-  let best = arr[0], bestScore = score(arr[0]);
+  let best = arr[0],
+    bestScore = score(arr[0]);
   for (let i = 1; i < arr.length; i++) {
     const s = score(arr[i]);
-    if (s > bestScore) { best = arr[i]; bestScore = s; }
+    if (s > bestScore) {
+      best = arr[i];
+      bestScore = s;
+    }
   }
   return best;
 }

@@ -17,9 +17,5 @@ export function BrandWordmark({
   size?: string;
   className?: string;
 }) {
-  return (
-    <span className={`font-display ${size} ${className}`}>
-      DumpDeck
-    </span>
-  );
+  return <span className={`font-display ${size} ${className}`}>DumpDeck</span>;
 }

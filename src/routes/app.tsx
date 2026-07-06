@@ -1,6 +1,6 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { AnimatePresence, motion, type PanInfo } from "framer-motion";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowLeft,
   ArrowRight,
@@ -11,6 +11,7 @@ import {
   Laugh,
   Palette,
   Palmtree,
+  Pin,
   RotateCcw,
   Save,
   Shuffle,
@@ -27,39 +28,103 @@ import JSZip from "jszip";
 import { toast } from "sonner";
 import { Copy, RefreshCw, MessageCircle } from "lucide-react";
 import { generateCaptions, type CaptionIdea } from "@/lib/dumpdeck/captions";
+import { nextAnalyzingTagline, rememberTagline } from "@/lib/dumpdeck/analyzing-taglines";
 
 import { Button } from "@/components/ui/button";
 import { Toaster } from "@/components/ui/sonner";
 import { DumpDeckProvider, useDumpDeck } from "@/lib/dumpdeck/store";
+import { aiOrder, groupBestBadges } from "@/lib/dumpdeck/ai";
 import {
-  aiOrder,
-  analyzeImage,
-  buildAllSimilarGroups,
-  classifyPhoto,
-  groupBestBadges,
-  groupNearDuplicates,
-  scorePhoto,
-  shortlist,
-} from "@/lib/dumpdeck/ai";
-import { detectPeopleAndFaces, warmupDetection } from "@/lib/dumpdeck/detection";
-import type { Photo, PostFormat, RemovedPhoto, Settings, VibeFocus } from "@/lib/dumpdeck/types";
-import { UploadGrid, type UploadItem } from "@/components/dumpdeck/upload-grid";
+  assignDuplicateClusters,
+  buildDuplicateGroupsForPhotos,
+  type DuplicateClusterInput,
+} from "@/lib/dumpdeck/pipeline/duplicate-clustering";
+import { organizePhotos } from "@/lib/dumpdeck/pipeline/organization";
+import {
+  saveFinalDraft,
+  type DuplicateDecisionDraft,
+  type FinalDraftPayload,
+} from "@/lib/dumpdeck/drafts";
+import {
+  removedByRanking,
+  rankPhotos,
+  rankingShortlist,
+} from "@/lib/dumpdeck/pipeline/ranking-engine";
+import {
+  saveDuplicateClusterAssignments,
+  savePhotoRankings,
+} from "@/lib/dumpdeck/pipeline/metadata-cache";
+import type {
+  Photo,
+  PostFormat,
+  RemovedPhoto,
+  Settings,
+  AnalysisStatus,
+  UploadItem,
+  VibeFocus,
+} from "@/lib/dumpdeck/types";
+import { UploadGrid } from "@/components/dumpdeck/upload-grid";
 import { PhotoCard } from "@/components/dumpdeck/photo-card";
 import { SortableGrid } from "@/components/dumpdeck/sortable-grid";
 import { ScoreBadge } from "@/components/dumpdeck/score-badge";
 import { TagBadge } from "@/components/dumpdeck/tag-badge";
 import { BrandMark, BrandWordmark } from "@/components/dumpdeck/brand";
-
+import { useAuth } from "@/hooks/use-auth";
+import { isLocalDevAuth } from "@/integrations/supabase/client";
 
 const MAX_KEEP = 20;
+const LOCAL_SCAN_CONCURRENCY = 3;
+
+function analysisOf(photo: Photo) {
+  return photo.unifiedAnalysis?.analysis;
+}
+
+function rankingScore(photo: Photo) {
+  return analysisOf(photo)?.rankingScore ?? photo.overall;
+}
+
+function orderWithPinned(photos: Photo[], pinnedCoverId?: string | null) {
+  if (!pinnedCoverId) return photos;
+  const pinned = photos.find((photo) => photo.id === pinnedCoverId);
+  if (!pinned) return photos;
+  return [pinned, ...photos.filter((photo) => photo.id !== pinnedCoverId)];
+}
+
+function reasoningFor(photo: Photo) {
+  return analysisOf(photo)?.reasoning ?? photo.reasons[0] ?? "";
+}
+
+function activeProjectId() {
+  try {
+    return sessionStorage.getItem("dumpdeck:activeProjectId");
+  } catch {
+    return null;
+  }
+}
+
+function activeDraftId() {
+  try {
+    return sessionStorage.getItem("dumpdeck:activeDraftId");
+  } catch {
+    return null;
+  }
+}
+
+function projectUploadCountKey(projectId: string) {
+  return `dumpdeck:project:${projectId}:uploadCount`;
+}
 
 export const Route = createFileRoute("/app")({
   head: () => ({
     meta: [
       { title: "dumpify — Build your dump" },
-      { name: "description", content: "Upload, analyze, curate, order, and export your photo dump." },
+      {
+        name: "description",
+        content: "Upload, analyze, curate, order, and export your photo dump.",
+      },
     ],
   }),
+  errorComponent: AppError,
   component: () => (
     <DumpDeckProvider>
       <Shell />
@@ -68,7 +133,38 @@ export const Route = createFileRoute("/app")({
   ),
 });
 
-const STAGES = ["setup", "upload", "analyze", "similar", "results", "curate", "final", "export"] as const;
+function AppError({ reset }: { reset: () => void }) {
+  return (
+    <main className="grid min-h-screen place-items-center px-5 text-center">
+      <div className="max-w-sm">
+        <BrandMark className="mx-auto h-12 w-12" />
+        <h1 className="mt-4 font-display text-3xl">Sorting did not load</h1>
+        <p className="mt-2 text-sm text-muted-foreground">
+          The workspace hit a temporary issue before the upload flow could start.
+        </p>
+        <div className="mt-5 flex justify-center gap-2">
+          <button type="button" onClick={reset} className="chip bg-ink text-cream">
+            Try again
+          </button>
+          <Link to="/projects" className="chip">
+            Back home
+          </Link>
+        </div>
+      </div>
+    </main>
+  );
+}
+
+const STAGES = [
+  "setup",
+  "upload",
+  "analyze",
+  "similar",
+  "results",
+  "curate",
+  "final",
+  "export",
+] as const;
 
 const FORMAT_LABEL: Record<PostFormat, string> = {
   square: "Instagram square (1:1)",
@@ -85,7 +181,70 @@ const FORMAT_ASPECT: Record<PostFormat, string> = {
 };
 
 function Shell() {
-  const { state } = useDumpDeck();
+  const { state, dispatch } = useDumpDeck();
+  const { isAuthed, loading } = useAuth();
+
+  useEffect(() => {
+    if (!isAuthed) return;
+    const raw = sessionStorage.getItem("dumpdeck:resumeDraft");
+    if (!raw) return;
+    try {
+      const draft = JSON.parse(raw) as FinalDraftPayload;
+      if (!Array.isArray(draft.finalOrder) || draft.finalOrder.length === 0) {
+        toast.error("That draft is missing photo details. Start from the saved project instead.");
+        return;
+      }
+      const finalOrder = orderWithPinned(draft.finalOrder, draft.pinnedCoverPhotoId);
+      dispatch({
+        type: "hydrate",
+        state: {
+          stage: "final",
+          settings: draft.selectedPreferences ?? { formats: ["portrait"], vibes: ["random"] },
+          photos: finalOrder,
+          shortlist: finalOrder,
+          kept: finalOrder,
+          finalOrder,
+          removed: Array.isArray(draft.removed) ? draft.removed : [],
+          duplicateDecisions: draft.duplicateDecisions ?? [],
+          pinnedCoverId: draft.pinnedCoverPhotoId ?? null,
+        },
+      });
+      toast.success("Draft opened");
+    } catch (err) {
+      console.error("[dumpdeck] failed to resume draft", err);
+      toast.error("Could not open that draft.");
+    } finally {
+      sessionStorage.removeItem("dumpdeck:resumeDraft");
+    }
+  }, [dispatch, isAuthed]);
+
+  if (loading) {
+    return (
+      <main className="grid min-h-screen place-items-center text-sm text-muted-foreground">
+        Loading…
+      </main>
+    );
+  }
+
+  if (!isAuthed) {
+    return (
+      <main className="grid min-h-screen place-items-center px-5 text-center">
+        <div className="max-w-sm">
+          <h1 className="font-display text-3xl">Sign in to start sorting</h1>
+          <p className="mt-2 text-sm text-muted-foreground">
+            Your projects and sorting sessions are saved to your account.
+          </p>
+          <Link
+            to="/auth"
+            className="mt-5 inline-flex h-11 items-center rounded-xl bg-ink px-4 font-semibold text-cream"
+          >
+            Sign in
+          </Link>
+        </div>
+      </main>
+    );
+  }
+
   return (
     <main className="relative mx-auto min-h-screen max-w-md px-4 pb-28 pt-6">
       <TopBar />
@@ -118,13 +277,14 @@ function TopBar() {
   const { dispatch } = useDumpDeck();
   return (
     <header className="flex items-center justify-between">
-      <Link to="/" className="flex items-center gap-2">
+      <Link to="/projects" className="flex items-center gap-2">
         <BrandMark className="h-9 w-9" />
         <BrandWordmark size="text-lg" />
       </Link>
       <button
         onClick={() => {
-          if (confirm("Start over? Your current progress will be cleared.")) dispatch({ type: "reset" });
+          if (confirm("Start over? Your current progress will be cleared."))
+            dispatch({ type: "reset" });
         }}
         className="chip"
         type="button"
@@ -194,12 +354,37 @@ function SetupStage() {
     dispatch({ type: "setStage", stage: "upload" });
   }
 
-  const formatOpts: { id: PostFormat; label: string; ratio: string; box: string; grad: string }[] = [
-    { id: "square",    label: "Instagram square",   ratio: "1 : 1",     box: "h-14 w-14",     grad: "bg-gradient-to-br from-coral to-butter" },
-    { id: "portrait",  label: "Portrait carousel",  ratio: "4 : 5",     box: "h-16 w-[3.2rem]", grad: "bg-gradient-to-br from-lavender to-mint" },
-    { id: "landscape", label: "Landscape",          ratio: "1.91 : 1",  box: "h-10 w-[4.2rem]", grad: "bg-gradient-to-br from-mint to-butter" },
-    { id: "story",     label: "Story",              ratio: "9 : 16",    box: "h-16 w-9",       grad: "bg-gradient-to-br from-coral to-lavender" },
-  ];
+  const formatOpts: { id: PostFormat; label: string; ratio: string; box: string; grad: string }[] =
+    [
+      {
+        id: "square",
+        label: "Instagram square",
+        ratio: "1 : 1",
+        box: "h-14 w-14",
+        grad: "bg-gradient-to-br from-coral to-butter",
+      },
+      {
+        id: "portrait",
+        label: "Portrait carousel",
+        ratio: "4 : 5",
+        box: "h-16 w-[3.2rem]",
+        grad: "bg-gradient-to-br from-lavender to-mint",
+      },
+      {
+        id: "landscape",
+        label: "Landscape",
+        ratio: "1.91 : 1",
+        box: "h-10 w-[4.2rem]",
+        grad: "bg-gradient-to-br from-mint to-butter",
+      },
+      {
+        id: "story",
+        label: "Story",
+        ratio: "9 : 16",
+        box: "h-16 w-9",
+        grad: "bg-gradient-to-br from-coral to-lavender",
+      },
+    ];
 
   const vibeOpts: {
     id: VibeFocus;
@@ -208,15 +393,56 @@ function SetupStage() {
     hint: string;
     tile: string;
   }[] = [
-    { id: "cute",      label: "Cute",        Icon: Heart,            hint: "Soft, sweet moments",   tile: "from-coral/80 to-butter/80" },
-    { id: "aesthetic", label: "Aesthetic",   Icon: Palette,          hint: "Color, light, mood",    tile: "from-lavender to-mint" },
-    { id: "funny",     label: "Funny",       Icon: Laugh,            hint: "Chaotic, candid",       tile: "from-butter to-coral/70" },
-    { id: "vacation",  label: "Vacation",    Icon: Palmtree,         hint: "Travel + scenery",      tile: "from-mint to-lavender" },
-    { id: "food",      label: "Food",        Icon: UtensilsCrossed,  hint: "Plates + details",      tile: "from-coral/70 to-butter" },
-    { id: "friends",   label: "Friends",     Icon: Users,            hint: "People-first",          tile: "from-mint to-butter" },
-    { id: "random",    label: "Random dump", Icon: Shuffle,          hint: "A little of everything", tile: "from-lavender to-coral/70" },
+    {
+      id: "cute",
+      label: "Cute",
+      Icon: Heart,
+      hint: "Soft, sweet moments",
+      tile: "from-coral/80 to-butter/80",
+    },
+    {
+      id: "aesthetic",
+      label: "Aesthetic",
+      Icon: Palette,
+      hint: "Color, light, mood",
+      tile: "from-lavender to-mint",
+    },
+    {
+      id: "funny",
+      label: "Funny",
+      Icon: Laugh,
+      hint: "Chaotic, candid",
+      tile: "from-butter to-coral/70",
+    },
+    {
+      id: "vacation",
+      label: "Vacation",
+      Icon: Palmtree,
+      hint: "Travel + scenery",
+      tile: "from-mint to-lavender",
+    },
+    {
+      id: "food",
+      label: "Food",
+      Icon: UtensilsCrossed,
+      hint: "Plates + details",
+      tile: "from-coral/70 to-butter",
+    },
+    {
+      id: "friends",
+      label: "Friends",
+      Icon: Users,
+      hint: "People-first",
+      tile: "from-mint to-butter",
+    },
+    {
+      id: "random",
+      label: "Random dump",
+      Icon: Shuffle,
+      hint: "A little of everything",
+      tile: "from-lavender to-coral/70",
+    },
   ];
-
 
   const formatsFull = formats.length >= 3;
   const vibesFull = vibes.length >= 3;
@@ -256,7 +482,9 @@ function SetupStage() {
 
       <div className="mt-6">
         <div className="mb-2 flex items-baseline justify-between">
-          <div className="text-xs font-bold uppercase tracking-wider text-muted-foreground">Post format</div>
+          <div className="text-xs font-bold uppercase tracking-wider text-muted-foreground">
+            Post format
+          </div>
           <div className="text-[11px] text-muted-foreground">{formats.length}/3 picked</div>
         </div>
         <div className="grid grid-cols-2 gap-2">
@@ -287,7 +515,9 @@ function SetupStage() {
 
       <div className="mt-6">
         <div className="mb-2 flex items-baseline justify-between">
-          <div className="text-xs font-bold uppercase tracking-wider text-muted-foreground">Post vibe</div>
+          <div className="text-xs font-bold uppercase tracking-wider text-muted-foreground">
+            Post vibe
+          </div>
           <div className="text-[11px] text-muted-foreground">{vibes.length}/3 picked</div>
         </div>
         <div className="grid grid-cols-2 gap-2">
@@ -335,15 +565,268 @@ function SetupStage() {
 }
 
 /* ───────────── Upload ───────────── */
+async function makeLocalSampleUploads(): Promise<UploadItem[]> {
+  const samples = [
+    {
+      name: "Brunch table",
+      displayName: "Brunch table",
+      colorA: "#ff7a59",
+      colorB: "#f7d154",
+      label: "food",
+      seed: 0,
+    },
+    {
+      name: "Brunch table copy",
+      displayName: "Brunch table",
+      colorA: "#ff7a59",
+      colorB: "#f7d154",
+      label: "food",
+      seed: 0,
+    },
+    {
+      name: "City night",
+      displayName: "City night",
+      colorA: "#223049",
+      colorB: "#7cc6fe",
+      label: "city",
+      seed: 1,
+    },
+    {
+      name: "Beach walk",
+      displayName: "Beach walk",
+      colorA: "#4db6ac",
+      colorB: "#ffe08a",
+      label: "beach",
+      seed: 2,
+    },
+    {
+      name: "Mountain view",
+      displayName: "Mountain view",
+      colorA: "#6c7a89",
+      colorB: "#b8e0d2",
+      label: "landscape",
+      seed: 3,
+    },
+    {
+      name: "Portrait smile",
+      displayName: "Portrait smile",
+      colorA: "#c084fc",
+      colorB: "#ffd6a5",
+      label: "friends",
+      seed: 4,
+    },
+    {
+      name: "Dog park",
+      displayName: "Dog park",
+      colorA: "#78c6a3",
+      colorB: "#f4a261",
+      label: "pets",
+      seed: 5,
+    },
+    {
+      name: "Gallery wall",
+      displayName: "Gallery wall",
+      colorA: "#f5f3ff",
+      colorB: "#7c3aed",
+      label: "aesthetic",
+      seed: 6,
+    },
+    {
+      name: "Coffee detail",
+      displayName: "Coffee detail",
+      colorA: "#8d6e63",
+      colorB: "#ffe0b2",
+      label: "food",
+      seed: 7,
+    },
+    {
+      name: "Hotel mirror",
+      displayName: "Hotel mirror",
+      colorA: "#f8bbd0",
+      colorB: "#90caf9",
+      label: "outfit",
+      seed: 8,
+    },
+    {
+      name: "Museum steps",
+      displayName: "Museum steps",
+      colorA: "#cfd8dc",
+      colorB: "#ffab91",
+      label: "city",
+      seed: 9,
+    },
+    {
+      name: "Sunset road",
+      displayName: "Sunset road",
+      colorA: "#ff8a65",
+      colorB: "#5c6bc0",
+      label: "travel",
+      seed: 10,
+    },
+    {
+      name: "Park picnic",
+      displayName: "Park picnic",
+      colorA: "#aed581",
+      colorB: "#fff176",
+      label: "friends",
+      seed: 11,
+    },
+    {
+      name: "Train window",
+      displayName: "Train window",
+      colorA: "#78909c",
+      colorB: "#b3e5fc",
+      label: "travel",
+      seed: 12,
+    },
+    {
+      name: "Dessert plate",
+      displayName: "Dessert plate",
+      colorA: "#f48fb1",
+      colorB: "#fff59d",
+      label: "food",
+      seed: 13,
+    },
+    {
+      name: "Concert blur",
+      displayName: "Concert blur",
+      colorA: "#311b92",
+      colorB: "#f06292",
+      label: "night",
+      seed: 14,
+    },
+    {
+      name: "Lake dock",
+      displayName: "Lake dock",
+      colorA: "#4fc3f7",
+      colorB: "#a5d6a7",
+      label: "landscape",
+      seed: 15,
+    },
+    {
+      name: "Bookstore corner",
+      displayName: "Bookstore corner",
+      colorA: "#bcaaa4",
+      colorB: "#ffe082",
+      label: "indoors",
+      seed: 16,
+    },
+    {
+      name: "Market flowers",
+      displayName: "Market flowers",
+      colorA: "#ec407a",
+      colorB: "#81c784",
+      label: "detail",
+      seed: 17,
+    },
+    {
+      name: "Airport snack",
+      displayName: "Airport snack",
+      colorA: "#90a4ae",
+      colorB: "#ffcc80",
+      label: "travel",
+      seed: 18,
+    },
+  ];
+
+  return Promise.all(
+    samples.map(async (sample, index) => {
+      const width = sample.seed % 2 === 0 ? 900 : 720;
+      const height = sample.seed % 2 === 0 ? 1200 : 900;
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("Canvas is unavailable");
+
+      const gradient = ctx.createLinearGradient(0, 0, width, height);
+      gradient.addColorStop(0, sample.colorA);
+      gradient.addColorStop(1, sample.colorB);
+      ctx.fillStyle = gradient;
+      ctx.fillRect(0, 0, width, height);
+      ctx.globalAlpha = 0.2;
+      for (let i = 0; i < 12; i++) {
+        ctx.beginPath();
+        ctx.arc(
+          (((i + sample.seed) * 211) % width) + 40,
+          (((i + sample.seed) * 157) % height) + 40,
+          60 + (((i + sample.seed) * 23) % 110),
+          0,
+          Math.PI * 2,
+        );
+        ctx.fillStyle = i % 2 === 0 ? "#ffffff" : "#111827";
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = "rgba(255,255,255,0.86)";
+      ctx.fillRect(72, height - 210, width - 144, 120);
+      ctx.fillStyle = "#111827";
+      ctx.font = "700 48px system-ui, sans-serif";
+      ctx.fillText(sample.displayName, 108, height - 138);
+      ctx.font = "500 28px system-ui, sans-serif";
+      ctx.fillText(`Local ${sample.label} sample`, 108, height - 98);
+
+      const blob = await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob(
+          (result) => (result ? resolve(result) : reject(new Error("Could not create sample"))),
+          "image/jpeg",
+          0.9,
+        );
+      });
+      const url = URL.createObjectURL(blob);
+      return {
+        id: `local-sample-${index + 1}`,
+        url,
+        previewUrl: url,
+        name: `${sample.name}.jpg`,
+        width,
+        height,
+        fingerprint: `local-sample-${sample.seed}-${width}x${height}`,
+        byteSize: blob.size,
+        mimeType: blob.type,
+        lastModified: Date.now() - index * 1000,
+      };
+    }),
+  );
+}
+
 function UploadStage() {
   const { state, dispatch } = useDumpDeck();
   const [items, setItems] = useState<UploadItem[]>([]);
+  const [loadingSamples, setLoadingSamples] = useState(false);
 
   function handleAnalyze() {
+    const projectId = activeProjectId();
     sessionStorage.setItem(
       "dumpdeck:pending",
-      JSON.stringify(items.map((it) => ({ id: it.id, url: it.url, previewUrl: it.previewUrl, name: it.name, width: it.width, height: it.height }))),
+      JSON.stringify(
+        items.map((it) => ({
+          id: it.id,
+          url: it.url,
+          originalFileUrl: it.originalFileUrl,
+          previewFileUrl: it.previewFileUrl,
+          previewUrl: it.previewUrl,
+          name: it.name,
+          width: it.width,
+          height: it.height,
+          fingerprint: it.fingerprint,
+          byteSize: it.byteSize,
+          mimeType: it.mimeType,
+          originalMimeType: it.originalMimeType,
+          convertedFromHeic: it.convertedFromHeic,
+          conversionQuality: it.conversionQuality,
+          conversionDecoder: it.conversionDecoder,
+          originalByteSize: it.originalByteSize,
+          previewByteSize: it.previewByteSize,
+          lastModified: it.lastModified,
+        })),
+      ),
     );
+    sessionStorage.setItem("dumpdeck:lastUploadCount", String(items.length));
+    if (projectId) {
+      sessionStorage.setItem(projectUploadCountKey(projectId), String(items.length));
+      localStorage.setItem(projectUploadCountKey(projectId), String(items.length));
+    }
     dispatch({ type: "clearRemoved" });
     dispatch({ type: "setStage", stage: "analyze" });
   }
@@ -357,10 +840,14 @@ function UploadStage() {
       />
       <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px]">
         {state.settings.formats.map((f) => (
-          <span key={f} className="chip bg-lavender/40">{FORMAT_LABEL[f]}</span>
+          <span key={f} className="chip bg-lavender/40">
+            {FORMAT_LABEL[f]}
+          </span>
         ))}
         {state.settings.vibes.map((v) => (
-          <span key={v} className="chip bg-mint/40">#{v}</span>
+          <span key={v} className="chip bg-mint/40">
+            #{v}
+          </span>
         ))}
       </div>
       <div className="mt-5">
@@ -371,6 +858,29 @@ function UploadStage() {
           onAnalyze={handleAnalyze}
         />
       </div>
+      {isLocalDevAuth && (
+        <div className="mt-3">
+          <button
+            type="button"
+            onClick={async () => {
+              setLoadingSamples(true);
+              try {
+                setItems(await makeLocalSampleUploads());
+                toast.success("Loaded local sample photos");
+              } catch (err) {
+                console.error("[dumpdeck] sample photo generation failed", err);
+                toast.error("Could not load sample photos");
+              } finally {
+                setLoadingSamples(false);
+              }
+            }}
+            disabled={loadingSamples}
+            className="chip bg-mint/50 text-ink disabled:opacity-60"
+          >
+            {loadingSamples ? "Loading samples…" : "Use local sample photos"}
+          </button>
+        </div>
+      )}
       <div className="mt-4">
         <button
           onClick={() => dispatch({ type: "setStage", stage: "setup" })}
@@ -385,99 +895,1170 @@ function UploadStage() {
 }
 
 /* ───────────── Analyze ───────────── */
-const ANALYZE_LINES = [
-  "Reading every pixel…",
-  "Loading TensorFlow people detector…",
-  "Counting people + faces (COCO-SSD + MediaPipe)…",
-  "Hashing for near-duplicates…",
-  "Cosine-matching visually similar photos…",
-  "Classifying selfies, food, landscapes…",
-  "Scoring against your vibe & format…",
-];
+type AnalysisRow = {
+  item: UploadItem;
+  status: AnalysisStatus;
+  photo?: Photo;
+  clipEmbeddingVector?: number[];
+  error?: string;
+  attempts: number;
+  geminiRequests: number;
+  geminiCandidate?: boolean;
+  localSkipReason?: string;
+};
 
+type AnalysisPhase = "loading" | "local-scanning" | "refining" | "ready" | "preparing" | "blocked";
+
+type RefinementSnapshot = {
+  waiting: AnalysisRow[];
+  analyzing: AnalysisRow[];
+  retrying: AnalysisRow[];
+  completed: AnalysisRow[];
+  failed: AnalysisRow[];
+  skipped: AnalysisRow[];
+  screenshots: AnalysisRow[];
+  unsupported: AnalysisRow[];
+};
+
+type GeminiPhotoAudit = {
+  id: string;
+  name: string;
+  reason: string;
+  requests: number;
+  retries: number;
+  cache: "hit" | "miss" | "skipped" | "unknown";
+  status: "analyzed" | "failed" | "cancelled" | "skipped";
+  durationMs: number;
+  error?: string;
+};
+
+type GeminiRefinementAudit = {
+  requests: number;
+  retries: number;
+  failures: number;
+  cacheHits: number;
+  skippedReanalysis: number;
+  startedAt: number;
+  photos: GeminiPhotoAudit[];
+};
+
+type PipelineConfig = {
+  analysisConcurrency: number;
+  maxGeminiPhotos: number;
+  geminiModel: string;
+};
+
+async function getPipelineConfig(): Promise<PipelineConfig> {
+  try {
+    const response = await fetch("/api/dumpdeck/pipeline-config");
+    if (!response.ok) throw new Error(`Config request failed: ${response.status}`);
+    const data = await response.json();
+    const configured = Number(data.analysisConcurrency);
+    return {
+      analysisConcurrency: Number.isFinite(configured)
+        ? Math.min(10, Math.max(1, Math.round(configured)))
+        : 3,
+      maxGeminiPhotos: Number.isFinite(Number(data.maxGeminiPhotos))
+        ? Math.min(200, Math.max(0, Math.round(Number(data.maxGeminiPhotos))))
+        : 70,
+      geminiModel: typeof data.geminiModel === "string" ? data.geminiModel : "gemini-2.5-flash",
+    };
+  } catch (err) {
+    console.warn("[dumpdeck] pipeline config unavailable; using defaults", err);
+    return { analysisConcurrency: 3, maxGeminiPhotos: 70, geminiModel: "gemini-2.5-flash" };
+  }
+}
+
+function isRetryableAnalysisError(err: unknown) {
+  if (err && typeof err === "object" && "retryable" in err) {
+    return Boolean((err as { retryable?: unknown }).retryable);
+  }
+  const message = err instanceof Error ? err.message : String(err);
+  return /429|too.?many|resource_exhausted|rate limit|quota|temporar|timeout|network|upstream|unavailable|503|retry/i.test(
+    message,
+  );
+}
+
+function retryDelayMs(attempt: number, err?: unknown) {
+  const providerDelay =
+    err && typeof err === "object" && "retryAfterMs" in err
+      ? Number((err as { retryAfterMs?: unknown }).retryAfterMs)
+      : Number.NaN;
+  if (Number.isFinite(providerDelay) && providerDelay > 0) return providerDelay + retryJitterMs();
+  return [2000, 4000, 8000, 16000, 32000][Math.min(attempt - 1, 4)] + retryJitterMs();
+}
+
+function retryJitterMs() {
+  return Math.round(300 + Math.random() * 900);
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function useAnalyzingTagline({
+  items,
+  photos,
+  phase,
+  active,
+}: {
+  items: UploadItem[];
+  photos: Photo[];
+  phase: AnalysisPhase;
+  active: boolean;
+}) {
+  const tickRef = useRef(0);
+  const latestRef = useRef({ items, photos, phase });
+  const recentRef = useRef<string[]>([]);
+  const [line, setLine] = useState(() => {
+    const initial = nextAnalyzingTagline({
+      items,
+      photos,
+      phase,
+      tick: 0,
+      recent: [],
+    });
+    recentRef.current = rememberTagline([], initial);
+    return initial;
+  });
+
+  useEffect(() => {
+    latestRef.current = { items, photos, phase };
+  }, [items, photos, phase]);
+
+  useEffect(() => {
+    if (!active) return;
+    const rotate = () => {
+      tickRef.current += 1;
+      const current = latestRef.current;
+      const next = nextAnalyzingTagline({
+        ...current,
+        tick: tickRef.current,
+        recent: recentRef.current,
+      });
+      setLine((previous) => {
+        const safeNext =
+          next === previous
+            ? nextAnalyzingTagline({
+                ...current,
+                tick: tickRef.current + 17,
+                recent: [previous, ...recentRef.current],
+              })
+            : next;
+        recentRef.current = rememberTagline(recentRef.current, safeNext);
+        return safeNext;
+      });
+    };
+    const id = window.setInterval(rotate, 6000);
+    return () => window.clearInterval(id);
+  }, [active]);
+
+  return line;
+}
+
+function localRemovalReason(photo: Photo) {
+  const convertedFromHeic = photo.sourceMetadata?.convertedFromHeic;
+  const sharpnessFloor = convertedFromHeic ? 0.07 : 0.12;
+  if (
+    photo.imageQuality?.sharpness !== undefined &&
+    photo.imageQuality.sharpness < sharpnessFloor
+  ) {
+    return "Very blurry in quick scan.";
+  }
+  const brightness = photo.imageQuality?.signals.brightness ?? photo.analysis.brightness;
+  if (brightness < 0.08) return "Extremely dark in quick scan.";
+  if (brightness > 0.94) return "Extremely overexposed in quick scan.";
+  if (looksLikeScreenshot(photo)) return "Likely screenshot/non-photo skipped before Gemini.";
+  return "";
+}
+
+function looksLikeScreenshot(photo: Photo) {
+  const name = photo.name.toLowerCase();
+  if (/\bscreen\s?shot\b|screenshot|screen_recording|screen-recording/.test(name)) return true;
+  const ratio = photo.width / Math.max(1, photo.height);
+  const commonScreenRatio =
+    Math.abs(ratio - 9 / 16) < 0.02 ||
+    Math.abs(ratio - 16 / 9) < 0.02 ||
+    Math.abs(ratio - 19.5 / 9) < 0.03;
+  const objectLabels = new Set(
+    (photo.detectedObjects ?? []).map((object) => object.labelNormalized),
+  );
+  const scene = photo.sceneAnalysis?.primaryScene.toLowerCase() ?? "";
+  const textOrUi =
+    objectLabels.has("text") || objectLabels.has("screen") || objectLabels.has("button");
+  return (
+    scene.includes("screenshot") ||
+    scene.includes("screen") ||
+    scene.includes("receipt") ||
+    scene.includes("document") ||
+    scene.includes("meme") ||
+    objectLabels.has("receipt") ||
+    objectLabels.has("document") ||
+    (commonScreenRatio &&
+      ((photo.analysis.saturation < 0.2 && photo.analysis.contrast > 0.5) || textOrUi) &&
+      photo.analysis.sharpness > 0.5)
+  );
+}
+
+function chooseGeminiCandidates(rows: AnalysisRow[], maxGeminiPhotos: number) {
+  if (maxGeminiPhotos <= 0) return [];
+  const eligible = rows.filter((row) => row.status === "local_complete" && row.photo);
+  const scored = eligible.map((row) => {
+    const photo = row.photo!;
+    const quality = photo.imageQuality?.overallTechnicalQuality ?? photo.scores.quality;
+    const uncertain =
+      (photo.photoTypeConfidence < 0.58 ? 0.18 : 0) +
+      (photo.analysis.peopleUnsure ? 0.16 : 0) +
+      (photo.photoType === "random" ? 0.12 : 0);
+    const semanticNeed = photo.tags.some((tag) =>
+      ["Food", "Landscape", "Selfie", "Group", "Unsure"].includes(tag),
+    )
+      ? 0.14
+      : 0;
+    const tagNeed = row.photo
+      ? photoScoreForTags(photo, row.photo.unifiedAnalysis?.analysis.objects.length ?? 0)
+      : 0;
+    return {
+      row,
+      score: photo.overall * 0.45 + quality * 0.24 + uncertain + semanticNeed + tagNeed,
+    };
+  });
+  return scored
+    .sort((a, b) => b.score - a.score)
+    .slice(0, Math.min(maxGeminiPhotos, scored.length))
+    .map((entry) => entry.row);
+}
+
+function geminiCandidateReason(row: AnalysisRow) {
+  const photo = row.photo;
+  if (!photo) return "semantic refinement needed";
+  const reasons: string[] = [];
+  const quality = photo.imageQuality?.overallTechnicalQuality ?? photo.scores.quality;
+  if (photo.photoTypeConfidence < 0.58) reasons.push("uncertain local scene/type");
+  if (photo.analysis.peopleUnsure) reasons.push("people/face signal needs confirmation");
+  if (photo.tags.some((tag) => ["Food", "Landscape", "Selfie", "Group", "Unsure"].includes(tag))) {
+    reasons.push("semantic tag confirmation");
+  }
+  if (photo.overall >= 0.62 || quality >= 0.62) reasons.push("likely finalist");
+  if (
+    photo.photoType === "detail" ||
+    photo.photoType === "food" ||
+    photo.photoType === "landscape"
+  ) {
+    reasons.push("non-people aesthetic/detail candidate");
+  }
+  return reasons.length ? reasons.join("; ") : "selected for deeper Gemini refinement";
+}
+
+function photoScoreForTags(photo: Photo, objectCount: number) {
+  const tags = photo.tags.join(" ").toLowerCase();
+  let score = 0;
+  if (tags.includes("food") || photo.photoType === "food") score += 0.1;
+  if (tags.includes("landscape") || photo.photoType === "landscape") score += 0.08;
+  if (photo.peopleCount > 0) score += 0.08;
+  if (objectCount === 0 && photo.photoType === "random") score += 0.04;
+  return score;
+}
+
+function isScreenshotSkipReason(reason?: string) {
+  return /screenshot|screen|non-photo|receipt|document|meme/i.test(reason ?? "");
+}
+
+function isUnsupportedSkipReason(reason?: string) {
+  return /unsupported|corrupt|couldn't|failed|invalid/i.test(reason ?? "");
+}
+
+function refinementSnapshot(rows: AnalysisRow[]): RefinementSnapshot {
+  const skipped = rows.filter((row) => row.status === "skipped");
+  return {
+    waiting: rows.filter((row) => row.status === "queued"),
+    analyzing: rows.filter((row) => row.status === "analyzing"),
+    retrying: rows.filter((row) => row.status === "retrying"),
+    completed: rows.filter((row) => row.geminiCandidate && row.status === "analyzed"),
+    failed: rows.filter((row) => row.status === "failed"),
+    skipped,
+    screenshots: skipped.filter((row) => isScreenshotSkipReason(row.localSkipReason ?? row.error)),
+    unsupported: rows.filter(
+      (row) =>
+        row.status === "failed" ||
+        (row.status === "skipped" && isUnsupportedSkipReason(row.localSkipReason ?? row.error)),
+    ),
+  };
+}
+
+function logRefinementSnapshot(
+  label: string,
+  rows: AnalysisRow[],
+  extra: Record<string, unknown> = {},
+) {
+  const snapshot = refinementSnapshot(rows);
+  console.debug(`[dumpdeck] ${label}`, {
+    remainingGeminiRequests:
+      snapshot.waiting.length + snapshot.analyzing.length + snapshot.retrying.length,
+    photosWaitingForRefinement: snapshot.waiting.map((row) => ({
+      id: row.item.id,
+      name: row.item.name,
+      reason: row.error,
+    })),
+    currentlyAnalyzing: snapshot.analyzing.map((row) => ({
+      id: row.item.id,
+      name: row.item.name,
+      attempts: row.attempts,
+      geminiRequests: row.geminiRequests,
+    })),
+    retries: snapshot.retrying.map((row) => ({
+      id: row.item.id,
+      name: row.item.name,
+      attempts: row.attempts,
+      geminiRequests: row.geminiRequests,
+      error: row.error,
+    })),
+    cacheHits: snapshot.completed.filter((row) => row.geminiRequests === 0).length,
+    photosSkipped: snapshot.skipped.length,
+    screenshotsOrNonPhotos: snapshot.screenshots.length,
+    unsupportedOrFailed: snapshot.unsupported.length,
+    totalRemainingWork:
+      snapshot.waiting.length +
+      snapshot.analyzing.length +
+      snapshot.retrying.length +
+      snapshot.failed.length,
+    ...extra,
+  });
+}
 
 function AnalyzeStage() {
   const { state, dispatch } = useDumpDeck();
   const [progress, setProgress] = useState(0);
-  const [line, setLine] = useState(0);
   const [sample, setSample] = useState<{ url: string; previewUrl?: string }[]>([]);
+  const [rows, setRows] = useState<AnalysisRow[]>([]);
+  const [phase, setPhase] = useState<AnalysisPhase>("loading");
+  const [imagePipelineVersion, setImagePipelineVersion] = useState("");
+  const [analysisConcurrency, setAnalysisConcurrency] = useState(3);
+  const [maxGeminiPhotos, setMaxGeminiPhotos] = useState(70);
+  const runIdRef = useRef(0);
+  const rowsRef = useRef<AnalysisRow[]>([]);
+  const pendingItemsRef = useRef<UploadItem[]>([]);
+  const analysisStartedAtRef = useRef(0);
+  const localScanStartedAtRef = useRef(0);
+  const localScanDurationMsRef = useRef(0);
+  const meaningfulReadyAtRef = useRef(0);
 
   useEffect(() => {
-    let cancelled = false;
+    rowsRef.current = rows;
+  }, [rows]);
+
+  function updateRows(updater: (current: AnalysisRow[]) => AnalysisRow[]) {
+    setRows((current) => {
+      const next = updater(current);
+      rowsRef.current = next;
+      return next;
+    });
+  }
+
+  const analyzedCount = rows.filter((row) => row.status === "analyzed").length;
+  const failedRows = rows.filter((row) => row.status === "failed");
+  const skippedRows = rows.filter((row) => row.status === "skipped");
+  const screenshotRows = skippedRows.filter((row) =>
+    isScreenshotSkipReason(row.localSkipReason ?? row.error),
+  );
+  const unsupportedRows = rows.filter(
+    (row) =>
+      row.status === "failed" ||
+      (row.status === "skipped" && isUnsupportedSkipReason(row.localSkipReason ?? row.error)),
+  );
+  const backgroundRefiningCount = rows.filter(
+    (row) => row.geminiCandidate && ["queued", "analyzing", "retrying"].includes(row.status),
+  ).length;
+  const scannedCount = rows.filter((row) =>
+    ["local_complete", "analyzed", "skipped", "failed"].includes(row.status),
+  ).length;
+  const localCompleteCount = rows.filter(
+    (row) => row.status === "local_complete" || row.status === "analyzed",
+  ).length;
+  const retryingCount = rows.filter((row) => row.status === "retrying").length;
+  const geminiCandidateCount = rows.filter((row) => row.geminiCandidate).length;
+  const usableCount = rows.filter(
+    (row) => row.photo?.analysis && row.status !== "failed" && row.status !== "skipped",
+  ).length;
+  const hasActiveAnalysis = rows.some(
+    (row) =>
+      row.status === "local_scanning" ||
+      row.status === "queued" ||
+      row.status === "analyzing" ||
+      row.status === "retrying",
+  );
+  const canStartSorting =
+    rows.length > 0 && phase !== "loading" && phase !== "local-scanning" && usableCount >= 4;
+
+  const progressLabel =
+    phase === "preparing"
+      ? "Preparing your photo dump…"
+      : phase === "local-scanning"
+        ? `${scannedCount}/${rows.length} photos scanned…`
+        : phase === "refining" && retryingCount > 0
+          ? "Taking a little longer on the best candidates…"
+          : phase === "refining"
+            ? "Quick scan complete — refining top photos…"
+            : canStartSorting
+              ? backgroundRefiningCount
+                ? "Ready to sort — refining details in the background"
+                : "Ready to sort"
+              : hasActiveAnalysis
+                ? `${scannedCount}/${rows.length} photos scanned…`
+                : failedRows.length
+                  ? `${failedRows.length} photo${failedRows.length === 1 ? "" : "s"} couldn't be scanned`
+                  : "Preparing analysis…";
+  const taglinePhotos = useMemo(
+    () => rows.map((row) => row.photo).filter((photo): photo is Photo => !!photo),
+    [rows],
+  );
+  const friendlyLine = useAnalyzingTagline({
+    items: pendingItemsRef.current,
+    photos: taglinePhotos,
+    phase,
+    active: hasActiveAnalysis || phase === "local-scanning" || phase === "refining",
+  });
+
+  async function analyzeRows(
+    items: UploadItem[],
+    runId = runIdRef.current,
+    concurrency = analysisConcurrency,
+  ) {
+    if (!items.length) return;
+    analysisStartedAtRef.current = performance.now();
+    const pipeline = await import("@/lib/dumpdeck/pipeline");
+    setImagePipelineVersion(pipeline.imagePipelineVersion);
+
+    const localRows = await runLocalScan(items, runId, pipeline);
+    if (runIdRef.current !== runId) return;
+
+    const candidates = chooseGeminiCandidates(localRows, maxGeminiPhotos);
+    const candidateIds = new Set(candidates.map((row) => row.item.id));
+    const candidateReasons = new Map(
+      candidates.map((row) => [row.item.id, geminiCandidateReason(row)]),
+    );
+    const rowsAfterCandidateSelection = rowsRef.current.map((row) => {
+      if (!candidateIds.has(row.item.id)) {
+        return row.status === "local_complete" ? { ...row, status: "analyzed" } : row;
+      }
+      return {
+        ...row,
+        status: "queued",
+        geminiCandidate: true,
+        error: candidateReasons.get(row.item.id),
+        attempts: 0,
+        geminiRequests: 0,
+      };
+    });
+    rowsRef.current = rowsAfterCandidateSelection;
+    setRows(rowsAfterCandidateSelection);
+
+    const readyRows = rowsAfterCandidateSelection.filter(
+      (row) => row.photo?.analysis && row.status !== "failed" && row.status !== "skipped",
+    );
+    meaningfulReadyAtRef.current = performance.now();
+
+    console.debug("[dumpdeck] quick scan complete", {
+      totalUploaded: items.length,
+      uniqueLocalPhotos: localRows.filter((row) => row.status !== "skipped").length,
+      photosHandledOnlyByLocalScan: localRows.filter((row) => !candidateIds.has(row.item.id))
+        .length,
+      geminiCandidateIds: candidates.map((row) => row.item.id),
+      geminiCandidateReasons: candidates.map((row) => ({
+        id: row.item.id,
+        name: row.item.name,
+        reason: candidateReasons.get(row.item.id),
+      })),
+      maxGeminiPhotos,
+      selectedTags: state.settings.vibes,
+      localScanTimeMs: localScanDurationMsRef.current,
+      usablePhotosReady: readyRows.length,
+    });
+    console.debug("[dumpdeck] skipped Gemini calls", {
+      skipped: localRows
+        .filter((row) => !candidateIds.has(row.item.id))
+        .map((row) => ({
+          id: row.item.id,
+          name: row.item.name,
+          reason: row.localSkipReason || "local quick scan was confident enough",
+          photoType: row.photo?.photoType,
+          score: row.photo?.overall,
+        })),
+    });
+    logRefinementSnapshot("remaining refinement work after quick scan", rowsRef.current, {
+      totalUploaded: items.length,
+      localScanTimeMs: localScanDurationMsRef.current,
+      photosSelectedForGemini: candidates.length,
+      photosReadyNow: readyRows.length,
+      skippedBeforeGemini: rowsRef.current.filter((row) => row.status === "skipped").length,
+    });
+
+    if (!candidates.length) {
+      setPhase(readyRows.length >= 4 ? "ready" : "blocked");
+      return;
+    }
+
+    setPhase(readyRows.length >= 4 ? "ready" : "blocked");
+
+    void runGeminiQueue(
+      candidates.map((row) => row.item),
+      runId,
+      pipeline,
+      concurrency,
+      candidateReasons,
+    ).then((audit) => {
+      const totalRefinementTimeMs = Math.round(performance.now() - audit.startedAt);
+      const totalUploadTimeMs = Math.round(performance.now() - analysisStartedAtRef.current);
+      const meaningfulReadyTimeMs = Math.round(
+        meaningfulReadyAtRef.current - analysisStartedAtRef.current,
+      );
+      const unnecessaryWaitingAvoidedMs = Math.max(0, totalUploadTimeMs - meaningfulReadyTimeMs);
+      console.debug("[dumpdeck] Gemini refinement audit", {
+        totalUploadedPhotos: items.length,
+        totalUploadTimeMs,
+        localScanTimeMs: localScanDurationMsRef.current,
+        geminiRefinementTimeMs: totalRefinementTimeMs,
+        meaningfulReadyTimeMs,
+        unnecessaryWaitingAvoidedMs,
+        photosHandledOnlyByLocalScan: Math.max(0, localRows.length - candidates.length),
+        photosSentToGemini: candidates.length,
+        totalGeminiRequests: audit.requests,
+        retries: audit.retries,
+        failures: audit.failures,
+        photosSkipped: rowsRef.current.filter((row) => row.status === "skipped").length,
+        screenshotsSkipped: rowsRef.current.filter((row) =>
+          isScreenshotSkipReason(row.localSkipReason ?? row.error),
+        ).length,
+        cacheHits: audit.cacheHits,
+        skippedReanalysis: audit.skippedReanalysis,
+        duplicateGeminiCalls: audit.photos.filter((photo) => photo.requests > 1).length,
+        averageGeminiRequestsPerPhoto: candidates.length
+          ? Number((audit.requests / candidates.length).toFixed(2))
+          : 0,
+        reasonEachPhotoWasSent: audit.photos.map((photo) => ({
+          id: photo.id,
+          name: photo.name,
+          reason: photo.reason,
+          requests: photo.requests,
+          retries: photo.retries,
+          cache: photo.cache,
+          status: photo.status,
+          error: photo.error,
+        })),
+      });
+      logRefinementSnapshot(
+        "remaining refinement work after Gemini queue settled",
+        rowsRef.current,
+      );
+      if (runIdRef.current !== runId) return;
+      if (
+        rowsRef.current.filter((row) => row.photo?.analysis && row.status !== "failed").length < 4
+      ) {
+        setPhase("blocked");
+      }
+    });
+  }
+
+  async function runLocalScan(
+    items: UploadItem[],
+    runId: number,
+    pipeline: typeof import("@/lib/dumpdeck/pipeline"),
+  ) {
+    setPhase("local-scanning");
+    localScanStartedAtRef.current = performance.now();
+    const seenFingerprints = new Set<string>();
+    const workItems: UploadItem[] = [];
+
+    for (const item of items) {
+      const exactDuplicate = item.fingerprint && seenFingerprints.has(item.fingerprint);
+      if (item.fingerprint) seenFingerprints.add(item.fingerprint);
+      if (exactDuplicate) {
+        updateRows((current) =>
+          current.map((row) =>
+            row.item.id === item.id
+              ? {
+                  ...row,
+                  status: "skipped",
+                  localSkipReason: "Exact duplicate detected during quick scan.",
+                  error: "Exact duplicate skipped before Gemini.",
+                }
+              : row,
+          ),
+        );
+        updateLocalScanProgress(items.length);
+        continue;
+      }
+      workItems.push(item);
+    }
+
+    let cursor = 0;
+    async function worker() {
+      while (cursor < workItems.length && runIdRef.current === runId) {
+        const item = workItems[cursor++];
+        await scanOneLocalItem(item);
+      }
+    }
+
+    async function scanOneLocalItem(item: UploadItem) {
+      updateRows((current) =>
+        current.map((row) =>
+          row.item.id === item.id ? { ...row, status: "local_scanning" } : row,
+        ),
+      );
+      try {
+        const { photo, clipEmbeddingVector } = await pipeline.processLocalImage({
+          ...item,
+          settings: state.settings,
+        });
+        const localSkipReason = localRemovalReason(photo);
+        updateRows((current) =>
+          current.map((row) =>
+            row.item.id === item.id
+              ? {
+                  ...row,
+                  status: localSkipReason ? "skipped" : "local_complete",
+                  photo,
+                  clipEmbeddingVector,
+                  localSkipReason,
+                  error: localSkipReason,
+                }
+              : row,
+          ),
+        );
+        if (item.convertedFromHeic) {
+          console.debug("[dumpdeck] HEIC quick scan completed", {
+            id: item.id,
+            name: item.name,
+            conversionQuality: item.conversionQuality,
+            conversionDecoder: item.conversionDecoder,
+            sharpness: photo.imageQuality?.sharpness,
+            technicalQuality: photo.imageQuality?.overallTechnicalQuality,
+            localSkipReason,
+          });
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Local quick scan failed";
+        updateRows((current) =>
+          current.map((row) =>
+            row.item.id === item.id
+              ? {
+                  ...row,
+                  status: "failed",
+                  error: message,
+                }
+              : row,
+          ),
+        );
+      } finally {
+        const completed = rowsRef.current.filter((row) =>
+          ["local_complete", "analyzed", "skipped", "failed"].includes(row.status),
+        ).length;
+        updateLocalScanProgress(items.length, completed);
+      }
+    }
+
+    await Promise.all(
+      Array.from({ length: Math.min(LOCAL_SCAN_CONCURRENCY, Math.max(1, workItems.length)) }, () =>
+        worker(),
+      ),
+    );
+
+    localScanDurationMsRef.current = Math.round(performance.now() - localScanStartedAtRef.current);
+    return rowsRef.current.filter((row) => row.photo && row.status === "local_complete");
+  }
+
+  function updateLocalScanProgress(total: number, completedOverride?: number) {
+    const completed =
+      completedOverride ??
+      rowsRef.current.filter((row) =>
+        ["local_complete", "analyzed", "skipped", "failed"].includes(row.status),
+      ).length;
+    const p = Math.min(0.5, (completed / Math.max(1, total)) * 0.5);
+    setProgress(p);
+  }
+
+  async function runGeminiQueue(
+    items: UploadItem[],
+    runId: number,
+    pipeline: typeof import("@/lib/dumpdeck/pipeline"),
+    initialConcurrency: number,
+    candidateReasons: Map<string, string>,
+  ) {
+    const pending = [...items];
+    let active = 0;
+    let currentConcurrency = Math.max(1, initialConcurrency);
+    const audit: GeminiRefinementAudit = {
+      requests: 0,
+      retries: 0,
+      failures: 0,
+      cacheHits: 0,
+      skippedReanalysis: 0,
+      startedAt: performance.now(),
+      photos: [],
+    };
+
+    return new Promise<GeminiRefinementAudit>((resolve) => {
+      const pump = () => {
+        if (runIdRef.current !== runId) {
+          resolve(audit);
+          return;
+        }
+        while (active < currentConcurrency && pending.length) {
+          const item = pending.shift()!;
+          const row = rowsRef.current.find((entry) => entry.item.id === item.id);
+          if (!row || row.status === "skipped" || row.status === "failed") {
+            audit.photos.push({
+              id: item.id,
+              name: item.name,
+              reason: "Skipped before Gemini because the photo was no longer eligible.",
+              requests: 0,
+              retries: 0,
+              cache: "skipped",
+              status: "skipped",
+              durationMs: 0,
+              error: row?.error,
+            });
+            continue;
+          }
+          active += 1;
+          void analyzeGeminiCandidate(
+            item,
+            runId,
+            pipeline,
+            candidateReasons.get(item.id) ?? "candidate-semantic-refinement",
+          )
+            .then((result) => {
+              if (!result) return;
+              audit.photos.push(result.audit);
+              audit.requests += result.audit.requests;
+              audit.retries += result.audit.retries;
+              if (result.audit.status === "failed") audit.failures += 1;
+              if (result.audit.cache === "hit") {
+                audit.cacheHits += 1;
+                audit.skippedReanalysis += 1;
+              }
+              if (result.queueSignal === "rate-limited") currentConcurrency = 1;
+            })
+            .finally(() => {
+              active -= 1;
+              const remainingActive = rowsRef.current.some(
+                (row) =>
+                  row.status === "queued" ||
+                  row.status === "analyzing" ||
+                  row.status === "retrying",
+              );
+              updateRefinedProgress();
+              if (!pending.length && active === 0 && !remainingActive) {
+                resolve(audit);
+              } else {
+                pump();
+              }
+            });
+        }
+        if (!pending.length && active === 0) {
+          resolve(audit);
+        }
+      };
+      pump();
+    });
+  }
+
+  async function analyzeGeminiCandidate(
+    item: UploadItem,
+    runId: number,
+    pipeline: typeof import("@/lib/dumpdeck/pipeline"),
+    reason: string,
+  ) {
+    let sawRateLimit = false;
+    let actualRequests = 0;
+    let retryCount = 0;
+    let cacheState: GeminiPhotoAudit["cache"] = "unknown";
+    const startedAt = performance.now();
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      if (runIdRef.current !== runId) {
+        return {
+          queueSignal: sawRateLimit ? "rate-limited" : "cancelled",
+          audit: {
+            id: item.id,
+            name: item.name,
+            reason,
+            requests: actualRequests,
+            retries: retryCount,
+            cache: cacheState,
+            status: "cancelled" as const,
+            durationMs: Math.round(performance.now() - startedAt),
+          },
+        };
+      }
+      updateRows((current) =>
+        current.map((row) =>
+          row.item.id === item.id
+            ? {
+                ...row,
+                status: "analyzing",
+                attempts: attempt,
+                error: attempt === 1 ? undefined : row.error,
+              }
+            : row,
+        ),
+      );
+
+      try {
+        const { photo, clipEmbeddingVector, cache } = await pipeline.processImage({
+          ...item,
+          settings: state.settings,
+          geminiRequestMeta: {
+            photoId: item.id,
+            photoName: item.name,
+            reason,
+            retryCount: attempt - 1,
+          },
+        });
+        cacheState = cache === "hit" || cache === "miss" || cache === "skipped" ? cache : "unknown";
+        if (cacheState !== "hit") actualRequests += 1;
+        if (runIdRef.current !== runId) {
+          return {
+            queueSignal: sawRateLimit ? "rate-limited" : "cancelled",
+            audit: {
+              id: item.id,
+              name: item.name,
+              reason,
+              requests: actualRequests,
+              retries: retryCount,
+              cache: cacheState,
+              status: "cancelled" as const,
+              durationMs: Math.round(performance.now() - startedAt),
+            },
+          };
+        }
+        updateRows((current) =>
+          current.map((row) =>
+            row.item.id === item.id
+              ? {
+                  ...row,
+                  status: "analyzed",
+                  photo,
+                  clipEmbeddingVector,
+                  error: undefined,
+                  attempts: attempt,
+                  geminiRequests: actualRequests,
+                }
+              : row,
+          ),
+        );
+        console.debug("[dumpdeck] photo analysis complete", {
+          id: item.id,
+          name: item.name,
+          reason,
+          cache,
+          attempts: attempt,
+          actualGeminiRequests: actualRequests,
+          retries: retryCount,
+          geminiAnalysisTimeMs: Math.round(performance.now() - startedAt),
+        });
+        return {
+          queueSignal: sawRateLimit ? "rate-limited" : "ok",
+          audit: {
+            id: item.id,
+            name: item.name,
+            reason,
+            requests: actualRequests,
+            retries: retryCount,
+            cache: cacheState,
+            status: "analyzed" as const,
+            durationMs: Math.round(performance.now() - startedAt),
+          },
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Analysis failed";
+        const retryable = isRetryableAnalysisError(err);
+        actualRequests += 1;
+        const status =
+          err && typeof err === "object" && "status" in err
+            ? (err as { status?: unknown }).status
+            : undefined;
+        if (status === 429 || /429|resource_exhausted|too.?many|quota/i.test(message)) {
+          sawRateLimit = true;
+        }
+        console.warn("[dumpdeck] photo analysis attempt failed", {
+          id: item.id,
+          name: item.name,
+          reason,
+          attempt,
+          retryable,
+          message,
+        });
+        if (runIdRef.current !== runId) return;
+        const localResultIsEnough =
+          sawRateLimit &&
+          meaningfulReadyAtRef.current > 0 &&
+          rowsRef.current.filter(
+            (row) => row.photo?.analysis && row.status !== "failed" && row.status !== "skipped",
+          ).length >= 4;
+        if (localResultIsEnough) {
+          updateRows((current) =>
+            current.map((row) =>
+              row.item.id === item.id
+                ? {
+                    ...row,
+                    status: "analyzed",
+                    attempts: attempt,
+                    geminiRequests: actualRequests,
+                    error: undefined,
+                  }
+                : row,
+            ),
+          );
+          console.debug("[dumpdeck] skipped low-impact Gemini retry", {
+            id: item.id,
+            name: item.name,
+            reason,
+            message,
+            localAnalysisAvailable: true,
+          });
+          return {
+            queueSignal: "rate-limited",
+            audit: {
+              id: item.id,
+              name: item.name,
+              reason: `${reason}; background refinement skipped after rate limit`,
+              requests: actualRequests,
+              retries: retryCount,
+              cache: cacheState,
+              status: "skipped" as const,
+              durationMs: Math.round(performance.now() - startedAt),
+              error: message,
+            },
+          };
+        }
+        if (retryable && attempt < 5) {
+          const waitMs = sawRateLimit
+            ? Math.max(30000, retryDelayMs(attempt, err))
+            : retryDelayMs(attempt, err);
+          updateRows((current) =>
+            current.map((row) =>
+              row.item.id === item.id
+                ? {
+                    ...row,
+                    status: "retrying",
+                    attempts: attempt,
+                    geminiRequests: actualRequests,
+                    error: `${message} Retrying in ${Math.ceil(waitMs / 1000)}s.`,
+                  }
+                : row,
+            ),
+          );
+          retryCount += 1;
+          await sleep(waitMs);
+          continue;
+        }
+        updateRows((current) =>
+          current.map((row) =>
+            row.item.id === item.id
+              ? {
+                  ...row,
+                  status: "failed",
+                  attempts: attempt,
+                  geminiRequests: actualRequests,
+                  error: message,
+                }
+              : row,
+          ),
+        );
+        return {
+          queueSignal: sawRateLimit ? "rate-limited" : "failed",
+          audit: {
+            id: item.id,
+            name: item.name,
+            reason,
+            requests: actualRequests,
+            retries: retryCount,
+            cache: cacheState,
+            status: "failed" as const,
+            durationMs: Math.round(performance.now() - startedAt),
+            error: message,
+          },
+        };
+      } finally {
+        updateRefinedProgress();
+      }
+    }
+    return {
+      queueSignal: sawRateLimit ? "rate-limited" : "failed",
+      audit: {
+        id: item.id,
+        name: item.name,
+        reason,
+        requests: actualRequests,
+        retries: retryCount,
+        cache: cacheState,
+        status: "failed" as const,
+        durationMs: Math.round(performance.now() - startedAt),
+        error: "Analysis retry limit reached",
+      },
+    };
+  }
+
+  function updateRefinedProgress() {
+    const refinedDone = rowsRef.current.filter(
+      (row) => row.geminiCandidate && (row.status === "analyzed" || row.status === "failed"),
+    ).length;
+    const totalRefined = Math.max(1, rowsRef.current.filter((row) => row.geminiCandidate).length);
+    const p = Math.min(1, 0.5 + (refinedDone / totalRefined) * 0.5);
+    setProgress(p);
+  }
+
+  function retryFailed() {
+    const failed = rowsRef.current.filter((row) => row.status === "failed").map((row) => row.item);
+    if (!failed.length) return;
+    const runId = ++runIdRef.current;
+    void analyzeRows(failed, runId, analysisConcurrency);
+  }
+
+  async function startSorting() {
+    if (!canStartSorting || phase === "preparing") return;
+    setPhase("preparing");
+    try {
+      const processed = rowsRef.current
+        .filter((row) => row.status !== "failed" && row.status !== "skipped" && row.photo?.analysis)
+        .map((row) => ({
+          photo: row.photo!,
+          clipEmbeddingVector: row.clipEmbeddingVector,
+        }));
+
+      if (processed.length < 4) {
+        setPhase("blocked");
+        toast.error("At least 4 analyzed photos are needed to start sorting.");
+        return;
+      }
+
+      const { photos: clusteredPhotos } = assignDuplicateClusters(processed);
+      const { photos: rankedPhotos } = rankPhotos(clusteredPhotos, { settings: state.settings });
+      const { photos: out, events, collections } = organizePhotos(rankedPhotos);
+      await Promise.all([
+        saveDuplicateClusterAssignments(out, imagePipelineVersion),
+        savePhotoRankings(out, imagePipelineVersion),
+      ]).catch((err) => {
+        console.warn("[dumpdeck] metadata cache save failed", err);
+      });
+
+      const groups = buildDuplicateGroupsForPhotos(out);
+      const hasGroups = groups.some((g) => g.photos.length > 1);
+
+      console.debug("[dumpdeck] analysis debug", {
+        selectedTags: state.settings.vibes,
+        analysisRows: rowsRef.current.map((row) => ({
+          id: row.item.id,
+          name: row.item.name,
+          status: row.status,
+          error: row.error,
+        })),
+        duplicateGroups: groups.filter((group) => group.photos.length > 1),
+        events,
+        collections,
+        scoreBreakdown: out.map((photo) => ({
+          id: photo.id,
+          name: photo.name,
+          score: photo.ranking?.overallScore,
+          breakdown: photo.ranking?.scoreBreakdown,
+          duplicateClusterId: photo.duplicateClusterId,
+        })),
+      });
+      console.debug(
+        "[dumpdeck] duplicate groups",
+        groups.filter((group) => group.photos.length > 1),
+      );
+      console.debug("[dumpdeck] same-event groups", events);
+
+      dispatch({ type: "setPhotos", photos: out });
+
+      if (hasGroups) {
+        dispatch({ type: "setStage", stage: "similar" });
+      } else {
+        const sl = rankingShortlist(out, MAX_KEEP);
+        const cutEntries: RemovedPhoto[] = removedByRanking(out, sl);
+        if (cutEntries.length) dispatch({ type: "addRemoved", entries: cutEntries });
+        if (cutEntries.length) {
+          console.debug(
+            "[dumpdeck] final removal reasons assigned",
+            cutEntries.map((entry) => ({
+              id: entry.photo.id,
+              name: entry.photo.name,
+              reason: entry.reason,
+              source: entry.source,
+            })),
+          );
+          console.debug("[dumpdeck] AI cut score components", {
+            selectedTags: state.settings.vibes,
+            cutPhotos: cutEntries.map((entry) => ({
+              id: entry.photo.id,
+              name: entry.photo.name,
+              reason: entry.reason,
+              rank: entry.photo.ranking?.overallRank,
+              score: entry.photo.ranking?.overallScore,
+              signals: entry.photo.ranking?.signals,
+              breakdown: entry.photo.ranking?.scoreBreakdown,
+            })),
+          });
+        }
+        dispatch({ type: "setShortlist", photos: sl });
+        dispatch({ type: "setStage", stage: "results" });
+      }
+    } catch (err) {
+      console.error("[dumpdeck] sorting preparation failed", err);
+      setPhase("ready");
+      toast.error("Sorting could not start. Retry failed analysis or upload a fresh batch.");
+    }
+  }
+
+  useEffect(() => {
     (async () => {
+      const runId = ++runIdRef.current;
       const raw = sessionStorage.getItem("dumpdeck:pending");
       if (!raw) {
         dispatch({ type: "setStage", stage: "upload" });
         return;
       }
-      const items: UploadItem[] = JSON.parse(raw);
-      setSample(items.slice(0, 9).map((i) => ({ url: i.url, previewUrl: i.previewUrl })));
-
-      await warmupDetection();
-
-      const out: Photo[] = [];
-      for (let i = 0; i < items.length; i++) {
-        if (cancelled) return;
-        const it = items[i];
-        const src = it.previewUrl ?? it.url;
-        const [analysis, detection] = await Promise.all([
-          analyzeImage(src),
-          detectPeopleAndFaces(src),
-        ]);
-        analysis.detectedPeopleCount = detection.detectedPeopleCount;
-        analysis.detectedFaceCount = detection.detectedFaceCount;
-        analysis.detectionConfidence = detection.confidence;
-        analysis.peopleUnsure = detection.unsure;
-        analysis.peopleBoxes = detection.peopleBoxes;
-        analysis.faceBoxes = detection.faceBoxes;
-
-        const cls = classifyPhoto(it.width, it.height, analysis);
-        const s = scorePhoto({ width: it.width, height: it.height, analysis }, cls, state.settings);
-        out.push({
-          ...it,
-          analysis,
-          group: 0,
-          ...cls,
-          ...s,
-        });
-        const p = (i + 1) / items.length;
-        setProgress(p);
-        setLine(Math.min(ANALYZE_LINES.length - 1, Math.floor(p * ANALYZE_LINES.length)));
-        if (i % 4 === 3) await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      let items: UploadItem[];
+      try {
+        items = JSON.parse(raw) as UploadItem[];
+      } catch {
+        sessionStorage.removeItem("dumpdeck:pending");
+        toast.error("Upload session expired. Please choose your photos again.");
+        dispatch({ type: "setStage", stage: "upload" });
+        return;
       }
-
-      if (cancelled) return;
-
-      const groups = buildAllSimilarGroups(out);
-      const hasGroups = groups.some((g) => g.photos.length > 1);
-
-      dispatch({ type: "setPhotos", photos: out });
-
-      setTimeout(() => {
-        if (hasGroups) {
-          dispatch({ type: "setStage", stage: "similar" });
-        } else {
-          const sl = shortlist(out);
-          const cutEntries: RemovedPhoto[] = out
-            .filter((p) => !sl.some((q) => q.id === p.id))
-            .map((p) => ({
-              photo: p,
-              reason: "Cut from shortlist — low sharpness/contrast.",
-              source: "ai",
-            }));
-          if (cutEntries.length) dispatch({ type: "addRemoved", entries: cutEntries });
-          dispatch({ type: "setShortlist", photos: sl });
-          dispatch({ type: "setStage", stage: "results" });
-        }
-      }, 300);
+      if (!Array.isArray(items) || items.length === 0) {
+        sessionStorage.removeItem("dumpdeck:pending");
+        dispatch({ type: "setStage", stage: "upload" });
+        return;
+      }
+      const config = await getPipelineConfig();
+      if (runIdRef.current !== runId) return;
+      setAnalysisConcurrency(config.analysisConcurrency);
+      pendingItemsRef.current = items;
+      setSample(items.slice(0, 9).map((i) => ({ url: i.url, previewUrl: i.previewUrl })));
+      const initialRows: AnalysisRow[] = items.map((item) => ({
+        item,
+        status: "uploaded",
+        attempts: 0,
+        geminiRequests: 0,
+      }));
+      setRows(initialRows);
+      rowsRef.current = initialRows;
+      setProgress(0);
+      setMaxGeminiPhotos(config.maxGeminiPhotos);
+      await analyzeRows(items, runId, config.analysisConcurrency);
     })();
-    return () => { cancelled = true; };
+    return () => {
+      runIdRef.current += 1;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
     <section className="text-center">
-      <Heading eyebrow="Step 2" title="AI is reading your roll" body="Brightness, sharpness, palette, people, near-duplicates." />
+      <Heading eyebrow="Step 2" title="Reading your camera roll" body={friendlyLine} />
 
       <div className="relative mx-auto mt-8 grid h-64 w-64 grid-cols-3 gap-1.5">
         {sample.map((p, i) => (
@@ -488,7 +2069,12 @@ function AnalyzeStage() {
             transition={{ delay: i * 0.05 }}
             className="overflow-hidden rounded-xl bg-muted"
           >
-            <img src={p.previewUrl ?? p.url} alt="" decoding="async" className="h-full w-full object-cover" />
+            <img
+              src={p.previewUrl ?? p.url}
+              alt=""
+              decoding="async"
+              className="h-full w-full object-cover"
+            />
           </motion.div>
         ))}
         <motion.div
@@ -501,19 +2087,114 @@ function AnalyzeStage() {
 
       <div className="mx-auto mt-8 max-w-xs">
         <div className="h-2 overflow-hidden rounded-full bg-ink/10">
-          <motion.div className="h-full rounded-full bg-coral" animate={{ width: `${Math.round(progress * 100)}%` }} />
+          <motion.div
+            className={`h-full rounded-full ${canStartSorting ? "bg-mint" : "bg-coral"}`}
+            animate={{ width: `${Math.round(progress * 100)}%` }}
+          />
         </div>
         <AnimatePresence mode="wait">
           <motion.div
-            key={line}
+            key={progressLabel}
             initial={{ opacity: 0, y: 6 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -6 }}
             className="mt-3 font-display text-xl"
           >
-            {ANALYZE_LINES[line]}
+            {progressLabel}
           </motion.div>
         </AnimatePresence>
+        {rows.length > 0 && (
+          <div className="mt-2 space-y-1 text-xs text-muted-foreground">
+            <p>
+              {usableCount} usable photo{usableCount === 1 ? "" : "s"} found
+              {backgroundRefiningCount ? " · refining details in the background" : ""}
+            </p>
+            {skippedRows.length > 0 && (
+              <p>
+                {screenshotRows.length > 0
+                  ? `${screenshotRows.length} screenshot/non-photo ${
+                      screenshotRows.length === 1 ? "was" : "were"
+                    } excluded automatically`
+                  : null}
+                {screenshotRows.length > 0 && unsupportedRows.length > 0 ? " · " : ""}
+                {unsupportedRows.length > 0
+                  ? `${unsupportedRows.length} unsupported or failed ${
+                      unsupportedRows.length === 1 ? "image was" : "images were"
+                    } skipped`
+                  : null}
+                {screenshotRows.length === 0 && unsupportedRows.length === 0
+                  ? `${skippedRows.length} photo${skippedRows.length === 1 ? "" : "s"} skipped`
+                  : null}
+              </p>
+            )}
+          </div>
+        )}
+      </div>
+
+      {failedRows.length > 0 && (
+        <div className="mx-auto mt-5 max-w-sm rounded-3xl bg-coral/10 p-3 text-left">
+          <div className="text-sm font-semibold text-coral">
+            {failedRows.length} photo{failedRows.length === 1 ? "" : "s"} couldn't be scanned
+          </div>
+          <ul className="mt-2 max-h-28 space-y-1 overflow-y-auto text-xs text-ink/75">
+            {failedRows.map((row) => (
+              <li key={row.item.id} className="flex items-center gap-2">
+                <span className="h-8 w-8 shrink-0 overflow-hidden rounded-lg bg-muted">
+                  <img
+                    src={row.item.previewUrl ?? row.item.url}
+                    alt=""
+                    decoding="async"
+                    loading="lazy"
+                    className="h-full w-full object-cover"
+                  />
+                </span>
+                <span className="min-w-0">
+                  <span className="block truncate font-semibold">{row.item.name}</span>
+                  <span className="line-clamp-1 text-muted-foreground">{row.error}</span>
+                </span>
+              </li>
+            ))}
+          </ul>
+          <button
+            type="button"
+            onClick={retryFailed}
+            disabled={hasActiveAnalysis || phase === "preparing"}
+            className="mt-3 chip bg-white/80 text-ink disabled:opacity-60"
+          >
+            Try those photos again
+          </button>
+        </div>
+      )}
+
+      <div className="mx-auto mt-5 max-w-sm space-y-2">
+        <Button
+          onClick={startSorting}
+          disabled={!canStartSorting || phase === "preparing"}
+          className="h-14 w-full rounded-2xl bg-ink text-base font-semibold text-cream hover:bg-coral disabled:opacity-55"
+        >
+          {phase === "preparing"
+            ? "Preparing your photo dump…"
+            : canStartSorting
+              ? failedRows.length
+                ? `Start Sorting with ${usableCount} usable photos`
+                : "Start Sorting"
+              : hasActiveAnalysis
+                ? "Start Sorting unlocks after quick scan"
+                : "Not enough analyzed photos"}
+        </Button>
+        {failedRows.length > 0 && analyzedCount >= 4 && !hasActiveAnalysis && (
+          <p className="text-xs text-muted-foreground">
+            Failed photos will be skipped unless you retry them first.
+          </p>
+        )}
+        <button
+          type="button"
+          onClick={() => dispatch({ type: "setStage", stage: "upload" })}
+          disabled={hasActiveAnalysis || phase === "preparing"}
+          className="chip disabled:opacity-60"
+        >
+          ← Back to upload
+        </button>
       </div>
     </section>
   );
@@ -523,11 +2204,8 @@ function AnalyzeStage() {
 function SimilarStage() {
   const { state, dispatch } = useDumpDeck();
 
-  const allGroups = useMemo(() => buildAllSimilarGroups(state.photos), [state.photos]);
-  const similarGroups = useMemo(
-    () => allGroups.filter((g) => g.photos.length > 1),
-    [allGroups],
-  );
+  const allGroups = useMemo(() => buildDuplicateGroupsForPhotos(state.photos), [state.photos]);
+  const similarGroups = useMemo(() => allGroups.filter((g) => g.photos.length > 1), [allGroups]);
   const singletonIds = useMemo(() => {
     const ids = new Set<string>();
     allGroups.forEach((g) => {
@@ -594,17 +2272,27 @@ function SimilarStage() {
     Object.values(picked).forEach((set) => set.forEach((id) => keepIds.add(id)));
 
     const drops: RemovedPhoto[] = [];
+    const decisions: DuplicateDecisionDraft[] = [];
     for (const g of similarGroups) {
       const selected = picked[g.id] ?? new Set<string>();
       const keptInGroup = g.photos.filter((p) => selected.has(p.id));
       const keptTop = keptInGroup[0] ?? g.photos[0];
+      decisions.push({
+        clusterId: keptTop.duplicateClusterId ?? `group-${g.id}`,
+        keptPhotoIds: keptInGroup.map((photo) => photo.id),
+        removedPhotoIds: g.photos
+          .filter((photo) => !selected.has(photo.id))
+          .map((photo) => photo.id),
+        reason: g.reason,
+      });
       for (const p of g.photos) {
         if (!selected.has(p.id)) {
           drops.push({
             photo: p,
-            reason: selected.size === 0
-              ? "User did not select from similar group."
-              : `Removed from similar group — kept "${keptTop.name}" instead.`,
+            reason:
+              selected.size === 0
+                ? "User did not select from similar group."
+                : `Removed from similar group — kept "${keptTop.name}" instead. ${g.reason}`,
             source: "user",
             similarToId: keptTop.id,
           });
@@ -612,15 +2300,60 @@ function SimilarStage() {
       }
     }
     if (drops.length) dispatch({ type: "addRemoved", entries: drops });
+    dispatch({ type: "setDuplicateDecisions", decisions });
 
     const survivors = state.photos.filter((p) => keepIds.has(p.id));
-    const sl = shortlist(survivors);
-    const cuts: RemovedPhoto[] = survivors
-      .filter((p) => !sl.some((q) => q.id === p.id))
-      .map((p) => ({ photo: p, reason: "Cut from shortlist — low sharpness/contrast.", source: "ai" }));
+    const { photos: rerankedSurvivors } = rankPhotos(survivors, { settings: state.settings });
+    const { photos: organizedSurvivors } = organizePhotos(rerankedSurvivors);
+    const allowMultipleClusterIds = new Set(
+      decisions
+        .filter((decision) => decision.keptPhotoIds.length > 1)
+        .map((decision) => decision.clusterId),
+    );
+    const baseShortlist = rankingShortlist(organizedSurvivors, MAX_KEEP, {
+      allowMultipleClusterIds,
+    });
+    const baseIds = new Set(baseShortlist.map((photo) => photo.id));
+    const explicitKeeps = organizedSurvivors
+      .filter((photo) => keepIds.has(photo.id) && !baseIds.has(photo.id))
+      .sort((a, b) => rankingScore(b) - rankingScore(a));
+    const sl = [...baseShortlist, ...explicitKeeps];
+    const cuts: RemovedPhoto[] = removedByRanking(organizedSurvivors, sl);
     if (cuts.length) dispatch({ type: "addRemoved", entries: cuts });
+    if (cuts.length) {
+      console.debug(
+        "[dumpdeck] final removal reasons assigned",
+        cuts.map((entry) => ({
+          id: entry.photo.id,
+          name: entry.photo.name,
+          reason: entry.reason,
+          source: entry.source,
+        })),
+      );
+      console.debug("[dumpdeck] AI cut score components", {
+        selectedTags: state.settings.vibes,
+        cutPhotos: cuts.map((entry) => ({
+          id: entry.photo.id,
+          name: entry.photo.name,
+          reason: entry.reason,
+          rank: entry.photo.ranking?.overallRank,
+          score: entry.photo.ranking?.overallScore,
+          signals: entry.photo.ranking?.signals,
+          breakdown: entry.photo.ranking?.scoreBreakdown,
+        })),
+      });
+    }
 
     dispatch({ type: "setShortlist", photos: sl });
+    console.debug("[dumpdeck] duplicate decisions", {
+      selectedTags: state.settings.vibes,
+      decisions,
+      kept: sl.map((photo) => photo.id),
+      removed: [...drops, ...cuts].map((entry) => ({
+        id: entry.photo.id,
+        reason: entry.reason,
+      })),
+    });
     dispatch({ type: "setStage", stage: "results" });
   }
 
@@ -632,8 +2365,8 @@ function SimilarStage() {
     <section>
       <Heading
         eyebrow="Step 3"
-        title="Look-alike shots"
-        body={`We found ${similarGroups.length} group${similarGroups.length === 1 ? "" : "s"} of similar photos. Pick up to ${MAX_PICK} from each — the rest get cut.`}
+        title="Duplicate review"
+        body={`We found ${similarGroups.length} conservative duplicate group${similarGroups.length === 1 ? "" : "s"}. Pick up to ${MAX_PICK} from each — unrelated photos stay out of this step.`}
       />
 
       <div className="mt-3 flex items-center justify-between gap-2 text-sm">
@@ -652,14 +2385,16 @@ function SimilarStage() {
             <div key={g.id} className="glass-card rounded-3xl p-3">
               <div className="mb-2 flex items-center justify-between px-1">
                 <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">
-                  Group {g.id + 1} · {g.kind === "near-dup" ? "Near-duplicates" : "Look-alikes"}
+                  Group {g.id + 1} · {g.kind === "exact" ? "Exact duplicates" : "Near-duplicates"}
                 </span>
                 <span className="text-[11px] font-semibold text-ink">
                   {sel.size} of {g.photos.length} selected
                 </span>
               </div>
               <p className="mb-2 px-1 text-[11px] text-muted-foreground">
-                These photos look similar. Pick up to {MAX_PICK} to keep.
+                {g.reason} Suggested best:{" "}
+                {g.photos.find((photo) => photo.id === g.suggestedBestPhotoId)?.name ??
+                  g.photos[0].name}
               </p>
 
               <div className="grid grid-cols-3 gap-1.5">
@@ -685,11 +2420,11 @@ function SimilarStage() {
                         className="h-full w-full object-cover"
                       />
                       <div className="absolute left-1 top-1 rounded-full bg-white/90 px-1.5 py-0.5 text-[10px] font-bold text-ink">
-                        {Math.round(p.overall * 100)}
+                        {Math.round(rankingScore(p) * 100)}
                       </div>
                       {isAiPick && (
                         <div className="absolute right-1 top-1 rounded-md bg-coral px-1 py-0.5 text-[9px] font-bold text-white shadow">
-                          AI PICK
+                          BEST
                         </div>
                       )}
                       {photoBadges.length > 0 && (
@@ -720,14 +2455,10 @@ function SimilarStage() {
                   onClick={() => keepAiPick(g.id)}
                   className="chip bg-coral/15 text-coral"
                 >
-                  Keep AI's pick
+                  Keep best only
                 </button>
-                <button
-                  type="button"
-                  onClick={() => skipGroup(g.id)}
-                  className="chip"
-                >
-                  Skip group (keep all)
+                <button type="button" onClick={() => skipGroup(g.id)} className="chip">
+                  Keep multiple
                 </button>
                 <span className="chip bg-ink/5 text-ink/70">
                   {sel.size > 0 ? `${sel.size} selected` : "None selected"}
@@ -761,6 +2492,21 @@ function ResultsStage() {
     toast.success("Restored to your shortlist.");
   }
 
+  function removeFromEventReview(photo: Photo) {
+    dispatch({
+      type: "addRemoved",
+      entries: [
+        {
+          photo,
+          reason: "removed by user during event review.",
+          source: "user",
+        },
+      ],
+    });
+    dispatch({ type: "removePhoto", id: photo.id });
+    toast("Removed from this dump");
+  }
+
   return (
     <section>
       <Heading
@@ -771,22 +2517,26 @@ function ResultsStage() {
 
       <div className="mt-4 grid grid-cols-3 gap-1.5 sm:gap-2">
         <ScoreBadge label="Cut" value={removed / Math.max(1, state.photos.length)} />
-        <ScoreBadge label="Top score" value={state.shortlist[0]?.overall ?? 0} />
-        <ScoreBadge label="Kept" value={state.shortlist.length / Math.max(1, state.photos.length)} />
+        <ScoreBadge
+          label="Top score"
+          value={state.shortlist[0] ? rankingScore(state.shortlist[0]) : 0}
+        />
+        <ScoreBadge
+          label="Kept"
+          value={state.shortlist.length / Math.max(1, state.photos.length)}
+        />
       </div>
 
       <div className="mt-3 flex items-center justify-between">
         <span className="text-xs text-muted-foreground">
           {state.shortlist.length} kept · {state.removed.length} removed
         </span>
-        <button
-          type="button"
-          onClick={() => setShowRemoved(true)}
-          className="chip"
-        >
+        <button type="button" onClick={() => setShowRemoved(true)} className="chip">
           <Eye className="h-3 w-3" /> View removed ({state.removed.length})
         </button>
       </div>
+
+      <OrganizationBrowser photos={state.shortlist} onRemovePhoto={removeFromEventReview} />
 
       <div className="mt-5 grid grid-cols-2 gap-3">
         {state.shortlist.map((p) => (
@@ -810,6 +2560,146 @@ function ResultsStage() {
         onRestore={restore}
       />
     </section>
+  );
+}
+
+function OrganizationBrowser({
+  photos,
+  onRemovePhoto,
+}: {
+  photos: Photo[];
+  onRemovePhoto: (photo: Photo) => void;
+}) {
+  const collections = useMemo(() => {
+    const byCollection = new Map<
+      string,
+      {
+        id: string;
+        title: string;
+        summary: string;
+        cover?: Photo;
+        events: Map<string, { id: string; title: string; description: string; photos: Photo[] }>;
+        photos: Photo[];
+      }
+    >();
+
+    photos.forEach((photo) => {
+      const collection = photo.collectionGroup;
+      const event = photo.eventGroup;
+      const collectionId = collection?.groupId || "collection_unfiled";
+      if (!byCollection.has(collectionId)) {
+        byCollection.set(collectionId, {
+          id: collectionId,
+          title: collection?.title || "Camera Roll",
+          summary: collection?.summary || "Photos that have not been grouped into a collection.",
+          cover: photos.find((candidate) => candidate.id === collection?.coverPhoto) ?? photo,
+          events: new Map(),
+          photos: [],
+        });
+      }
+      const collectionGroup = byCollection.get(collectionId)!;
+      collectionGroup.photos.push(photo);
+
+      const eventId = event?.groupId || `event_${photo.id}`;
+      if (!collectionGroup.events.has(eventId)) {
+        collectionGroup.events.set(eventId, {
+          id: eventId,
+          title: event?.title || "Ungrouped photo",
+          description: event?.description || "Single photo from the camera roll.",
+          photos: [],
+        });
+      }
+      collectionGroup.events.get(eventId)!.photos.push(photo);
+    });
+
+    return Array.from(byCollection.values());
+  }, [photos]);
+
+  if (photos.length === 0) return null;
+
+  return (
+    <div className="mt-5 rounded-3xl border border-ink/10 bg-white/70 p-3">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <div className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">
+            Camera Roll → Collections → Events → Photos
+          </div>
+          <div className="font-display text-lg">AI organization</div>
+        </div>
+        <span className="chip bg-mint/40">{photos.length} photos</span>
+      </div>
+
+      <div className="mt-3 space-y-3">
+        {collections.map((collection) => (
+          <div key={collection.id} className="rounded-2xl bg-cream/80 p-2">
+            <div className="flex gap-3">
+              {collection.cover && (
+                <div className="h-16 w-16 shrink-0 overflow-hidden rounded-xl bg-muted">
+                  <img
+                    src={collection.cover.previewUrl ?? collection.cover.url}
+                    alt=""
+                    decoding="async"
+                    loading="lazy"
+                    className="h-full w-full object-cover"
+                  />
+                </div>
+              )}
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="truncate text-sm font-semibold">{collection.title}</div>
+                  <span className="text-[11px] text-muted-foreground">
+                    {collection.events.size} event{collection.events.size === 1 ? "" : "s"}
+                  </span>
+                </div>
+                <p className="mt-0.5 line-clamp-2 text-xs text-muted-foreground">
+                  {collection.summary}
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-2 space-y-2">
+              {Array.from(collection.events.values()).map((event) => (
+                <div key={event.id} className="rounded-xl bg-white/70 p-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="truncate text-xs font-semibold">{event.title}</div>
+                      <div className="line-clamp-1 text-[11px] text-muted-foreground">
+                        {event.description}
+                      </div>
+                    </div>
+                    <span className="chip bg-ink/5 text-ink/70">{event.photos.length}</span>
+                  </div>
+                  <div className="mt-2 flex gap-1 overflow-x-auto pb-1 no-scrollbar">
+                    {event.photos.map((photo) => (
+                      <div
+                        key={photo.id}
+                        className="group relative h-14 w-14 shrink-0 overflow-hidden rounded-lg bg-muted"
+                      >
+                        <img
+                          src={photo.previewUrl ?? photo.url}
+                          alt=""
+                          decoding="async"
+                          loading="lazy"
+                          className="h-full w-full object-cover"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => onRemovePhoto(photo)}
+                          className="absolute right-1 top-1 grid h-5 w-5 place-items-center rounded-full bg-black/65 text-white opacity-100 shadow transition sm:opacity-0 sm:group-hover:opacity-100"
+                          aria-label={`Remove ${photo.name} from event`}
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -837,28 +2727,36 @@ function CurateStage() {
     setFocusIdx((i) => Math.max(0, i - 1));
   }, []);
 
-  const remove = useCallback((id: string) => {
-    setRemaining((cur) => {
-      const idx = cur.findIndex((p) => p.id === id);
-      if (idx === -1) return cur;
-      const photo = cur[idx];
-      dispatch({
-        type: "addRemoved",
-        entries: [{ photo, reason: "Removed by you during curate.", source: "user" }],
+  const remove = useCallback(
+    (id: string) => {
+      setRemaining((cur) => {
+        const idx = cur.findIndex((p) => p.id === id);
+        if (idx === -1) return cur;
+        const photo = cur[idx];
+        dispatch({
+          type: "addRemoved",
+          entries: [{ photo, reason: "Removed by you during curate.", source: "user" }],
+        });
+        const next = cur.filter((p) => p.id !== id);
+        setFocusIdx((fi) =>
+          Math.min(Math.max(0, next.length - 1), idx === fi ? idx : fi > idx ? fi - 1 : fi),
+        );
+        return next;
       });
-      const next = cur.filter((p) => p.id !== id);
-      setFocusIdx((fi) => Math.min(Math.max(0, next.length - 1), idx === fi ? idx : fi > idx ? fi - 1 : fi));
-      return next;
-    });
-  }, [dispatch]);
+    },
+    [dispatch],
+  );
 
-  const restore = useCallback((id: string) => {
-    const entry = state.removed.find((r) => r.photo.id === id);
-    if (!entry) return;
-    setRemaining((cur) => (cur.some((p) => p.id === id) ? cur : [...cur, entry.photo]));
-    dispatch({ type: "restorePhoto", id });
-    toast.success("Restored to your shortlist.");
-  }, [state.removed, dispatch]);
+  const restore = useCallback(
+    (id: string) => {
+      const entry = state.removed.find((r) => r.photo.id === id);
+      if (!entry) return;
+      setRemaining((cur) => (cur.some((p) => p.id === id) ? cur : [...cur, entry.photo]));
+      dispatch({ type: "restorePhoto", id });
+      toast.success("Restored to your shortlist.");
+    },
+    [state.removed, dispatch],
+  );
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -893,22 +2791,8 @@ function CurateStage() {
   }
 
   function continueToFinal() {
-    const nearDupGroups = groupNearDuplicates(remaining).filter((g) => g.photos.length > 1);
-    const autoCut = nearDupGroups.flatMap((g) => g.photos.slice(1).map((photo) => ({
-      photo,
-      reason: `Removed before final because it was almost identical to "${g.photos[0].name}".`,
-      source: "ai" as const,
-      similarToId: g.photos[0].id,
-    })));
-    const finalPhotos = nearDupGroups.length
-      ? remaining.filter((p) => !autoCut.some((r) => r.photo.id === p.id))
-      : remaining;
-    if (autoCut.length) {
-      dispatch({ type: "addRemoved", entries: autoCut });
-      toast.success(`Removed ${autoCut.length} near-duplicate${autoCut.length === 1 ? "" : "s"} before final.`);
-    }
-    dispatch({ type: "setKept", photos: finalPhotos });
-    dispatch({ type: "setFinalOrder", photos: finalPhotos });
+    dispatch({ type: "setKept", photos: remaining });
+    dispatch({ type: "setFinalOrder", photos: orderWithPinned(remaining, state.pinnedCoverId) });
     dispatch({ type: "setStage", stage: "final" });
   }
 
@@ -925,13 +2809,11 @@ function CurateStage() {
         {overBy > 0 ? (
           <span className="chip bg-coral/20 text-coral">Cut {overBy} more</span>
         ) : (
-          <span className="chip inline-flex items-center gap-1 bg-mint/60 text-ink"><Check className="h-3 w-3" /> Under limit</span>
+          <span className="chip inline-flex items-center gap-1 bg-mint/60 text-ink">
+            <Check className="h-3 w-3" /> Under limit
+          </span>
         )}
-        <button
-          type="button"
-          onClick={() => setShowRemoved(true)}
-          className="chip"
-        >
+        <button type="button" onClick={() => setShowRemoved(true)} className="chip">
           <Eye className="h-3 w-3" /> Removed ({state.removed.length})
         </button>
       </div>
@@ -939,15 +2821,15 @@ function CurateStage() {
       <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-ink/10">
         <div
           className={`h-full rounded-full transition-all ${overBy > 0 ? "bg-coral" : "bg-mint"}`}
-          style={{ width: `${Math.min(100, ((focusIdx + 1) / Math.max(1, remaining.length)) * 100)}%` }}
+          style={{
+            width: `${Math.min(100, ((focusIdx + 1) / Math.max(1, remaining.length)) * 100)}%`,
+          }}
         />
       </div>
 
       {focus ? (
         <div className="mt-5 relative">
-          <div
-            className="pointer-events-none absolute inset-0 z-10 flex items-center justify-between px-4"
-          >
+          <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-between px-4">
             <div
               className="rounded-2xl bg-coral px-3 py-2 text-xs font-bold text-white shadow-lg transition"
               style={{ opacity: Math.max(0, -dragX / 120) }}
@@ -978,7 +2860,13 @@ function CurateStage() {
               className="relative overflow-hidden rounded-3xl bg-muted shadow-xl touch-pan-y"
             >
               <div style={{ aspectRatio: "4 / 5" }}>
-                <img src={focus.previewUrl ?? focus.url} alt="" decoding="async" className="h-full w-full object-cover pointer-events-none" draggable={false} />
+                <img
+                  src={focus.previewUrl ?? focus.url}
+                  alt=""
+                  decoding="async"
+                  className="h-full w-full object-cover pointer-events-none"
+                  draggable={false}
+                />
               </div>
               <div className="pointer-events-none absolute inset-x-0 bottom-0 h-1/2 bg-gradient-to-t from-black/70 via-black/10 to-transparent" />
               <div className="absolute left-3 top-3 flex flex-wrap gap-1">
@@ -987,18 +2875,20 @@ function CurateStage() {
                 ))}
               </div>
               <div className="absolute right-3 top-3 rounded-full bg-white/95 px-2 py-1 text-[11px] font-bold text-ink">
-                {Math.round(focus.overall * 100)}
+                {Math.round(rankingScore(focus) * 100)}
               </div>
               <div className="absolute inset-x-3 bottom-3 text-[11px] font-semibold uppercase tracking-wider text-white/90">
-                {focus.photoType}
-                {focus.photoTypeConfidence < 0.55 && " (unsure)"} ·{" "}
-                {focus.peopleCount === 4 ? "4+" : focus.peopleCount} people · {focus.orientation}
+                {analysisOf(focus)?.scene ?? focus.photoType}
+                {(analysisOf(focus)?.confidence ?? focus.photoTypeConfidence) < 0.55 &&
+                  " (unsure)"}{" "}
+                · {analysisOf(focus)?.peopleCount ?? focus.peopleCount} people ·{" "}
+                {analysisOf(focus)?.orientation ?? focus.orientation}
               </div>
             </motion.div>
           </AnimatePresence>
 
-          {focus.reasons[0] && (
-            <p className="mt-2 px-1 text-xs text-muted-foreground">{focus.reasons[0]}</p>
+          {reasoningFor(focus) && (
+            <p className="mt-2 px-1 text-xs text-muted-foreground">{reasoningFor(focus)}</p>
           )}
 
           <div className="mt-3 grid grid-cols-4 gap-2">
@@ -1036,7 +2926,9 @@ function CurateStage() {
         </div>
       )}
 
-      {remaining.length > 0 && <MiniStrip remaining={remaining} focusIdx={focusIdx} onJump={setFocusIdx} />}
+      {remaining.length > 0 && (
+        <MiniStrip remaining={remaining} focusIdx={focusIdx} onJump={setFocusIdx} />
+      )}
 
       {canContinue ? (
         <StickyAction>
@@ -1104,7 +2996,10 @@ function RemovedModal({
                   {removed.length} photo{removed.length === 1 ? "" : "s"} cut
                 </div>
               </div>
-              <button onClick={onClose} className="grid h-9 w-9 place-items-center rounded-full bg-ink/10">
+              <button
+                onClick={onClose}
+                className="grid h-9 w-9 place-items-center rounded-full bg-ink/10"
+              >
                 <X className="h-4 w-4" />
               </button>
             </div>
@@ -1131,12 +3026,18 @@ function categorize(r: RemovedPhoto): "similar" | "ai" | "user" {
 }
 
 function friendlyReason(r: RemovedPhoto): string {
+  if (r.source === "user" && r.reason) return r.reason;
   const cat = categorize(r);
   if (cat === "similar") return r.reason || "Too similar to another photo.";
   if (cat === "ai") {
+    if (r.reason) return r.reason.replace(/^Keep:\s*/i, "Cut because ");
+    const reasoning = analysisOf(r.photo)?.reasoning;
+    if (reasoning && !/^Keep:/i.test(reasoning)) return reasoning;
     if (/shortlist/i.test(r.reason)) return "Lower quality / sharpness score.";
-    return r.reason || "AI cut — lower overall score.";
+    return "Cut because this was lower-ranked than similar options.";
   }
+  const reasoning = analysisOf(r.photo)?.reasoning;
+  if (reasoning) return reasoning;
   return r.reason || "You removed this one.";
 }
 
@@ -1149,8 +3050,8 @@ function RemovedCategories({
 }) {
   const groups: { key: "similar" | "ai" | "user"; label: string; items: RemovedPhoto[] }[] = [
     { key: "similar", label: "Removed as duplicate / similar", items: [] },
-    { key: "ai",      label: "Removed by AI",                  items: [] },
-    { key: "user",    label: "Removed by you",                 items: [] },
+    { key: "ai", label: "Removed by AI", items: [] },
+    { key: "user", label: "Removed by you", items: [] },
   ];
   for (const r of removed) {
     const cat = categorize(r);
@@ -1158,57 +3059,67 @@ function RemovedCategories({
   }
   return (
     <div className="space-y-5">
-      {groups.filter((g) => g.items.length > 0).map((g) => (
-        <div key={g.key}>
-          <div className="mb-2 flex items-center justify-between px-1">
-            <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">
-              {g.label}
-            </span>
-            <span className="text-[11px] text-muted-foreground">{g.items.length}</span>
-          </div>
-          <ul className="space-y-2">
-            {g.items.map((r) => (
-              <li key={r.photo.id} className="glass-card flex gap-3 rounded-2xl p-2">
-                <div className="h-20 w-20 shrink-0 overflow-hidden rounded-xl bg-muted">
-                  <img
-                    src={r.photo.previewUrl ?? r.photo.url}
-                    alt=""
-                    decoding="async"
-                    loading="lazy"
-                    className="h-full w-full object-cover"
-                  />
-                </div>
-                <div className="flex min-w-0 flex-1 flex-col justify-between">
-                  <div>
-                    <div className="flex items-center gap-1.5">
-                      <span
-                        className={`chip ${
-                          g.key === "similar"
-                            ? "bg-lavender/60"
-                            : g.key === "ai"
-                              ? "bg-mint/40"
-                              : "bg-coral/15 text-coral"
-                        }`}
-                      >
-                        {g.key === "similar" ? "Similar" : g.key === "ai" ? "AI cut" : "You cut"}
-                      </span>
-                      <span className="truncate text-xs text-muted-foreground">{r.photo.name}</span>
-                    </div>
-                    <p className="mt-1 line-clamp-2 text-xs text-ink/80">{friendlyReason(r)}</p>
+      {groups
+        .filter((g) => g.items.length > 0)
+        .map((g) => (
+          <div key={g.key}>
+            <div className="mb-2 flex items-center justify-between px-1">
+              <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">
+                {g.label}
+              </span>
+              <span className="text-[11px] text-muted-foreground">{g.items.length}</span>
+            </div>
+            <ul className="space-y-2">
+              {g.items.map((r) => (
+                <li key={r.photo.id} className="glass-card flex gap-3 rounded-2xl p-2">
+                  <div className="h-20 w-20 shrink-0 overflow-hidden rounded-xl bg-muted">
+                    <img
+                      src={r.photo.previewUrl ?? r.photo.url}
+                      alt=""
+                      decoding="async"
+                      loading="lazy"
+                      className="h-full w-full object-cover"
+                    />
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => onRestore(r.photo.id)}
-                    className="self-start chip bg-mint/60 text-ink"
-                  >
-                    <Undo2 className="h-3 w-3" /> Restore
-                  </button>
-                </div>
-              </li>
-            ))}
-          </ul>
-        </div>
-      ))}
+                  <div className="flex min-w-0 flex-1 flex-col justify-between">
+                    <div>
+                      <div className="flex items-center gap-1.5">
+                        <span
+                          className={`chip ${
+                            g.key === "similar"
+                              ? "bg-lavender/60"
+                              : g.key === "ai"
+                                ? "bg-mint/40"
+                                : "bg-coral/15 text-coral"
+                          }`}
+                        >
+                          {g.key === "similar" ? "Similar" : g.key === "ai" ? "AI cut" : "You cut"}
+                        </span>
+                        <span className="truncate text-xs text-muted-foreground">
+                          {r.photo.name}
+                        </span>
+                      </div>
+                      <p className="mt-1 line-clamp-2 text-xs text-ink/80">{friendlyReason(r)}</p>
+                      {analysisOf(r.photo) && (
+                        <p className="mt-1 text-[11px] text-muted-foreground">
+                          Rank {analysisOf(r.photo)!.overallRank || "—"} · confidence{" "}
+                          {Math.round(analysisOf(r.photo)!.confidence * 100)}%
+                        </p>
+                      )}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => onRestore(r.photo.id)}
+                      className="self-start chip bg-mint/60 text-ink"
+                    >
+                      <Undo2 className="h-3 w-3" /> Restore
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))}
     </div>
   );
 }
@@ -1217,6 +3128,7 @@ function RemovedCategories({
 function FinalStage() {
   const { state, dispatch } = useDumpDeck();
   const [ordering, setOrdering] = useState(false);
+  const pinnedCover = state.finalOrder.find((photo) => photo.id === state.pinnedCoverId);
 
   function removeSlide(id: string) {
     const photo = state.finalOrder.find((p) => p.id === id);
@@ -1226,14 +3138,43 @@ function FinalStage() {
         entries: [{ photo, reason: "Removed from final collection.", source: "user" }],
       });
     }
+    if (state.pinnedCoverId === id) dispatch({ type: "setPinnedCover", id: null });
     dispatch({ type: "setFinalOrder", photos: state.finalOrder.filter((p) => p.id !== id) });
+  }
+
+  function pinCover(id: string) {
+    const ordered = orderWithPinned(state.finalOrder, id);
+    dispatch({ type: "setPinnedCover", id });
+    dispatch({ type: "setFinalOrder", photos: ordered });
+    toast.success("Cover pinned as slide 1.");
+  }
+
+  function unpinCover() {
+    dispatch({ type: "setPinnedCover", id: null });
+    toast("Cover pin removed.");
   }
 
   function runAiOrder() {
     setOrdering(true);
     setTimeout(() => {
-      dispatch({ type: "setFinalOrder", photos: aiOrder(state.finalOrder, state.settings) });
+      const ordered = aiOrder(state.finalOrder, state.settings, {
+        pinnedCoverId: state.pinnedCoverId,
+      });
+      dispatch({ type: "setFinalOrder", photos: ordered });
       setOrdering(false);
+      console.debug("[dumpdeck] final order", {
+        selectedTags: state.settings.vibes,
+        ordered: ordered.map((photo, index) => ({
+          slide: index + 1,
+          id: photo.id,
+          scene: analysisOf(photo)?.scene ?? photo.photoType,
+          event: photo.eventGroup?.title,
+          collection: photo.collectionGroup?.title,
+          people: analysisOf(photo)?.peopleCount ?? photo.peopleCount,
+          orientation: analysisOf(photo)?.orientation ?? photo.orientation,
+          score: rankingScore(photo),
+        })),
+      });
       toast.success("AI ordered your post");
     }, 700);
   }
@@ -1250,7 +3191,10 @@ function FinalStage() {
         <ScoreBadge label="Slides" value={state.finalOrder.length / 20} />
         <ScoreBadge
           label="Avg score"
-          value={state.finalOrder.reduce((a, p) => a + p.overall, 0) / Math.max(1, state.finalOrder.length)}
+          value={
+            state.finalOrder.reduce((a, p) => a + rankingScore(p), 0) /
+            Math.max(1, state.finalOrder.length)
+          }
         />
         <ScoreBadge label="Vibe" value={0.92} />
       </div>
@@ -1264,10 +3208,67 @@ function FinalStage() {
         {ordering ? "Arranging the flow…" : "AI order my post"}
       </Button>
 
+      <div className="glass-card mt-5 rounded-3xl p-4">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <p className="text-xs font-bold uppercase tracking-wider text-muted-foreground">
+              Cover photo
+            </p>
+            <p className="mt-1 text-sm text-muted-foreground">
+              {pinnedCover
+                ? "Pinned cover stays first while AI arranges the rest."
+                : "Pick one slide to lock in as the cover."}
+            </p>
+          </div>
+          {pinnedCover && (
+            <button type="button" onClick={unpinCover} className="chip bg-white/80 text-ink">
+              Unpin
+            </button>
+          )}
+        </div>
+        <div className="mt-3 flex gap-2 overflow-x-auto pb-1 no-scrollbar">
+          {state.finalOrder.map((photo, index) => {
+            const pinned = photo.id === state.pinnedCoverId;
+            return (
+              <button
+                key={photo.id}
+                type="button"
+                onClick={() => (pinned ? unpinCover() : pinCover(photo.id))}
+                className={`relative h-20 w-16 shrink-0 overflow-hidden rounded-2xl bg-muted transition ${
+                  pinned ? "ring-4 ring-coral" : "ring-1 ring-ink/10"
+                }`}
+                aria-label={pinned ? `Unpin ${photo.name} as cover` : `Pin ${photo.name} as cover`}
+              >
+                <img
+                  src={photo.previewUrl ?? photo.url}
+                  alt=""
+                  decoding="async"
+                  loading="lazy"
+                  className="h-full w-full object-cover"
+                />
+                <span className="absolute left-1 top-1 rounded-full bg-white/90 px-1.5 py-0.5 text-[10px] font-bold text-ink">
+                  {index + 1}
+                </span>
+                {pinned && (
+                  <span className="absolute inset-x-1 bottom-1 inline-flex items-center justify-center gap-1 rounded-full bg-coral px-1.5 py-0.5 text-[9px] font-bold text-white">
+                    <Pin className="h-2.5 w-2.5" /> Cover
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
       <div className="mt-5">
         <SortableGrid
           photos={state.finalOrder}
-          onChange={(next) => dispatch({ type: "setFinalOrder", photos: next })}
+          onChange={(next) =>
+            dispatch({
+              type: "setFinalOrder",
+              photos: orderWithPinned(next, state.pinnedCoverId),
+            })
+          }
           onRemove={removeSlide}
         />
       </div>
@@ -1287,7 +3288,9 @@ function FinalStage() {
 /* ───────────── Export ───────────── */
 function ExportStage() {
   const { state, dispatch } = useDumpDeck();
+  const { user } = useAuth();
   const [downloading, setDownloading] = useState(false);
+  const [saving, setSaving] = useState(false);
 
   function removeSlide(id: string) {
     const photo = state.finalOrder.find((p) => p.id === id);
@@ -1297,6 +3300,7 @@ function ExportStage() {
         entries: [{ photo, reason: "Removed from final post.", source: "user" }],
       });
     }
+    if (state.pinnedCoverId === id) dispatch({ type: "setPinnedCover", id: null });
     dispatch({ type: "setFinalOrder", photos: state.finalOrder.filter((p) => p.id !== id) });
     toast("Removed from post");
   }
@@ -1326,13 +3330,38 @@ function ExportStage() {
     }
   }
 
-  function save() {
+  async function save() {
+    setSaving(true);
     try {
-      const data = state.finalOrder.map((p, i) => ({ slide: i + 1, name: p.name, tags: p.tags }));
-      localStorage.setItem("dumpdeck:saved", JSON.stringify({ at: Date.now(), data }));
-      toast.success("Collection saved to this browser.");
-    } catch {
-      toast.error("Couldn't save.");
+      const result = await saveFinalDraft({
+        draftId: activeDraftId(),
+        projectId: activeProjectId(),
+        finalOrder: state.finalOrder,
+        removed: state.removed,
+        settings: state.settings,
+        duplicateDecisions: state.duplicateDecisions,
+        pinnedCoverPhotoId: state.pinnedCoverId,
+      });
+      console.debug("[dumpdeck] draft save response", {
+        userId: user?.id,
+        draftId: activeDraftId(),
+        projectId: activeProjectId(),
+        result,
+        orderedPhotoIds: state.finalOrder.map((photo) => photo.id),
+        rejectedPhotoIds: state.removed.map((entry) => entry.photo.id),
+        duplicateDecisions: state.duplicateDecisions,
+        pinnedCoverPhotoId: state.pinnedCoverId,
+      });
+      toast.success(
+        result.storage === "supabase"
+          ? "Draft saved to your project."
+          : "Draft saved locally for this browser.",
+      );
+    } catch (err) {
+      console.error("[dumpdeck] draft save failed", err);
+      toast.error("Couldn't save draft.");
+    } finally {
+      setSaving(false);
     }
   }
 
@@ -1349,8 +3378,17 @@ function ExportStage() {
       <div className="mt-5 flex gap-3 overflow-x-auto pb-2 no-scrollbar -mx-4 px-4">
         {state.finalOrder.map((p, i) => (
           <div key={p.id} className="relative w-[78%] shrink-0">
-            <div className="relative overflow-hidden rounded-3xl bg-muted shadow-xl" style={{ aspectRatio: aspect }}>
-              <img src={p.previewUrl ?? p.url} alt="" decoding="async" loading="lazy" className="h-full w-full object-cover" />
+            <div
+              className="relative overflow-hidden rounded-3xl bg-muted shadow-xl"
+              style={{ aspectRatio: aspect }}
+            >
+              <img
+                src={p.previewUrl ?? p.url}
+                alt=""
+                decoding="async"
+                loading="lazy"
+                className="h-full w-full object-cover"
+              />
               <button
                 type="button"
                 onClick={() => removeSlide(p.id)}
@@ -1389,7 +3427,6 @@ function ExportStage() {
       <CaptionIdeas />
 
       <div className="mt-6 space-y-2">
-
         <Button
           onClick={download}
           disabled={downloading || state.finalOrder.length === 0}
@@ -1402,9 +3439,10 @@ function ExportStage() {
           <Button
             variant="outline"
             onClick={save}
+            disabled={saving || state.finalOrder.length === 0}
             className="h-12 rounded-2xl border-ink/15 bg-white/70 font-semibold"
           >
-            <Save className="mr-2 h-4 w-4" /> Save collection
+            <Save className="mr-2 h-4 w-4" /> {saving ? "Saving…" : "Save draft"}
           </Button>
           <Button
             variant="outline"
@@ -1417,9 +3455,113 @@ function ExportStage() {
       </div>
 
       <p className="mt-6 text-center text-xs text-muted-foreground">
-        Heuristic on-device analysis — drop in a vision model for production-grade scoring.
+        Drafts save to Supabase when signed in, with local fallback for dev/testing.
       </p>
+      <DebugPanel />
     </section>
+  );
+}
+
+function DebugPanel() {
+  const { state } = useDumpDeck();
+
+  if (!import.meta.env.DEV) return null;
+
+  const duplicateGroups = buildDuplicateGroupsForPhotos(state.photos).filter(
+    (group) => group.photos.length > 1,
+  );
+  const events = Array.from(
+    new Map(
+      state.photos
+        .map((photo) => photo.eventGroup)
+        .filter((event): event is NonNullable<Photo["eventGroup"]> => Boolean(event))
+        .map((event) => [event.groupId, event]),
+    ).values(),
+  );
+  const collections = Array.from(
+    new Map(
+      state.photos
+        .map((photo) => photo.collectionGroup)
+        .filter((collection): collection is NonNullable<Photo["collectionGroup"]> =>
+          Boolean(collection),
+        )
+        .map((collection) => [collection.groupId, collection]),
+    ).values(),
+  );
+
+  return (
+    <details className="mt-5 rounded-2xl border border-ink/10 bg-white/70 p-3 text-left text-xs">
+      <summary className="cursor-pointer font-semibold">Debug analysis</summary>
+      <div className="mt-3 space-y-3">
+        <div>
+          <div className="font-semibold">Selected tags</div>
+          <div className="text-muted-foreground">{state.settings.vibes.join(", ")}</div>
+        </div>
+        <div>
+          <div className="font-semibold">Duplicate groups</div>
+          <ul className="mt-1 space-y-1 text-muted-foreground">
+            {duplicateGroups.map((group) => (
+              <li key={group.id}>
+                {group.reason} · {group.photos.map((photo) => photo.name).join(" / ")}
+              </li>
+            ))}
+            {duplicateGroups.length === 0 && <li>None</li>}
+          </ul>
+        </div>
+        <div>
+          <div className="font-semibold">Events</div>
+          <ul className="mt-1 space-y-1 text-muted-foreground">
+            {events.map((event) => (
+              <li key={event.groupId}>
+                {event.title}: {event.photoCount} photo{event.photoCount === 1 ? "" : "s"} ·{" "}
+                {event.description}
+              </li>
+            ))}
+            {events.length === 0 && <li>None</li>}
+          </ul>
+        </div>
+        <div>
+          <div className="font-semibold">Collections</div>
+          <ul className="mt-1 space-y-1 text-muted-foreground">
+            {collections.map((collection) => (
+              <li key={collection.groupId}>
+                {collection.title}: {collection.eventCount} event
+                {collection.eventCount === 1 ? "" : "s"} · {collection.photoCount} photo
+                {collection.photoCount === 1 ? "" : "s"}
+              </li>
+            ))}
+            {collections.length === 0 && <li>None</li>}
+          </ul>
+        </div>
+        <div>
+          <div className="font-semibold">Score breakdown</div>
+          <ul className="mt-1 space-y-1 text-muted-foreground">
+            {state.photos.map((photo) => (
+              <li key={photo.id}>
+                {photo.name}: {Math.round(rankingScore(photo) * 100)} · tag boost{" "}
+                {Math.round((photo.ranking?.scoreBreakdown?.tagBoost ?? 0) * 100)}
+              </li>
+            ))}
+          </ul>
+        </div>
+        <div>
+          <div className="font-semibold">Final selected</div>
+          <div className="text-muted-foreground">
+            {state.finalOrder.map((photo) => photo.name).join(", ") || "None yet"}
+          </div>
+        </div>
+        <div>
+          <div className="font-semibold">Rejected</div>
+          <ul className="mt-1 space-y-1 text-muted-foreground">
+            {state.removed.map((entry) => (
+              <li key={entry.photo.id}>
+                {entry.photo.name}: {entry.reason}
+              </li>
+            ))}
+          </ul>
+        </div>
+      </div>
+    </details>
   );
 }
 
@@ -1428,8 +3570,7 @@ function CaptionIdeas() {
   const { state } = useDumpDeck();
   const [seed, setSeed] = useState(0);
   const ideas = useMemo<CaptionIdea[]>(
-    () => generateCaptions(state.finalOrder, state.settings.vibes),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    () => generateCaptions(state.finalOrder, state.settings.vibes, seed),
     [state.finalOrder, state.settings.vibes, seed],
   );
 
@@ -1523,11 +3664,7 @@ function MiniStrip({
   const [open, setOpen] = useState(false);
   return (
     <div className="mt-5">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="chip"
-      >
+      <button type="button" onClick={() => setOpen((v) => !v)} className="chip">
         {open ? "Hide" : "Show"} all {remaining.length}
       </button>
       {open && (

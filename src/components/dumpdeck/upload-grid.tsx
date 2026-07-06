@@ -2,17 +2,50 @@ import { Sparkles, Upload, X } from "lucide-react";
 import { useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import type { UploadItem } from "@/lib/dumpdeck/types";
 
-export type UploadItem = {
-  id: string;
-  url: string;
-  previewUrl?: string;
-  name: string;
-  width: number;
-  height: number;
+const ACCEPTED_PHOTO_EXTENSIONS = /\.(jpe?g|png|webp|heic|heif|gif)$/i;
+const ACCEPTED_PHOTO_TYPES = new Set([
+  "image/jpeg",
+  "image/jpg",
+  "image/png",
+  "image/webp",
+  "image/heic",
+  "image/heif",
+  "image/gif",
+]);
+const INPUT_ACCEPT = [
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/heic",
+  "image/heif",
+  "image/gif",
+  ".jpg",
+  ".jpeg",
+  ".png",
+  ".webp",
+  ".heic",
+  ".heif",
+  ".gif",
+].join(",");
+
+const HEIC_CONVERSION_QUALITY = 0.95;
+const PREVIEW_QUALITY = 0.9;
+
+type Heic2Any = (typeof import("heic2any"))["default"];
+type HeicTo = (typeof import("heic-to"))["heicTo"];
+
+type PreparedImageSource = {
+  blob: Blob;
+  mimeType: string;
+  originalMimeType: string;
+  convertedFromHeic: boolean;
+  conversionQuality?: number;
+  conversionDecoder?: string;
 };
 
-function makePreviewUrl(img: HTMLImageElement, maxSide = 1280): Promise<string> {
+function makePreviewUrl(img: HTMLImageElement, maxSide = 1600): Promise<string> {
   return new Promise((resolve) => {
     const scale = Math.min(1, maxSide / Math.max(img.naturalWidth, img.naturalHeight));
     if (scale >= 1) {
@@ -31,29 +64,165 @@ function makePreviewUrl(img: HTMLImageElement, maxSide = 1280): Promise<string> 
     canvas.toBlob(
       (blob) => resolve(blob ? URL.createObjectURL(blob) : img.src),
       "image/jpeg",
-      0.82,
+      PREVIEW_QUALITY,
     );
   });
 }
 
-function readImage(file: File): Promise<UploadItem> {
+async function readImage(file: File): Promise<UploadItem> {
+  const fingerprint = await fingerprintFile(file);
+  const source = await prepareImageSource(file);
+
   return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(file);
+    const originalFileUrl = URL.createObjectURL(file);
+    const url = URL.createObjectURL(source.blob);
     const img = new Image();
     img.onload = async () => {
       const previewUrl = await makePreviewUrl(img);
       resolve({
         id: crypto.randomUUID(),
         url,
+        originalFileUrl,
+        previewFileUrl: previewUrl,
         previewUrl,
         name: file.name,
         width: img.naturalWidth,
         height: img.naturalHeight,
+        fingerprint,
+        byteSize: source.blob.size,
+        mimeType: source.mimeType,
+        originalMimeType: source.originalMimeType,
+        convertedFromHeic: source.convertedFromHeic,
+        conversionQuality: source.conversionQuality,
+        conversionDecoder: source.conversionDecoder,
+        originalByteSize: file.size,
+        previewByteSize: source.blob.size,
+        lastModified: file.lastModified,
       });
     };
-    img.onerror = reject;
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      URL.revokeObjectURL(originalFileUrl);
+      reject(new Error(friendlyDecodeError(file)));
+    };
     img.src = url;
   });
+}
+
+async function prepareImageSource(file: File): Promise<PreparedImageSource> {
+  const originalMimeType = file.type || mimeTypeFromName(file.name) || "image/jpeg";
+  if (!isHeicFile(file)) {
+    return {
+      blob: file,
+      mimeType: originalMimeType,
+      originalMimeType,
+      convertedFromHeic: false,
+    };
+  }
+
+  const startedAt = performance.now();
+  const errors: string[] = [];
+  try {
+    console.debug("[upload] preparing HEIC/HEIF photo", { name: file.name, decoder: "heic-to" });
+    const { heicTo } = (await import("heic-to")) as { heicTo: HeicTo };
+    const converted = await heicTo({
+      blob: file,
+      type: "image/jpeg",
+      quality: HEIC_CONVERSION_QUALITY,
+    });
+    if (!(converted instanceof Blob)) throw new Error("HEIC conversion returned no image");
+    console.debug("[upload] HEIC/HEIF photo ready", {
+      name: file.name,
+      decoder: "heic-to",
+      conversionQuality: HEIC_CONVERSION_QUALITY,
+      originalBytes: file.size,
+      convertedBytes: converted.size,
+      ms: Math.round(performance.now() - startedAt),
+    });
+    return {
+      blob: converted,
+      mimeType: "image/jpeg",
+      originalMimeType,
+      convertedFromHeic: true,
+      conversionQuality: HEIC_CONVERSION_QUALITY,
+      conversionDecoder: "heic-to",
+    };
+  } catch (error) {
+    errors.push(error instanceof Error ? error.message : String(error));
+    console.warn("[upload] HEIC conversion failed with heic-to", error);
+  }
+
+  try {
+    console.debug("[upload] preparing HEIC/HEIF photo", { name: file.name, decoder: "heic2any" });
+    const heic2any = (await import("heic2any")).default as Heic2Any;
+    const converted = await heic2any({
+      blob: file,
+      toType: "image/jpeg",
+      quality: HEIC_CONVERSION_QUALITY,
+    });
+    const blob = Array.isArray(converted) ? converted[0] : converted;
+    if (!(blob instanceof Blob)) throw new Error("HEIC conversion returned no image");
+    console.debug("[upload] HEIC/HEIF photo ready", {
+      name: file.name,
+      decoder: "heic2any",
+      conversionQuality: HEIC_CONVERSION_QUALITY,
+      originalBytes: file.size,
+      convertedBytes: blob.size,
+      ms: Math.round(performance.now() - startedAt),
+    });
+    return {
+      blob,
+      mimeType: "image/jpeg",
+      originalMimeType,
+      convertedFromHeic: true,
+      conversionQuality: HEIC_CONVERSION_QUALITY,
+      conversionDecoder: "heic2any",
+    };
+  } catch (error) {
+    errors.push(error instanceof Error ? error.message : String(error));
+    console.warn("[upload] HEIC conversion failed with heic2any", error);
+    throw new Error(
+      `${file.name} could not be converted from HEIC/HEIF. ${errors.length ? `Decoder said: ${errors[errors.length - 1]}` : "Try exporting it as JPEG/WebP and uploading again."}`,
+    );
+  }
+}
+
+function isHeicFile(file: File) {
+  return /\.(heic|heif)$/i.test(file.name) || /heic|heif/i.test(file.type);
+}
+
+function mimeTypeFromName(name: string) {
+  if (/\.jpe?g$/i.test(name)) return "image/jpeg";
+  if (/\.png$/i.test(name)) return "image/png";
+  if (/\.webp$/i.test(name)) return "image/webp";
+  if (/\.gif$/i.test(name)) return "image/gif";
+  if (/\.(heic|heif)$/i.test(name)) return "image/heic";
+  return "";
+}
+
+function isSupportedPhotoFile(file: File) {
+  const type = file.type.toLowerCase();
+  return ACCEPTED_PHOTO_TYPES.has(type) || ACCEPTED_PHOTO_EXTENSIONS.test(file.name);
+}
+
+function friendlyDecodeError(file: File) {
+  if (/\.(heic|heif)$/i.test(file.name) || /heic|heif/i.test(file.type)) {
+    return `${file.name} could not be converted from HEIC/HEIF. Try exporting it as JPEG/WebP and uploading again.`;
+  }
+  return `${file.name} could not be previewed. It may be corrupt or an unsupported image file.`;
+}
+
+async function fingerprintFile(file: File): Promise<string | undefined> {
+  try {
+    const buffer = await file.arrayBuffer();
+    const hash = await crypto.subtle.digest("SHA-256", buffer);
+    return Array.from(new Uint8Array(hash))
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
+  } catch (err) {
+    console.warn("[upload] Failed to fingerprint image", err);
+    return undefined;
+  }
 }
 
 export function UploadGrid({
@@ -71,21 +240,38 @@ export function UploadGrid({
   const [progress, setProgress] = useState(0);
   const [busy, setBusy] = useState(false);
   const [dragOver, setDragOver] = useState(false);
+  const [errors, setErrors] = useState<string[]>([]);
+  const [status, setStatus] = useState("");
 
   async function handleFiles(files: FileList | File[]) {
-    const arr = Array.from(files).filter((f) => f.type.startsWith("image/"));
+    const selected = Array.from(files);
+    const arr = selected.filter(isSupportedPhotoFile);
+    const unsupported = selected
+      .filter((file) => !isSupportedPhotoFile(file))
+      .map((file) => `${file.name} is not a supported photo format.`);
+    setErrors(unsupported);
     if (!arr.length) return;
     setBusy(true);
     setProgress(0);
+    setStatus(`0/${arr.length} photos uploaded…`);
     const out: UploadItem[] = [];
+    const failed: string[] = [];
     for (let i = 0; i < arr.length; i++) {
+      const file = arr[i];
       try {
-        out.push(await readImage(arr[i]));
-      } catch {}
+        out.push(await readImage(file));
+      } catch (err) {
+        console.warn("[upload] Failed to load image", err);
+        failed.push(err instanceof Error ? err.message : `${file.name} could not be loaded.`);
+      }
       setProgress(Math.round(((i + 1) / arr.length) * 100));
+      const suffix = out.length === arr.length ? "" : "…";
+      setStatus(`${out.length}/${arr.length} photos uploaded${suffix}`);
     }
+    setErrors([...unsupported, ...failed]);
     onAdd(out);
     setBusy(false);
+    setStatus("");
   }
 
   return (
@@ -109,7 +295,7 @@ export function UploadGrid({
         <input
           ref={inputRef}
           type="file"
-          accept="image/*"
+          accept={INPUT_ACCEPT}
           multiple
           className="sr-only"
           onChange={(e) => e.target.files && handleFiles(e.target.files)}
@@ -129,10 +315,28 @@ export function UploadGrid({
                 style={{ width: `${progress}%` }}
               />
             </div>
-            <div className="mt-1 text-xs text-muted-foreground">Loading {progress}%</div>
+            <div className="mt-1 text-xs text-muted-foreground">
+              {status || `Loading ${progress}%`}
+            </div>
           </div>
         )}
       </label>
+
+      {errors.length > 0 && (
+        <div className="rounded-2xl border border-coral/20 bg-coral/10 p-3 text-xs text-ink/75">
+          <div className="font-semibold text-coral">
+            {errors.length === 1 ? "One photo needs attention" : "Some photos need attention"}
+          </div>
+          <ul className="mt-1 space-y-1">
+            {errors.slice(0, 4).map((error) => (
+              <li key={error}>{error}</li>
+            ))}
+          </ul>
+          {errors.length > 4 && (
+            <div className="mt-1 text-muted-foreground">+ {errors.length - 4} more</div>
+          )}
+        </div>
+      )}
 
       {items.length > 0 && (
         <>
@@ -156,7 +360,13 @@ export function UploadGrid({
                 className="group relative overflow-hidden rounded-2xl bg-muted"
                 style={{ aspectRatio: "1 / 1" }}
               >
-                <img src={it.previewUrl ?? it.url} alt={it.name} decoding="async" loading="lazy" className="h-full w-full object-cover" />
+                <img
+                  src={it.previewUrl ?? it.url}
+                  alt={it.name}
+                  decoding="async"
+                  loading="lazy"
+                  className="h-full w-full object-cover"
+                />
                 <button
                   type="button"
                   onClick={() => onRemove(it.id)}
@@ -184,7 +394,6 @@ export function UploadGrid({
               </>
             )}
           </Button>
-
         </>
       )}
     </div>

@@ -1,6 +1,5 @@
-import "@tensorflow/tfjs";
-import * as cocoSsd from "@tensorflow-models/coco-ssd";
-import { FaceDetector, FilesetResolver } from "@mediapipe/tasks-vision";
+import type * as cocoSsd from "@tensorflow-models/coco-ssd";
+import type { FaceDetector } from "@mediapipe/tasks-vision";
 
 export type Box = { x: number; y: number; w: number; h: number; score: number };
 
@@ -16,26 +15,35 @@ export type DetectionResult = {
 
 const PERSON_THRESHOLD = 0.6;
 const FACE_THRESHOLD = 0.55;
+const SKIP_BROWSER_MODELS =
+  import.meta.env.DEV && import.meta.env.VITE_DUMPDECK_DEV_AUTH === "true";
 
 let cocoPromise: Promise<cocoSsd.ObjectDetection | null> | null = null;
 let facePromise: Promise<FaceDetector | null> | null = null;
 
 function loadCoco(): Promise<cocoSsd.ObjectDetection | null> {
+  if (SKIP_BROWSER_MODELS) return Promise.resolve(null);
   if (!cocoPromise) {
-    cocoPromise = cocoSsd
-      .load({ base: "lite_mobilenet_v2" })
-      .catch((err) => {
+    cocoPromise = (async () => {
+      try {
+        await import("@tensorflow/tfjs");
+        const model = await import("@tensorflow-models/coco-ssd");
+        return await model.load({ base: "lite_mobilenet_v2" });
+      } catch (err) {
         console.warn("[detection] COCO-SSD failed to load", err);
         return null;
-      });
+      }
+    })();
   }
   return cocoPromise;
 }
 
 function loadFace(): Promise<FaceDetector | null> {
+  if (SKIP_BROWSER_MODELS) return Promise.resolve(null);
   if (!facePromise) {
     facePromise = (async () => {
       try {
+        const { FaceDetector, FilesetResolver } = await import("@mediapipe/tasks-vision");
         const vision = await FilesetResolver.forVisionTasks(
           "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm",
         );
@@ -142,10 +150,7 @@ export async function detectPeopleAndFaces(url: string): Promise<DetectionResult
     if (detectedPeopleCount === 0 && detectedFaceCount === 0) {
       confidence = 0.95;
     } else if (Math.abs(detectedPeopleCount - detectedFaceCount) <= 1) {
-      const avgScore = avg([
-        ...peopleBoxes.map((b) => b.score),
-        ...faceBoxes.map((b) => b.score),
-      ]);
+      const avgScore = avg([...peopleBoxes.map((b) => b.score), ...faceBoxes.map((b) => b.score)]);
       confidence = Math.min(0.98, 0.7 + avgScore * 0.25);
     } else {
       confidence = 0.35;

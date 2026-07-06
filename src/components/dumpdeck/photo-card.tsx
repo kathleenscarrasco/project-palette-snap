@@ -15,6 +15,11 @@ export function PhotoCard({
   overlay?: React.ReactNode;
   onClick?: () => void;
 }) {
+  const analysis = photo.unifiedAnalysis?.analysis;
+  const score = analysis?.rankingScore ?? photo.overall;
+  const scene = analysis?.scene ?? photo.photoType;
+  const quality = analysis?.technicalQuality.overall ?? photo.scores.quality;
+
   return (
     <button
       type="button"
@@ -41,7 +46,22 @@ export function PhotoCard({
         </div>
       )}
       <div className="absolute right-2 top-2 rounded-full bg-white/90 px-2 py-0.5 text-[10px] font-bold text-ink shadow-sm">
-        {Math.round(photo.overall * 100)}
+        {Math.round(score * 100)}
+      </div>
+      <div className="absolute inset-x-2 bottom-2 space-y-1">
+        <div className="flex flex-wrap gap-1">
+          <span className="rounded-full bg-black/65 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-white">
+            {scene}
+          </span>
+          <span className="rounded-full bg-white/85 px-1.5 py-0.5 text-[9px] font-bold text-ink">
+            Q {Math.round(quality * 100)}
+          </span>
+          {analysis && analysis.peopleCount > 0 && (
+            <span className="rounded-full bg-white/85 px-1.5 py-0.5 text-[9px] font-bold text-ink">
+              {analysis.peopleCount} people
+            </span>
+          )}
+        </div>
       </div>
       {overlay}
     </button>
