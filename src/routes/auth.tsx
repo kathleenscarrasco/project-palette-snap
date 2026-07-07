@@ -272,7 +272,7 @@ function initialMode(): AuthMode {
 }
 
 function authRedirectUrl(mode: "reset" | "verified") {
-  const url = new URL("/auth", window.location.origin);
+  const url = new URL("/auth/callback", window.location.origin);
   url.searchParams.set("mode", mode);
   return url.toString();
 }

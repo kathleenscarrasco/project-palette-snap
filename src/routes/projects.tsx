@@ -47,6 +47,16 @@ function saveLocalProjects(projects: SavedProject[]) {
   localStorage.setItem(LOCAL_PROJECTS_KEY, JSON.stringify(projects));
 }
 
+function projectPersistenceErrorMessage(err: unknown, fallback = "Could not save project") {
+  const message = err instanceof Error ? err.message : String(err || fallback);
+  if (
+    /saved_projects|schema cache|relation .* does not exist|table .* does not exist/i.test(message)
+  ) {
+    return "Project storage is not set up yet. Apply the Supabase project persistence migration, then try again.";
+  }
+  return message || fallback;
+}
+
 function statusForProject(project: SavedProject, drafts: SavedFinalDraft[]): ProjectStatus {
   const projectDrafts = drafts
     .filter((draft) => draft.projectId === project.id)
@@ -177,7 +187,7 @@ function ProjectsPage() {
       toast.success("Project created");
       void navigate({ to: "/app" });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Could not create project";
+      const msg = projectPersistenceErrorMessage(err, "Could not create project");
       console.error("[saved_projects] create project failed:", err);
       setError(msg);
       toast.error(msg);
@@ -196,7 +206,7 @@ function ProjectsPage() {
         toast.success("Project created. Add your first photos.");
         void navigate({ to: "/app", replace: true });
       } catch (err) {
-        const msg = err instanceof Error ? err.message : "Could not create your first project";
+        const msg = projectPersistenceErrorMessage(err, "Could not create your first project");
         console.error("[saved_projects] auto-create first project failed:", err);
         setError(msg);
         toast.error(msg);
@@ -403,13 +413,16 @@ function ProjectsPage() {
                   Create your first DumpDeck project, then upload photos and start sorting.
                 </p>
                 <button
-                  onClick={() => {
-                    setEditing(null);
-                    setShowForm(true);
-                  }}
+                  onClick={startNewProject}
+                  disabled={creatingProject}
                   className="mt-5 inline-flex h-11 items-center gap-2 rounded-xl bg-ink px-4 font-semibold text-cream hover:bg-coral"
                 >
-                  <Plus className="h-4 w-4" /> Create your first project
+                  {creatingProject ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Plus className="h-4 w-4" />
+                  )}
+                  Create your first project
                 </button>
               </div>
             )}
@@ -655,7 +668,7 @@ function ProjectForm({
         await onSaved(data as SavedProject);
       }
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Save failed";
+      const msg = projectPersistenceErrorMessage(err, "Save failed");
       console.error("[saved_projects] save error:", err);
       toast.error(msg);
     } finally {

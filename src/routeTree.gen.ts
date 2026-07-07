@@ -15,6 +15,7 @@ import { Route as AuthRouteImport } from './routes/auth'
 import { Route as AppRouteImport } from './routes/app'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as ProjectsProjectIdRouteImport } from './routes/projects.$projectId'
+import { Route as AuthCallbackRouteImport } from './routes/auth.callback'
 
 const TrustRoute = TrustRouteImport.update({
   id: '/trust',
@@ -46,38 +47,59 @@ const ProjectsProjectIdRoute = ProjectsProjectIdRouteImport.update({
   path: '/$projectId',
   getParentRoute: () => ProjectsRoute,
 } as any)
+const AuthCallbackRoute = AuthCallbackRouteImport.update({
+  id: '/callback',
+  path: '/callback',
+  getParentRoute: () => AuthRoute,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/app': typeof AppRoute
-  '/auth': typeof AuthRoute
+  '/auth': typeof AuthRouteWithChildren
   '/projects': typeof ProjectsRouteWithChildren
   '/trust': typeof TrustRoute
+  '/auth/callback': typeof AuthCallbackRoute
   '/projects/$projectId': typeof ProjectsProjectIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/app': typeof AppRoute
-  '/auth': typeof AuthRoute
+  '/auth': typeof AuthRouteWithChildren
   '/projects': typeof ProjectsRouteWithChildren
   '/trust': typeof TrustRoute
+  '/auth/callback': typeof AuthCallbackRoute
   '/projects/$projectId': typeof ProjectsProjectIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/app': typeof AppRoute
-  '/auth': typeof AuthRoute
+  '/auth': typeof AuthRouteWithChildren
   '/projects': typeof ProjectsRouteWithChildren
   '/trust': typeof TrustRoute
+  '/auth/callback': typeof AuthCallbackRoute
   '/projects/$projectId': typeof ProjectsProjectIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
-    '/' | '/app' | '/auth' | '/projects' | '/trust' | '/projects/$projectId'
+    | '/'
+    | '/app'
+    | '/auth'
+    | '/projects'
+    | '/trust'
+    | '/auth/callback'
+    | '/projects/$projectId'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/app' | '/auth' | '/projects' | '/trust' | '/projects/$projectId'
+  to:
+    | '/'
+    | '/app'
+    | '/auth'
+    | '/projects'
+    | '/trust'
+    | '/auth/callback'
+    | '/projects/$projectId'
   id:
     | '__root__'
     | '/'
@@ -85,13 +107,14 @@ export interface FileRouteTypes {
     | '/auth'
     | '/projects'
     | '/trust'
+    | '/auth/callback'
     | '/projects/$projectId'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AppRoute: typeof AppRoute
-  AuthRoute: typeof AuthRoute
+  AuthRoute: typeof AuthRouteWithChildren
   ProjectsRoute: typeof ProjectsRouteWithChildren
   TrustRoute: typeof TrustRoute
 }
@@ -140,8 +163,25 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ProjectsProjectIdRouteImport
       parentRoute: typeof ProjectsRoute
     }
+    '/auth/callback': {
+      id: '/auth/callback'
+      path: '/callback'
+      fullPath: '/auth/callback'
+      preLoaderRoute: typeof AuthCallbackRouteImport
+      parentRoute: typeof AuthRoute
+    }
   }
 }
+
+interface AuthRouteChildren {
+  AuthCallbackRoute: typeof AuthCallbackRoute
+}
+
+const AuthRouteChildren: AuthRouteChildren = {
+  AuthCallbackRoute: AuthCallbackRoute,
+}
+
+const AuthRouteWithChildren = AuthRoute._addFileChildren(AuthRouteChildren)
 
 interface ProjectsRouteChildren {
   ProjectsProjectIdRoute: typeof ProjectsProjectIdRoute
@@ -158,7 +198,7 @@ const ProjectsRouteWithChildren = ProjectsRoute._addFileChildren(
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AppRoute: AppRoute,
-  AuthRoute: AuthRoute,
+  AuthRoute: AuthRouteWithChildren,
   ProjectsRoute: ProjectsRouteWithChildren,
   TrustRoute: TrustRoute,
 }
