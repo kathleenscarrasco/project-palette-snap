@@ -1,5 +1,5 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
-import { ArrowLeft, Copy, FileText, Loader2, Play, Upload, Wand2 } from "lucide-react";
+import { ArrowLeft, Copy, FileText, ImageIcon, Loader2, Play, Upload, Wand2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
 
@@ -16,6 +16,18 @@ export const Route = createFileRoute("/projects/$projectId")({
 });
 
 const LOCAL_PROJECTS_KEY = "dumpdeck:dev-projects";
+
+function coverUrlForDraft(draft: SavedFinalDraft): string | null {
+  const payload = draft.draftPayload;
+  const finalOrder = payload?.finalOrder ?? [];
+  const uploaded = payload?.uploadedPhotos ?? [];
+  const pinnedId = draft.selectedPreferences?.pinnedCoverPhotoId ?? payload?.pinnedCoverPhotoId;
+  const cover =
+    (pinnedId ? finalOrder.find((photo) => photo.id === pinnedId) : null) ??
+    finalOrder[0] ??
+    uploaded[0];
+  return cover?.previewUrl ?? cover?.previewFileUrl ?? cover?.url ?? null;
+}
 
 function loadLocalProject(projectId: string): SavedProject | null {
   try {
@@ -178,6 +190,11 @@ function ProjectWorkspacePage() {
           refinementRunning ? "refinement still running" : "ready to sort"
         }`
       : "No photos uploaded yet · upload a batch first";
+  const latestDraft = drafts[0] ?? null;
+  const latestDraftCoverUrl = latestDraft ? coverUrlForDraft(latestDraft) : null;
+  const latestDraftUploadedCount = latestDraft
+    ? new Set([...latestDraft.orderedPhotoIds, ...latestDraft.rejectedPhotoIds]).size
+    : uploadedCount;
 
   if (authLoading || loading) {
     return (
@@ -238,53 +255,126 @@ function ProjectWorkspacePage() {
           </p>
         </section>
 
-        <section className="mt-8 grid gap-3 sm:grid-cols-2">
-          <button
-            type="button"
-            onClick={openUploadFlow}
-            className="glass-card rounded-2xl p-5 text-left transition hover:-translate-y-0.5 hover:shadow-lg"
-          >
-            <span className="grid h-11 w-11 place-items-center rounded-xl bg-coral/15 text-coral">
-              <Upload className="h-5 w-5" />
-            </span>
-            <div className="mt-4 font-display text-2xl">Upload photos</div>
-            <p className="mt-1 text-sm text-muted-foreground">
-              Add or replace photos for this project.
-            </p>
-          </button>
+        {latestDraft ? (
+          <section className="glass-card mt-8 overflow-hidden rounded-3xl p-0">
+            <div className="grid gap-0 sm:grid-cols-[220px_1fr]">
+              <div className="aspect-[4/5] bg-gradient-to-br from-coral/15 via-mint/20 to-lavender/25 sm:aspect-auto">
+                {latestDraftCoverUrl ? (
+                  <img
+                    src={latestDraftCoverUrl}
+                    alt=""
+                    loading="lazy"
+                    decoding="async"
+                    className="h-full w-full object-cover"
+                  />
+                ) : (
+                  <div className="grid h-full min-h-56 place-items-center text-ink/35">
+                    <ImageIcon className="h-10 w-10" />
+                  </div>
+                )}
+              </div>
+              <div className="p-5">
+                <div className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">
+                  Completed project
+                </div>
+                <h2 className="mt-1 font-display text-3xl">Final draft saved</h2>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <span className="chip bg-mint/40">
+                    {latestDraft.orderedPhotoIds.length} selected
+                  </span>
+                  <span className="chip bg-white/80">Final order saved</span>
+                  <span className="chip bg-white/80">{latestDraftUploadedCount} uploaded</span>
+                  {latestDraft.selectedPreferences?.pinnedCoverPhotoId && (
+                    <span className="chip bg-coral/15 text-coral">Cover pinned</span>
+                  )}
+                </div>
+                <p className="mt-3 text-sm text-muted-foreground">
+                  Open this final cut to review the saved order, captions, removed photos, and
+                  pinned cover.
+                </p>
+                <div className="mt-5 grid gap-2">
+                  <Button
+                    onClick={() => openDraft(latestDraft)}
+                    className="h-12 rounded-2xl bg-ink text-base font-semibold text-cream hover:bg-coral"
+                  >
+                    Open final draft
+                  </Button>
+                  <div className="grid gap-2 sm:grid-cols-3">
+                    <button type="button" onClick={() => openDraft(latestDraft)} className="chip">
+                      Edit draft
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => duplicateDraft(latestDraft)}
+                      disabled={duplicatingDraftId === latestDraft.id}
+                      className="chip disabled:opacity-60"
+                    >
+                      {duplicatingDraftId === latestDraft.id ? (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                      ) : (
+                        <Copy className="h-3 w-3" />
+                      )}
+                      Duplicate as new project
+                    </button>
+                    <button type="button" onClick={openUploadFlow} className="chip">
+                      <Upload className="h-3 w-3" /> Replace/add photos
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+        ) : (
+          <>
+            <section className="mt-8 grid gap-3 sm:grid-cols-2">
+              <button
+                type="button"
+                onClick={openUploadFlow}
+                className="glass-card rounded-2xl p-5 text-left transition hover:-translate-y-0.5 hover:shadow-lg"
+              >
+                <span className="grid h-11 w-11 place-items-center rounded-xl bg-coral/15 text-coral">
+                  <Upload className="h-5 w-5" />
+                </span>
+                <div className="mt-4 font-display text-2xl">Upload photos</div>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  Add or replace photos for this project.
+                </p>
+              </button>
 
-          <button
-            type="button"
-            onClick={startSorting}
-            disabled={uploadedCount <= 0}
-            className="glass-card rounded-2xl p-5 text-left transition hover:-translate-y-0.5 hover:shadow-lg disabled:cursor-not-allowed disabled:opacity-55 disabled:hover:translate-y-0 disabled:hover:shadow-none"
-          >
-            <span className="grid h-11 w-11 place-items-center rounded-xl bg-mint/60 text-ink">
-              <Wand2 className="h-5 w-5" />
-            </span>
-            <div className="mt-4 font-display text-2xl">Start sorting</div>
-            <p className="mt-1 text-sm text-muted-foreground">
-              Continue with the current uploaded and analyzed batch.
-            </p>
-            <p className="mt-3 text-xs font-semibold text-ink/70">{statusCopy}</p>
-          </button>
-        </section>
+              <button
+                type="button"
+                onClick={startSorting}
+                disabled={uploadedCount <= 0}
+                className="glass-card rounded-2xl p-5 text-left transition hover:-translate-y-0.5 hover:shadow-lg disabled:cursor-not-allowed disabled:opacity-55 disabled:hover:translate-y-0 disabled:hover:shadow-none"
+              >
+                <span className="grid h-11 w-11 place-items-center rounded-xl bg-mint/60 text-ink">
+                  <Wand2 className="h-5 w-5" />
+                </span>
+                <div className="mt-4 font-display text-2xl">Start sorting</div>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  Continue with the current uploaded and analyzed batch.
+                </p>
+                <p className="mt-3 text-xs font-semibold text-ink/70">{statusCopy}</p>
+              </button>
+            </section>
 
-        <div className="mt-8">
-          <Button
-            onClick={startSorting}
-            disabled={uploadedCount <= 0}
-            className="h-14 w-full rounded-2xl bg-ink text-base font-semibold text-cream hover:bg-coral disabled:opacity-55"
-          >
-            <Play className="mr-2 h-4 w-4" />{" "}
-            {uploadedCount > 0 ? "Start Sorting" : "Upload photos first"}
-          </Button>
-          {uploadedCount <= 0 && (
-            <p className="mt-3 text-center text-xs text-muted-foreground">
-              Use Upload photos to add a batch before starting the curation flow.
-            </p>
-          )}
-        </div>
+            <div className="mt-8">
+              <Button
+                onClick={startSorting}
+                disabled={uploadedCount <= 0}
+                className="h-14 w-full rounded-2xl bg-ink text-base font-semibold text-cream hover:bg-coral disabled:opacity-55"
+              >
+                <Play className="mr-2 h-4 w-4" />{" "}
+                {uploadedCount > 0 ? "Start Sorting" : "Upload photos first"}
+              </Button>
+              {uploadedCount <= 0 && (
+                <p className="mt-3 text-center text-xs text-muted-foreground">
+                  Use Upload photos to add a batch before starting the curation flow.
+                </p>
+              )}
+            </div>
+          </>
+        )}
 
         <section className="mt-8">
           <div className="mb-3 flex items-center justify-between gap-3">

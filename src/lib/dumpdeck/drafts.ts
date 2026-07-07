@@ -1,4 +1,5 @@
 import { isLocalDevAuth, supabase } from "@/integrations/supabase/client";
+import { generateCaptions, type CaptionIdea } from "./captions";
 import type { Photo, RemovedPhoto, Settings } from "./types";
 
 const DRAFTS_TABLE = "dumpdeck_drafts";
@@ -46,7 +47,7 @@ export type SavedFinalDraft = {
 };
 
 export async function saveFinalDraft(input: SaveDraftInput): Promise<SaveDraftResult> {
-  const payload = buildDraftPayload(input);
+  const payload = await makeDraftPayloadDurable(buildDraftPayload(input));
   if (isLocalDevAuth) return saveLocalDraft(payload);
 
   const { data: userData, error: userError } = await supabase.auth.getUser();
@@ -85,7 +86,7 @@ export async function saveFinalDraft(input: SaveDraftInput): Promise<SaveDraftRe
       console.warn("[dumpdeck] Supabase draft update failed", error);
       throw error;
     }
-    await touchProject(input.projectId, userData.user.id, payload.updatedAt);
+    await updateProjectSummary(input.projectId, userData.user.id, payload, String(data.id));
 
     return {
       id: String((data as { id: string }).id),
@@ -105,7 +106,7 @@ export async function saveFinalDraft(input: SaveDraftInput): Promise<SaveDraftRe
       console.warn("[dumpdeck] Supabase draft insert failed", error);
       throw error;
     }
-    await touchProject(input.projectId, userData.user.id, payload.updatedAt);
+    await updateProjectSummary(input.projectId, userData.user.id, payload, String(data.id));
 
     return {
       id: String((data as { id: string }).id),
@@ -124,7 +125,7 @@ export async function saveFinalDraft(input: SaveDraftInput): Promise<SaveDraftRe
     console.warn("[dumpdeck] Supabase draft save failed", error);
     throw error;
   }
-  await touchProject(input.projectId, userData.user.id, payload.updatedAt);
+  await updateProjectSummary(input.projectId, userData.user.id, payload, String(data.id));
 
   return {
     id: String((data as { id: string }).id),
@@ -133,16 +134,30 @@ export async function saveFinalDraft(input: SaveDraftInput): Promise<SaveDraftRe
   };
 }
 
-async function touchProject(
+async function updateProjectSummary(
   projectId: string | null | undefined,
   userId: string,
-  updatedAt: string,
+  payload: FinalDraftPayload,
+  draftId: string,
 ) {
   const id = asUuid(projectId);
   if (!id) return;
   const { error } = await supabase
     .from("saved_projects")
-    .update({ updated_at: updatedAt })
+    .update({
+      selected_preferences: {
+        ...payload.selectedPreferences,
+        pinnedCoverPhotoId: payload.pinnedCoverPhotoId ?? null,
+      },
+      duplicate_decisions: payload.duplicateDecisions,
+      final_order_photo_ids: payload.orderedPhotoIds,
+      removed_photo_ids: payload.rejectedPhotoIds,
+      restored_photo_ids: payload.restoredPhotoIds,
+      pinned_cover_photo_id: payload.pinnedCoverPhotoId ?? null,
+      caption_ideas: payload.captionIdeas,
+      active_draft_id: draftId,
+      updated_at: payload.updatedAt,
+    })
     .eq("id", id)
     .eq("user_id", userId);
   if (error) console.warn("[dumpdeck] project timestamp update failed", error);
@@ -249,6 +264,7 @@ function buildDraftPayload(input: SaveDraftInput) {
     rejectedPhotoIds: input.removed.map((entry) => entry.photo.id),
     duplicateDecisions: input.duplicateDecisions,
     selectedPreferences: input.settings,
+    captionIdeas: generateCaptions(input.finalOrder, input.settings.vibes, 0),
     scoresReasons: [
       ...(input.allPhotos ?? input.finalOrder),
       ...input.removed.map((entry) => entry.photo),
@@ -265,6 +281,82 @@ function buildDraftPayload(input: SaveDraftInput) {
     createdAt: now,
     updatedAt: now,
   };
+}
+
+async function makeDraftPayloadDurable(payload: ReturnType<typeof buildDraftPayload>) {
+  const photoCache = new Map<string, Promise<Photo>>();
+  const durablePhoto = (photo: Photo) => {
+    const key = photo.id;
+    const existing = photoCache.get(key);
+    if (existing) return existing;
+    const next = toDurablePhoto(photo);
+    photoCache.set(key, next);
+    return next;
+  };
+
+  const finalOrder = await Promise.all(payload.finalOrder.map(durablePhoto));
+  const removed = await Promise.all(
+    payload.removed.map(async (entry) => ({
+      ...entry,
+      photo: await durablePhoto(entry.photo),
+    })),
+  );
+
+  const byId = new Map<string, Photo>();
+  for (const photo of payload.uploadedPhotos) byId.set(photo.id, photo);
+  for (const photo of finalOrder) byId.set(photo.id, photo);
+  for (const entry of removed) byId.set(entry.photo.id, entry.photo);
+
+  return {
+    ...payload,
+    uploadedPhotos: Array.from(byId.values()),
+    finalOrder,
+    removed,
+  };
+}
+
+async function toDurablePhoto(photo: Photo): Promise<Photo> {
+  const source = photo.previewUrl ?? photo.previewFileUrl ?? photo.url;
+  const durableUrl = await durableUrlFor(source);
+  if (!durableUrl) return photo;
+  const originalFileUrl = photo.originalFileUrl?.startsWith("blob:")
+    ? undefined
+    : photo.originalFileUrl;
+  return {
+    ...photo,
+    url: durableUrl,
+    previewUrl: durableUrl,
+    previewFileUrl: durableUrl,
+    originalFileUrl,
+    sourceMetadata: {
+      ...photo.sourceMetadata,
+      previewFileUrl: durableUrl,
+      originalFileUrl: originalFileUrl ?? photo.sourceMetadata?.originalFileUrl,
+    },
+  };
+}
+
+async function durableUrlFor(url: string | undefined): Promise<string | null> {
+  if (!url || !url.startsWith("blob:")) return null;
+  try {
+    const blob = await fetch(url).then((response) => {
+      if (!response.ok) throw new Error(`Could not read draft preview: ${response.status}`);
+      return response.blob();
+    });
+    return await blobToDataUrl(blob);
+  } catch (error) {
+    console.warn("[dumpdeck] could not make draft photo URL durable", error);
+    return null;
+  }
+}
+
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error ?? new Error("Could not encode draft image"));
+    reader.readAsDataURL(blob);
+  });
 }
 
 function saveLocalDraft(payload: FinalDraftPayload): SaveDraftResult {

@@ -1,6 +1,17 @@
 import { createFileRoute, Link, Outlet, useLocation, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useState, type FormEvent } from "react";
-import { Copy, FolderOpen, Home, Loader2, LogOut, Pencil, Plus, Trash2, X } from "lucide-react";
+import {
+  Copy,
+  FolderOpen,
+  Home,
+  ImageIcon,
+  Loader2,
+  LogOut,
+  Pencil,
+  Plus,
+  Trash2,
+  X,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { isLocalDevAuth, supabase, type SavedProject } from "@/integrations/supabase/client";
@@ -17,10 +28,14 @@ export const Route = createFileRoute("/projects")({
 const LOCAL_PROJECTS_KEY = "dumpdeck:dev-projects";
 
 type ProjectStatus = {
-  photoCount: number;
+  uploadedCount: number;
+  selectedCount: number;
+  countLabel: string;
   hasFinalOrder: boolean;
   updatedAt: string | null;
   draftId: string | null;
+  latestDraft: SavedFinalDraft | null;
+  coverUrl: string | null;
 };
 
 function loadLocalProjects(): SavedProject[] {
@@ -62,12 +77,48 @@ function statusForProject(project: SavedProject, drafts: SavedFinalDraft[]): Pro
     .filter((draft) => draft.projectId === project.id)
     .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
   const latest = projectDrafts[0];
+  const uploadedCount = latest
+    ? new Set([...latest.orderedPhotoIds, ...latest.rejectedPhotoIds]).size
+    : 0;
+  const selectedCount = latest?.orderedPhotoIds.length ?? 0;
+  const hasFinalOrder = selectedCount > 0;
   return {
-    photoCount: latest ? new Set([...latest.orderedPhotoIds, ...latest.rejectedPhotoIds]).size : 0,
-    hasFinalOrder: Boolean(latest?.orderedPhotoIds.length),
+    uploadedCount,
+    selectedCount,
+    countLabel: hasFinalOrder
+      ? `${selectedCount} photo${selectedCount === 1 ? "" : "s"}`
+      : uploadedCount
+        ? `${uploadedCount} uploaded · no final cut yet`
+        : "No saved photos yet",
+    hasFinalOrder,
     updatedAt: latest?.updatedAt ?? project.updated_at ?? project.created_at,
     draftId: latest?.id ?? null,
+    latestDraft: latest ?? null,
+    coverUrl: latest ? coverUrlForDraft(latest) : null,
   };
+}
+
+function coverUrlForDraft(draft: SavedFinalDraft): string | null {
+  const payload = draft.draftPayload;
+  const finalOrder = payload?.finalOrder ?? [];
+  const uploaded = payload?.uploadedPhotos ?? [];
+  const pinnedId = draft.selectedPreferences?.pinnedCoverPhotoId ?? payload?.pinnedCoverPhotoId;
+  const cover =
+    (pinnedId ? finalOrder.find((photo) => photo.id === pinnedId) : null) ??
+    finalOrder[0] ??
+    uploaded[0];
+  return cover?.previewUrl ?? cover?.previewFileUrl ?? cover?.url ?? null;
+}
+
+function openDraftPayload(navigate: ReturnType<typeof useNavigate>, draft: SavedFinalDraft) {
+  if (!draft.draftPayload?.finalOrder?.length) {
+    toast.error("This older draft is missing photo details. Open the project and save it again.");
+    return;
+  }
+  sessionStorage.setItem("dumpdeck:activeProjectId", draft.projectId ?? "");
+  sessionStorage.setItem("dumpdeck:activeDraftId", draft.id);
+  sessionStorage.setItem("dumpdeck:resumeDraft", JSON.stringify(draft.draftPayload));
+  void navigate({ to: "/app" });
 }
 
 async function createProjectRecord(userId: string, title = "Untitled DumpDeck Project") {
@@ -175,6 +226,15 @@ function ProjectsPage() {
   function openProject(id: string) {
     sessionStorage.setItem("dumpdeck:activeProjectId", id);
     void navigate({ to: "/projects/$projectId", params: { projectId: id } });
+  }
+
+  function continueProject(project: SavedProject) {
+    const status = statusForProject(project, drafts);
+    if (status.latestDraft?.draftPayload?.finalOrder?.length) {
+      openDraftPayload(navigate, status.latestDraft);
+      return;
+    }
+    openProject(project.id);
   }
 
   async function startNewProject() {
@@ -433,11 +493,11 @@ function ProjectsPage() {
                   key={p.id}
                   role="button"
                   tabIndex={0}
-                  onClick={() => openProject(p.id)}
+                  onClick={() => continueProject(p)}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" || event.key === " ") {
                       event.preventDefault();
-                      openProject(p.id);
+                      continueProject(p);
                     }
                   }}
                   className="glass-card flex cursor-pointer items-start gap-3 rounded-2xl p-4 text-left transition hover:-translate-y-0.5 hover:shadow-lg focus:outline-none focus:ring-2 focus:ring-coral"
@@ -446,6 +506,21 @@ function ProjectsPage() {
                     const status = statusForProject(p, drafts);
                     return (
                       <>
+                        <div className="h-24 w-32 shrink-0 overflow-hidden rounded-xl bg-gradient-to-br from-coral/15 via-mint/20 to-lavender/25">
+                          {status.coverUrl ? (
+                            <img
+                              src={status.coverUrl}
+                              alt=""
+                              loading="lazy"
+                              decoding="async"
+                              className="h-full w-full object-cover"
+                            />
+                          ) : (
+                            <div className="grid h-full w-full place-items-center text-ink/35">
+                              <ImageIcon className="h-7 w-7" />
+                            </div>
+                          )}
+                        </div>
                         <div className="min-w-0 flex-1">
                           <div className="truncate font-semibold">{p.title}</div>
                           {p.description && (
@@ -455,11 +530,7 @@ function ProjectsPage() {
                           )}
                           <div className="mt-3 flex flex-wrap items-center gap-2">
                             <span className="chip bg-ink text-cream">Continue project</span>
-                            <span className="chip bg-mint/40">
-                              {status.photoCount
-                                ? `${status.photoCount} photo${status.photoCount === 1 ? "" : "s"}`
-                                : "No saved photos yet"}
-                            </span>
+                            <span className="chip bg-mint/40">{status.countLabel}</span>
                             <span className="chip bg-white/80">
                               {status.hasFinalOrder ? "Final order saved" : "No final order yet"}
                             </span>
