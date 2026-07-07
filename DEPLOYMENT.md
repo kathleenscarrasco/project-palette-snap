@@ -10,13 +10,13 @@ Use the repository `netlify.toml` as the source of truth.
 
 - Build command: `npm run build`
 - Publish directory: `dist`
-- Runtime: Netlify Edge Functions
-- Server route: generated Nitro `server` edge function on `/*`
+- Runtime: Netlify Functions
+- Server route: generated Nitro `server` function on `/*`
 
 The app previously failed because Netlify was configured to publish
 `dist/client`, but this project does not generate that directory. With the
-Netlify edge preset, Nitro generates public assets in `dist` and the server
-handler in `.netlify/edge-functions/server/server.js`.
+Netlify preset, Nitro generates public assets in `dist` and the server handler
+in `.netlify/functions-internal/server/server.mjs`.
 
 ## Build Verification
 
@@ -36,12 +36,24 @@ dist/
   favicon.svg
 
 .netlify/
-  edge-functions/
-    manifest.json
-    server/server.js
+  functions-internal/
+    nitro.json
+    server/
+      server.mjs
+      main.mjs
 ```
 
 `dist/client` should not exist and should not be used.
+
+To run the production artifact locally after building:
+
+```bash
+npm run preview
+```
+
+The preview command serves `dist` assets and routes requests through the
+generated Netlify Function handler, matching staging more closely than Vite's
+generic preview server for this TanStack Start/Nitro setup.
 
 ## Required Netlify Environment Variables
 
@@ -125,7 +137,7 @@ The app uses:
 3. Add the required environment variables.
 4. Deploy the staging branch.
 5. Confirm the deploy log says the publish directory is `dist`.
-6. Confirm Netlify detects the generated edge function.
+6. Confirm Netlify detects the generated server function.
 7. Visit these URLs directly in a fresh tab:
    - `/`
    - `/auth`
@@ -141,7 +153,7 @@ Production should use the same build settings as staging:
 
 - Build command: `npm run build`
 - Publish directory: `dist`
-- Nitro preset: `netlify-edge`
+- Nitro preset: `netlify`
 
 Production should use production values for:
 
@@ -161,8 +173,8 @@ The site still has an old dashboard publish-directory override. Use the repo
 
 ### Refreshing `/projects` or `/app` returns 404
 
-Confirm the generated Netlify edge function is deployed and mapped to `/*`.
-This app is SSR-capable; do not replace the edge function with a static
+Confirm the generated Netlify function is deployed and mapped to `/*`.
+This app is SSR-capable; do not replace the server function with a static
 `/index.html` fallback unless you intentionally remove server-side routes.
 
 ### Gemini works locally but not on Netlify

@@ -7,10 +7,24 @@
 import { defineConfig } from "@lovable.dev/vite-tanstack-config";
 
 export default defineConfig({
+  vite: {
+    resolve: {
+      alias: {
+        // Supabase Auth depends on tslib. When Nitro bundles for Netlify Functions,
+        // the CommonJS tslib entry can be wrapped with an undefined default export.
+        // Use tslib's ESM helper entry so SSR imports are stable in production.
+        tslib: "tslib/tslib.es6.mjs",
+      },
+    },
+  },
   nitro: {
-    // Netlify needs Nitro's function output, not the default Cloudflare worker bundle.
-    // This preserves TanStack Start SSR and server-side Gemini endpoints in staging.
-    preset: "netlify-edge",
+    // Netlify should run this app in Node Functions, not Edge Functions:
+    // the SSR/server bundle depends on Node APIs and server-side Gemini/Supabase code.
+    preset: "netlify",
+    // Avoid Nitro beta's optional dependency tracer on Netlify Functions.
+    // The tracer path fails in this dependency set against @vercel/nft's
+    // CommonJS package shape, so bundle the server instead.
+    noExternals: true,
   },
   tanstackStart: {
     // Redirect TanStack Start's bundled server entry to src/server.ts (our SSR error wrapper).
