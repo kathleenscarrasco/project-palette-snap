@@ -8,9 +8,9 @@ import { Button } from "@/components/ui/button";
 import { useAuth } from "@/hooks/use-auth";
 import { isLocalDevAuth, supabase, type SavedProject } from "@/integrations/supabase/client";
 import {
-  draftHasDisplayablePhotos,
   duplicateFinalDraft,
   listFinalDrafts,
+  savedDraftDebugSummary,
   type SavedFinalDraft,
 } from "@/lib/dumpdeck/drafts";
 import { listProjectPhotoSummaries } from "@/lib/dumpdeck/storage";
@@ -174,28 +174,47 @@ function ProjectWorkspacePage() {
   }
 
   function openDraft(draft: SavedFinalDraft) {
+    console.debug("[dumpdeck] project workspace open draft requested", {
+      action: "open_draft",
+      routeChosen: "/app",
+      user_id: user?.id,
+      ...savedDraftDebugSummary(draft),
+    });
     if (!draft.draftPayload?.finalOrder?.length) {
+      console.warn("[dumpdeck] project workspace draft cannot open", savedDraftDebugSummary(draft));
       toast.error("This older draft is missing photo details. Save a new draft to reopen it here.");
       return;
     }
-    if (!draftHasDisplayablePhotos(draft)) {
-      toast.error("This older draft is missing stored photo files. Re-upload or save a new draft.");
-      return;
-    }
-  sessionStorage.setItem("dumpdeck:activeProjectId", draft.projectId ?? projectId);
-  sessionStorage.setItem("dumpdeck:activeDraftId", draft.id);
-  sessionStorage.setItem("dumpdeck:resumeDraft", JSON.stringify(draft.draftPayload));
-  sessionStorage.setItem("dumpdeck:resumeDraftStage", "export");
-  void navigate({ to: "/app" });
-}
+    sessionStorage.setItem("dumpdeck:activeProjectId", draft.projectId ?? projectId);
+    sessionStorage.setItem("dumpdeck:activeDraftId", draft.id);
+    sessionStorage.removeItem("dumpdeck:resumeDraft");
+    sessionStorage.setItem("dumpdeck:resumeDraftStage", "export");
+    void navigate({ to: "/app" });
+  }
 
   async function duplicateDraft(draft: SavedFinalDraft) {
     if (duplicatingDraftId) return;
     setDuplicatingDraftId(draft.id);
     try {
+      console.debug("[dumpdeck] duplicate draft requested", {
+        action: "duplicate_draft",
+        user_id: user?.id,
+        ...savedDraftDebugSummary(draft),
+      });
       const result = await duplicateFinalDraft(draft.id, project?.title ?? "DumpDeck draft");
       toast.success("Draft duplicated");
-      void navigate({ to: "/projects/$projectId", params: { projectId: result.projectId } });
+      sessionStorage.setItem("dumpdeck:activeProjectId", result.projectId);
+      sessionStorage.setItem("dumpdeck:activeDraftId", result.draftId);
+      sessionStorage.removeItem("dumpdeck:resumeDraft");
+      sessionStorage.setItem("dumpdeck:resumeDraftStage", "export");
+      console.debug("[dumpdeck] duplicated draft route chosen", {
+        action: "duplicate_draft",
+        user_id: user?.id,
+        project_id: result.projectId,
+        draft_id: result.draftId,
+        routeChosen: "/app",
+      });
+      void navigate({ to: "/app" });
     } catch (err) {
       const message = err instanceof Error ? err.message : "Could not duplicate draft";
       console.error("[dumpdeck] draft duplicate failed", err);

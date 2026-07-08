@@ -215,7 +215,7 @@ export async function hydrateStoredDrafts(drafts: SavedFinalDraft[]): Promise<Sa
     rows.map((row) => [rowKey(row.project_id, row.id), row] as const),
   );
 
-  return drafts.map((draft) => {
+  const hydrated = drafts.map((draft) => {
     if (!draft.draftPayload) return draft;
     const hydratePhoto = (photo: Photo) => {
       const row = rowsByProjectPhoto.get(rowKey(draft.projectId, photo.id));
@@ -235,6 +235,27 @@ export async function hydrateStoredDrafts(drafts: SavedFinalDraft[]): Promise<Sa
       },
     };
   });
+  console.debug("[dumpdeck] hydrated stored draft photos", {
+    draftCount: drafts.length,
+    projectIds,
+    storedPhotoRows: rows.length,
+    signedUrlsGenerated: signed.size,
+    drafts: hydrated.map((draft) => ({
+      draftId: draft.id,
+      projectId: draft.projectId,
+      finalSelectedPhotoCount: draft.draftPayload?.finalOrder?.length ?? 0,
+      finalOrderPhotoIds: draft.draftPayload?.orderedPhotoIds ?? draft.orderedPhotoIds,
+      pinnedCoverPhotoId:
+        draft.draftPayload?.pinnedCoverPhotoId ?? draft.selectedPreferences?.pinnedCoverPhotoId,
+      storagePathsLoaded:
+        draft.draftPayload?.finalOrder.filter(
+          (photo) => photo.previewStoragePath || photo.sourceMetadata?.previewStoragePath,
+        ).length ?? 0,
+      signedUrlsLoaded:
+        draft.draftPayload?.finalOrder.filter((photo) => photo.previewUrl || photo.url).length ?? 0,
+    })),
+  });
+  return hydrated;
 }
 
 export async function listProjectPhotoSummaries(): Promise<Map<string, ProjectPhotoSummary>> {

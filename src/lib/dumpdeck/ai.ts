@@ -724,6 +724,8 @@ export function aiOrder(
       let penalty = 0;
       if (sceneKey(c) === sceneKey(prev)) penalty += 7;
       if (prev2 && sceneKey(c) === sceneKey(prev2)) penalty += 3;
+      if (categoryKey(c) === categoryKey(prev)) penalty += 5.5;
+      if (prev2 && categoryKey(c) === categoryKey(prev2)) penalty += 3.5;
       if (c.photoType === prev.photoType) penalty += 4;
       if (prev2 && c.photoType === prev2.photoType) penalty += 2.5;
       if (peopleWeight(c) > 0.35 && peopleWeight(prev) > 0.35) penalty += 5;
@@ -744,9 +746,13 @@ export function aiOrder(
       const recentPeople = recent.filter((p) => peopleWeight(p) > 0.35).length;
       const recentScene = recent.filter((p) => sceneKey(p) === sceneKey(c)).length;
       const recentType = recent.filter((p) => p.photoType === c.photoType).length;
+      const recentCategory = recent.filter((p) => categoryKey(p) === categoryKey(c)).length;
+      const recentNoPeople = recent.filter((p) => peopleWeight(p) <= 0.1).length;
       if (peopleWeight(c) > 0.35 && recentPeople >= 2) penalty += 4;
+      if (peopleWeight(c) <= 0.1 && recentNoPeople >= 2) penalty += 2.75;
       if (recentScene >= 2) penalty += 3.5;
       if (recentType >= 2) penalty += 2.5;
+      if (recentCategory >= 2) penalty += 4.5;
       const scoreDrop = Math.max(0, rankingScore(prev) - rankingScore(c));
       penalty += scoreDrop * 1.1;
       penalty += i * 0.01;
@@ -792,6 +798,25 @@ function sceneKey(photo: Photo) {
   return (
     photo.unifiedAnalysis?.analysis.scene ?? photo.sceneAnalysis?.primaryScene ?? photo.photoType
   );
+}
+
+function categoryKey(photo: Photo) {
+  const objects = (photo.detectedObjects ?? []).map((object) => object.labelNormalized);
+  const scene = sceneKey(photo).toLowerCase();
+  if (peopleWeight(photo) >= 0.65 || photo.photoType === "group") return "group";
+  if (peopleWeight(photo) > 0.1 || photo.photoType === "selfie") return "people";
+  if (photo.photoType === "food" || objects.some((label) => /food|drink|coffee|pizza|plate/.test(label))) {
+    return "food";
+  }
+  if (photo.photoType === "outfit" || objects.some((label) => /clothing|dress|shoe|bag/.test(label))) {
+    return "outfit";
+  }
+  if (/city|building|architecture|street/.test(scene)) return "architecture";
+  if (/beach|ocean|mountain|forest|landscape|sunset|nature/.test(scene) || photo.photoType === "landscape") {
+    return "scenery";
+  }
+  if (photo.photoType === "detail") return "detail";
+  return photo.photoType || "filler";
 }
 
 function bestBy<T>(arr: T[], score: (t: T) => number): T | undefined {

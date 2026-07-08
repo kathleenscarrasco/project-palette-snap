@@ -60,6 +60,63 @@ export function draftHasDisplayablePhotos(draft: SavedFinalDraft) {
   );
 }
 
+export function savedDraftDebugSummary(draft: SavedFinalDraft | null | undefined) {
+  const payload = draft?.draftPayload;
+  const allPhotos = payload
+    ? [
+        ...(payload.uploadedPhotos ?? []),
+        ...(payload.finalOrder ?? []),
+        ...(payload.removed ?? []).map((entry) => entry.photo),
+      ]
+    : [];
+  const uniquePhotos = new Map(allPhotos.map((photo) => [photo.id, photo] as const));
+  const photos = Array.from(uniquePhotos.values());
+  return {
+    project_id: draft?.projectId ?? payload?.projectId ?? null,
+    draft_id: draft?.id ?? payload?.draftId ?? null,
+    saved_photo_count: photos.length,
+    final_selected_photo_count: payload?.finalOrder?.length ?? draft?.orderedPhotoIds?.length ?? 0,
+    final_order_photo_ids: payload?.orderedPhotoIds ?? draft?.orderedPhotoIds ?? [],
+    removed_photo_ids: payload?.rejectedPhotoIds ?? draft?.rejectedPhotoIds ?? [],
+    pinned_cover_photo_id:
+      payload?.pinnedCoverPhotoId ?? draft?.selectedPreferences?.pinnedCoverPhotoId ?? null,
+    storage_paths_loaded: photos.filter(
+      (photo) =>
+        Boolean(photo.previewStoragePath || photo.sourceMetadata?.previewStoragePath) ||
+        Boolean(photo.originalStoragePath || photo.sourceMetadata?.originalStoragePath),
+    ).length,
+    signed_urls_loaded: photos.filter((photo) =>
+      Boolean(photo.previewUrl || photo.previewFileUrl || photo.url),
+    ).length,
+    missing: missingDraftFields(draft),
+  };
+}
+
+export function missingDraftFields(draft: SavedFinalDraft | null | undefined) {
+  const missing: string[] = [];
+  const payload = draft?.draftPayload;
+  if (!draft?.id) missing.push("draft_id");
+  if (!draft?.projectId && !payload?.projectId) missing.push("project_id");
+  if (!payload) missing.push("draft_payload");
+  if (payload && (!Array.isArray(payload.finalOrder) || payload.finalOrder.length === 0)) {
+    missing.push("draft_payload.finalOrder");
+  }
+  if (payload && (!Array.isArray(payload.orderedPhotoIds) || payload.orderedPhotoIds.length === 0)) {
+    missing.push("draft_payload.orderedPhotoIds");
+  }
+  const photosMissingDisplay = (payload?.finalOrder ?? []).filter((photo) => {
+    const url = photo.previewUrl ?? photo.previewFileUrl ?? photo.url;
+    const path =
+      photo.previewStoragePath ??
+      photo.sourceMetadata?.previewStoragePath ??
+      photo.originalStoragePath ??
+      photo.sourceMetadata?.originalStoragePath;
+    return !url && !path;
+  });
+  if (photosMissingDisplay.length) missing.push("finalOrder.storagePathsOrSignedUrls");
+  return missing;
+}
+
 export async function saveFinalDraft(input: SaveDraftInput): Promise<SaveDraftResult> {
   if (isLocalDevAuth) {
     const payload = await makeDraftPayloadDurable(buildDraftPayload(input));
@@ -255,6 +312,7 @@ export async function getFinalDraftById(draftId: string): Promise<SavedFinalDraf
   }
 
   const [draft] = await hydrateStoredDrafts([normalizeDraftRow(data as DraftRow)]);
+  console.debug("[dumpdeck] loaded final draft by id", savedDraftDebugSummary(draft));
   return draft ?? null;
 }
 

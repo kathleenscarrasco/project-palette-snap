@@ -18,9 +18,9 @@ import { isLocalDevAuth, supabase, type SavedProject } from "@/integrations/supa
 import { useAuth } from "@/hooks/use-auth";
 import { BrandMark, BrandWordmark } from "@/components/dumpdeck/brand";
 import {
-  draftHasDisplayablePhotos,
   duplicateFinalDraft,
   listFinalDrafts,
+  savedDraftDebugSummary,
   type SavedFinalDraft,
 } from "@/lib/dumpdeck/drafts";
 import { deleteStoredProjectPhotos, listProjectPhotoSummaries } from "@/lib/dumpdeck/storage";
@@ -127,17 +127,19 @@ function coverUrlForDraft(draft: SavedFinalDraft): string | null {
 }
 
 function openDraftPayload(navigate: ReturnType<typeof useNavigate>, draft: SavedFinalDraft) {
+  console.debug("[dumpdeck] saved projects open draft requested", {
+    action: "continue_project",
+    routeChosen: "/app",
+    ...savedDraftDebugSummary(draft),
+  });
   if (!draft.draftPayload?.finalOrder?.length) {
-    toast.error("This older draft is missing photo details. Open the project and save it again.");
-    return;
-  }
-  if (!draftHasDisplayablePhotos(draft)) {
-    toast.error("This older draft is missing stored photo files. Re-upload or save a new draft.");
+    console.warn("[dumpdeck] saved project draft cannot open", savedDraftDebugSummary(draft));
+    toast.error("This draft is missing its final photo order. Open the project and save it again.");
     return;
   }
   sessionStorage.setItem("dumpdeck:activeProjectId", draft.projectId ?? "");
   sessionStorage.setItem("dumpdeck:activeDraftId", draft.id);
-  sessionStorage.setItem("dumpdeck:resumeDraft", JSON.stringify(draft.draftPayload));
+  sessionStorage.removeItem("dumpdeck:resumeDraft");
   sessionStorage.setItem("dumpdeck:resumeDraftStage", "export");
   void navigate({ to: "/app" });
 }
@@ -257,6 +259,23 @@ function ProjectsPage() {
 
   function continueProject(project: SavedProject) {
     const status = statusForProject(project, drafts, photoSummaries.get(project.id));
+    console.debug("[dumpdeck] continue project requested", {
+      project_id: project.id,
+      user_id: user?.id,
+      routeChosen: status.latestDraft?.draftPayload?.finalOrder?.length
+        ? "/app:final-draft"
+        : "/projects/$projectId",
+      saved_photo_count: photoSummaries.get(project.id)?.count ?? 0,
+      final_selected_photo_count: status.latestDraft?.draftPayload?.finalOrder?.length ?? 0,
+      final_order_photo_ids:
+        status.latestDraft?.draftPayload?.orderedPhotoIds ?? status.latestDraft?.orderedPhotoIds ?? [],
+      pinned_cover_photo_id:
+        status.latestDraft?.draftPayload?.pinnedCoverPhotoId ??
+        status.latestDraft?.selectedPreferences?.pinnedCoverPhotoId ??
+        null,
+      draft_id: status.latestDraft?.id ?? null,
+      missing_data: status.latestDraft ? savedDraftDebugSummary(status.latestDraft).missing : [],
+    });
     if (status.latestDraft?.draftPayload?.finalOrder?.length) {
       openDraftPayload(navigate, status.latestDraft);
       return;
@@ -318,7 +337,19 @@ function ProjectsPage() {
         const result = await duplicateFinalDraft(status.draftId, project.title);
         toast.success("Project duplicated");
         await load();
-        openProject(result.projectId);
+        sessionStorage.setItem("dumpdeck:activeProjectId", result.projectId);
+        sessionStorage.setItem("dumpdeck:activeDraftId", result.draftId);
+        sessionStorage.removeItem("dumpdeck:resumeDraft");
+        sessionStorage.setItem("dumpdeck:resumeDraftStage", "export");
+        console.debug("[dumpdeck] duplicated project draft route chosen", {
+          action: "duplicate_project",
+          user_id: user?.id,
+          source_project_id: project.id,
+          project_id: result.projectId,
+          draft_id: result.draftId,
+          routeChosen: "/app",
+        });
+        void navigate({ to: "/app" });
         return;
       }
       const copy = await createProjectRecord(user!.id, `${project.title} copy`);

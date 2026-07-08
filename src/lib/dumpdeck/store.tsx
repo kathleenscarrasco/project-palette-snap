@@ -4,7 +4,6 @@ import {
   useEffect,
   useMemo,
   useReducer,
-  useState,
   type ReactNode,
 } from "react";
 import type { DuplicateDecisionDraft } from "./drafts";
@@ -145,17 +144,11 @@ function rehydrate(): State {
 const Ctx = createContext<{ state: State; dispatch: React.Dispatch<Action> } | null>(null);
 
 export function DumpDeckProvider({ children }: { children: ReactNode }) {
-  const [state, dispatch] = useReducer(reducer, initial);
-  const [hydrated, setHydrated] = useState(false);
+  const [state, dispatch] = useReducer(reducer, initial, rehydrate);
 
   useEffect(() => {
-    dispatch({ type: "hydrate", state: rehydrate() });
-    setHydrated(true);
-  }, []);
-
-  useEffect(() => {
-    if (hydrated) persist(state);
-  }, [hydrated, state.settings, state.stage]);
+    persist(state);
+  }, [state.settings, state.stage]);
 
   const value = useMemo(() => ({ state, dispatch }), [state]);
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

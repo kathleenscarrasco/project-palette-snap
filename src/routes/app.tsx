@@ -42,7 +42,9 @@ import {
 import { organizePhotos } from "@/lib/dumpdeck/pipeline/organization";
 import {
   getFinalDraftById,
+  missingDraftFields,
   saveFinalDraft,
+  savedDraftDebugSummary,
   type DuplicateDecisionDraft,
   type FinalDraftPayload,
 } from "@/lib/dumpdeck/drafts";
@@ -211,7 +213,7 @@ const FORMAT_ASPECT: Record<PostFormat, string> = {
 
 function Shell() {
   const { state, dispatch } = useDumpDeck();
-  const { isAuthed, loading } = useAuth();
+  const { user, isAuthed, loading } = useAuth();
   const navigate = useNavigate();
   const [draftHydrationChecked, setDraftHydrationChecked] = useState(false);
 
@@ -230,13 +232,51 @@ function Shell() {
       const targetStage =
         sessionStorage.getItem("dumpdeck:resumeDraftStage") === "final" ? "final" : "export";
       try {
-        let draft: FinalDraftPayload | null = raw ? (JSON.parse(raw) as FinalDraftPayload) : null;
-        if (!draft && draftId) {
+        let draft: FinalDraftPayload | null = null;
+        if (draftId) {
           const saved = await getFinalDraftById(draftId);
+          console.debug("[dumpdeck] app restore fetched saved draft", {
+            action: "app_restore",
+            user_id: user?.id,
+            routeChosen: targetStage,
+            ...savedDraftDebugSummary(saved),
+          });
           draft = saved?.draftPayload ?? null;
+        }
+        if (!draft && raw) {
+          draft = JSON.parse(raw) as FinalDraftPayload;
+          console.debug("[dumpdeck] app restore using session draft fallback", {
+            user_id: user?.id,
+            project_id: draft.projectId,
+            draft_id: draft.draftId,
+            final_selected_photo_count: draft.finalOrder?.length ?? 0,
+            final_order_photo_ids: draft.orderedPhotoIds ?? [],
+            pinned_cover_photo_id: draft.pinnedCoverPhotoId ?? null,
+            missing_data: missingDraftFields({
+              id: draft.draftId ?? "session-draft",
+              projectId: draft.projectId,
+              orderedPhotoIds: draft.orderedPhotoIds,
+              rejectedPhotoIds: draft.rejectedPhotoIds,
+              duplicateDecisions: draft.duplicateDecisions,
+              selectedPreferences: {
+                ...draft.selectedPreferences,
+                pinnedCoverPhotoId: draft.pinnedCoverPhotoId,
+              },
+              scoresReasons: draft.scoresReasons,
+              draftPayload: draft,
+              createdAt: draft.createdAt,
+              updatedAt: draft.updatedAt,
+              storage: "local",
+            }),
+          });
         }
         if (!draft) return;
         if (!Array.isArray(draft.finalOrder) || draft.finalOrder.length === 0) {
+          console.warn("[dumpdeck] app restore missing final order", {
+            draftId,
+            projectId: activeProjectId(),
+            hasSessionPayload: Boolean(raw),
+          });
           toast.error("That draft is missing photo details. Start from the saved project instead.");
           return;
         }
@@ -272,7 +312,7 @@ function Shell() {
     return () => {
       cancelled = true;
     };
-  }, [dispatch, isAuthed, loading]);
+  }, [dispatch, isAuthed, loading, user?.id]);
 
   if (loading || (isAuthed && !draftHydrationChecked)) {
     return (
