@@ -115,6 +115,25 @@ function projectUploadCountKey(projectId: string) {
   return `dumpdeck:project:${projectId}:uploadCount`;
 }
 
+function safeSessionItem(key: string) {
+  try {
+    return sessionStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function countPendingUploadItems() {
+  const raw = safeSessionItem("dumpdeck:pending");
+  if (!raw) return 0;
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.length : 0;
+  } catch {
+    return 0;
+  }
+}
+
 export const Route = createFileRoute("/app")({
   head: () => ({
     meta: [
@@ -134,7 +153,16 @@ export const Route = createFileRoute("/app")({
   ),
 });
 
-function AppError({ reset }: { reset: () => void }) {
+function AppError({ error, reset }: { error?: Error; reset: () => void }) {
+  console.error("[dumpdeck] /app route failed before workspace render", {
+    message: error?.message,
+    stack: error?.stack,
+    projectId: safeSessionItem("dumpdeck:activeProjectId"),
+    draftId: safeSessionItem("dumpdeck:activeDraftId"),
+    pendingPhotoCount: countPendingUploadItems(),
+    hasPendingUploadState: Boolean(safeSessionItem("dumpdeck:pending")),
+    route: typeof window !== "undefined" ? window.location.pathname : "/app",
+  });
   return (
     <main className="grid min-h-screen place-items-center px-5 text-center">
       <div className="max-w-sm">
@@ -182,7 +210,7 @@ const FORMAT_ASPECT: Record<PostFormat, string> = {
 };
 
 function Shell() {
-  const { dispatch } = useDumpDeck();
+  const { state, dispatch } = useDumpDeck();
   const { isAuthed, loading } = useAuth();
   const navigate = useNavigate();
   const [draftHydrationChecked, setDraftHydrationChecked] = useState(false);
