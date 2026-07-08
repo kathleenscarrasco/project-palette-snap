@@ -158,12 +158,18 @@ function ProjectWorkspacePage() {
 
   function openUploadFlow() {
     sessionStorage.setItem("dumpdeck:activeProjectId", projectId);
+    sessionStorage.removeItem("dumpdeck:activeDraftId");
+    sessionStorage.removeItem("dumpdeck:resumeDraft");
+    sessionStorage.removeItem("dumpdeck:resumeDraftStage");
     void navigate({ to: "/app" });
   }
 
   function startSorting() {
     if (uploadedCount <= 0) return;
     sessionStorage.setItem("dumpdeck:activeProjectId", projectId);
+    sessionStorage.removeItem("dumpdeck:activeDraftId");
+    sessionStorage.removeItem("dumpdeck:resumeDraft");
+    sessionStorage.removeItem("dumpdeck:resumeDraftStage");
     void navigate({ to: "/app" });
   }
 
@@ -176,11 +182,12 @@ function ProjectWorkspacePage() {
       toast.error("This older draft is missing stored photo files. Re-upload or save a new draft.");
       return;
     }
-    sessionStorage.setItem("dumpdeck:activeProjectId", draft.projectId ?? projectId);
-    sessionStorage.setItem("dumpdeck:activeDraftId", draft.id);
-    sessionStorage.setItem("dumpdeck:resumeDraft", JSON.stringify(draft.draftPayload));
-    void navigate({ to: "/app" });
-  }
+  sessionStorage.setItem("dumpdeck:activeProjectId", draft.projectId ?? projectId);
+  sessionStorage.setItem("dumpdeck:activeDraftId", draft.id);
+  sessionStorage.setItem("dumpdeck:resumeDraft", JSON.stringify(draft.draftPayload));
+  sessionStorage.setItem("dumpdeck:resumeDraftStage", "export");
+  void navigate({ to: "/app" });
+}
 
   async function duplicateDraft(draft: SavedFinalDraft) {
     if (duplicatingDraftId) return;

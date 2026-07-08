@@ -1,6 +1,10 @@
 import { isLocalDevAuth, supabase } from "@/integrations/supabase/client";
 import { generateCaptions } from "./captions";
-import { copyStoredProjectPhotosForDraft, hydrateStoredDrafts } from "./storage";
+import {
+  copyStoredProjectPhotosForDraft,
+  hydrateStoredDrafts,
+  persistFinalDraftPhotos,
+} from "./storage";
 import type { Photo, RemovedPhoto, Settings } from "./types";
 
 const DRAFTS_TABLE = "dumpdeck_drafts";
@@ -57,8 +61,10 @@ export function draftHasDisplayablePhotos(draft: SavedFinalDraft) {
 }
 
 export async function saveFinalDraft(input: SaveDraftInput): Promise<SaveDraftResult> {
-  const payload = await makeDraftPayloadDurable(buildDraftPayload(input));
-  if (isLocalDevAuth) return saveLocalDraft(payload);
+  if (isLocalDevAuth) {
+    const payload = await makeDraftPayloadDurable(buildDraftPayload(input));
+    return saveLocalDraft(payload);
+  }
 
   const { data: userData, error: userError } = await supabase.auth.getUser();
   if (userError || !userData.user) {
@@ -68,15 +74,26 @@ export async function saveFinalDraft(input: SaveDraftInput): Promise<SaveDraftRe
     throw new Error("Choose or create a project before saving.");
   }
 
+  const draftPhotos = uniquePhotos([...input.finalOrder, ...input.removed.map((entry) => entry.photo)]);
+  const storagePhotos = await persistFinalDraftPhotos(input.projectId, draftPhotos);
+  const storageBackedInput = replaceDraftPhotos(
+    {
+      ...input,
+      allPhotos: draftPhotos,
+    },
+    storagePhotos,
+  );
+  const payload = await makeDraftPayloadDurable(buildDraftPayload(storageBackedInput));
+
   const row = {
     user_id: userData.user.id,
     project_id: asUuid(input.projectId),
-    ordered_photo_ids: input.finalOrder.map((photo) => photo.id),
-    rejected_photo_ids: input.removed.map((entry) => entry.photo.id),
-    duplicate_decisions: input.duplicateDecisions,
+    ordered_photo_ids: storageBackedInput.finalOrder.map((photo) => photo.id),
+    rejected_photo_ids: storageBackedInput.removed.map((entry) => entry.photo.id),
+    duplicate_decisions: storageBackedInput.duplicateDecisions,
     selected_preferences: {
-      ...input.settings,
-      pinnedCoverPhotoId: input.pinnedCoverPhotoId ?? null,
+      ...storageBackedInput.settings,
+      pinnedCoverPhotoId: storageBackedInput.pinnedCoverPhotoId ?? null,
     },
     scores_reasons: payload.scoresReasons,
     draft_payload: payload,
@@ -144,6 +161,25 @@ export async function saveFinalDraft(input: SaveDraftInput): Promise<SaveDraftRe
   };
 }
 
+function replaceDraftPhotos(input: SaveDraftInput, replacements: Map<string, Photo>): SaveDraftInput {
+  const replacePhoto = (photo: Photo) => replacements.get(photo.id) ?? photo;
+  return {
+    ...input,
+    allPhotos: input.allPhotos?.map(replacePhoto),
+    finalOrder: input.finalOrder.map(replacePhoto),
+    removed: input.removed.map((entry) => ({
+      ...entry,
+      photo: replacePhoto(entry.photo),
+    })),
+  };
+}
+
+function uniquePhotos(photos: Photo[]) {
+  const byId = new Map<string, Photo>();
+  for (const photo of photos) byId.set(photo.id, photo);
+  return Array.from(byId.values());
+}
+
 async function updateProjectSummary(
   projectId: string | null | undefined,
   userId: string,
@@ -195,6 +231,31 @@ export async function listFinalDrafts(projectId?: string | null): Promise<SavedF
     return listLocalDrafts(projectId);
   }
   return hydrateStoredDrafts(((data ?? []) as DraftRow[]).map(normalizeDraftRow));
+}
+
+export async function getFinalDraftById(draftId: string): Promise<SavedFinalDraft | null> {
+  if (isLocalDevAuth) {
+    return listLocalDrafts().find((draft) => draft.id === draftId) ?? null;
+  }
+
+  const { data: userData, error: userError } = await supabase.auth.getUser();
+  if (userError || !userData.user) return null;
+
+  const { data, error } = await supabase
+    .from(DRAFTS_TABLE)
+    .select(
+      "id,project_id,ordered_photo_ids,rejected_photo_ids,duplicate_decisions,selected_preferences,scores_reasons,draft_payload,created_at,updated_at",
+    )
+    .eq("id", draftId)
+    .eq("user_id", userData.user.id)
+    .single();
+  if (error || !data) {
+    console.warn("[dumpdeck] Supabase draft load failed", error);
+    return null;
+  }
+
+  const [draft] = await hydrateStoredDrafts([normalizeDraftRow(data as DraftRow)]);
+  return draft ?? null;
 }
 
 export async function duplicateFinalDraft(

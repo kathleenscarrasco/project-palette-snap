@@ -41,6 +41,7 @@ import {
 } from "@/lib/dumpdeck/pipeline/duplicate-clustering";
 import { organizePhotos } from "@/lib/dumpdeck/pipeline/organization";
 import {
+  getFinalDraftById,
   saveFinalDraft,
   type DuplicateDecisionDraft,
   type FinalDraftPayload,
@@ -71,7 +72,6 @@ import { TagBadge } from "@/components/dumpdeck/tag-badge";
 import { BrandMark, BrandWordmark } from "@/components/dumpdeck/brand";
 import { useAuth } from "@/hooks/use-auth";
 import { isLocalDevAuth } from "@/integrations/supabase/client";
-import { persistProjectUploads } from "@/lib/dumpdeck/storage";
 
 const MAX_KEEP = 20;
 const LOCAL_SCAN_CONCURRENCY = 3;
@@ -182,45 +182,71 @@ const FORMAT_ASPECT: Record<PostFormat, string> = {
 };
 
 function Shell() {
-  const { state, dispatch } = useDumpDeck();
+  const { dispatch } = useDumpDeck();
   const { isAuthed, loading } = useAuth();
   const navigate = useNavigate();
+  const [draftHydrationChecked, setDraftHydrationChecked] = useState(false);
 
   useEffect(() => {
-    if (!isAuthed) return;
-    const raw = sessionStorage.getItem("dumpdeck:resumeDraft");
-    if (!raw) return;
-    try {
-      const draft = JSON.parse(raw) as FinalDraftPayload;
-      if (!Array.isArray(draft.finalOrder) || draft.finalOrder.length === 0) {
-        toast.error("That draft is missing photo details. Start from the saved project instead.");
-        return;
-      }
-      const finalOrder = orderWithPinned(draft.finalOrder, draft.pinnedCoverPhotoId);
-      dispatch({
-        type: "hydrate",
-        state: {
-          stage: "final",
-          settings: draft.selectedPreferences ?? { formats: ["portrait"], vibes: ["random"] },
-          photos: finalOrder,
-          shortlist: finalOrder,
-          kept: finalOrder,
-          finalOrder,
-          removed: Array.isArray(draft.removed) ? draft.removed : [],
-          duplicateDecisions: draft.duplicateDecisions ?? [],
-          pinnedCoverId: draft.pinnedCoverPhotoId ?? null,
-        },
-      });
-      toast.success("Draft opened");
-    } catch (err) {
-      console.error("[dumpdeck] failed to resume draft", err);
-      toast.error("Could not open that draft.");
-    } finally {
-      sessionStorage.removeItem("dumpdeck:resumeDraft");
+    if (loading) return;
+    if (!isAuthed) {
+      setDraftHydrationChecked(true);
+      return;
     }
-  }, [dispatch, isAuthed]);
 
-  if (loading) {
+    let cancelled = false;
+    async function loadDraftToResume() {
+      setDraftHydrationChecked(false);
+      const raw = sessionStorage.getItem("dumpdeck:resumeDraft");
+      const draftId = activeDraftId();
+      const targetStage =
+        sessionStorage.getItem("dumpdeck:resumeDraftStage") === "final" ? "final" : "export";
+      try {
+        let draft: FinalDraftPayload | null = raw ? (JSON.parse(raw) as FinalDraftPayload) : null;
+        if (!draft && draftId) {
+          const saved = await getFinalDraftById(draftId);
+          draft = saved?.draftPayload ?? null;
+        }
+        if (!draft) return;
+        if (!Array.isArray(draft.finalOrder) || draft.finalOrder.length === 0) {
+          toast.error("That draft is missing photo details. Start from the saved project instead.");
+          return;
+        }
+        if (cancelled) return;
+        const finalOrder = orderWithPinned(draft.finalOrder, draft.pinnedCoverPhotoId);
+        const removed = Array.isArray(draft.removed) ? draft.removed : [];
+        dispatch({
+          type: "hydrate",
+          state: {
+            stage: targetStage,
+            settings: draft.selectedPreferences ?? { formats: ["portrait"], vibes: ["random"] },
+            photos: mergeDraftPhotos(draft.uploadedPhotos, finalOrder, removed),
+            shortlist: finalOrder,
+            kept: finalOrder,
+            finalOrder,
+            removed,
+            duplicateDecisions: draft.duplicateDecisions ?? [],
+            pinnedCoverId: draft.pinnedCoverPhotoId ?? null,
+          },
+        });
+        toast.success("Draft opened");
+      } catch (err) {
+        console.error("[dumpdeck] failed to resume draft", err);
+        toast.error("Could not open that draft.");
+      } finally {
+        sessionStorage.removeItem("dumpdeck:resumeDraft");
+        sessionStorage.removeItem("dumpdeck:resumeDraftStage");
+        if (!cancelled) setDraftHydrationChecked(true);
+      }
+    }
+
+    void loadDraftToResume();
+    return () => {
+      cancelled = true;
+    };
+  }, [dispatch, isAuthed, loading]);
+
+  if (loading || (isAuthed && !draftHydrationChecked)) {
     return (
       <main className="grid min-h-screen place-items-center text-sm text-muted-foreground">
         Loading…
@@ -299,6 +325,18 @@ function Shell() {
       </AnimatePresence>
     </main>
   );
+}
+
+function mergeDraftPhotos(
+  uploadedPhotos: Photo[] | undefined,
+  finalOrder: Photo[],
+  removed: RemovedPhoto[],
+) {
+  const byId = new Map<string, Photo>();
+  for (const photo of uploadedPhotos ?? []) byId.set(photo.id, photo);
+  for (const photo of finalOrder) byId.set(photo.id, photo);
+  for (const entry of removed) byId.set(entry.photo.id, entry.photo);
+  return Array.from(byId.values());
 }
 
 function TopBar() {
@@ -822,25 +860,13 @@ function UploadStage() {
   const { state, dispatch } = useDumpDeck();
   const [items, setItems] = useState<UploadItem[]>([]);
   const [loadingSamples, setLoadingSamples] = useState(false);
-  const [persistingPhotos, setPersistingPhotos] = useState(false);
 
   async function handleAnalyze() {
     const projectId = activeProjectId();
-    setPersistingPhotos(true);
-    let storedItems = items;
-    try {
-      storedItems = await persistProjectUploads(projectId, items);
-      setItems(storedItems);
-    } catch (error) {
-      console.error("[dumpdeck] photo storage upload failed", error);
-      toast.error("Could not save photos to your project. Please try again.");
-      setPersistingPhotos(false);
-      return;
-    }
     sessionStorage.setItem(
       "dumpdeck:pending",
       JSON.stringify(
-        storedItems.map((it) => ({
+        items.map((it) => ({
           id: it.id,
           url: it.url,
           originalFileUrl: it.originalFileUrl,
@@ -867,13 +893,12 @@ function UploadStage() {
         })),
       ),
     );
-    sessionStorage.setItem("dumpdeck:lastUploadCount", String(storedItems.length));
+    sessionStorage.setItem("dumpdeck:lastUploadCount", String(items.length));
     if (projectId) {
-      sessionStorage.setItem(projectUploadCountKey(projectId), String(storedItems.length));
-      localStorage.setItem(projectUploadCountKey(projectId), String(storedItems.length));
+      sessionStorage.setItem(projectUploadCountKey(projectId), String(items.length));
+      localStorage.setItem(projectUploadCountKey(projectId), String(items.length));
     }
     dispatch({ type: "clearRemoved" });
-    setPersistingPhotos(false);
     dispatch({ type: "setStage", stage: "analyze" });
   }
 
@@ -902,8 +927,6 @@ function UploadStage() {
           onAdd={(added) => setItems((cur) => [...cur, ...added])}
           onRemove={(id) => setItems((cur) => cur.filter((x) => x.id !== id))}
           onAnalyze={handleAnalyze}
-          analyzeBusy={persistingPhotos}
-          analyzeLabel="Saving photos to your project…"
         />
       </div>
       {isLocalDevAuth && (
@@ -1216,6 +1239,52 @@ function isUnsupportedSkipReason(reason?: string) {
   return /unsupported|corrupt|couldn't|failed|invalid/i.test(reason ?? "");
 }
 
+function summarizeSkippedRows(
+  skippedRows: AnalysisRow[],
+  screenshotRows: AnalysisRow[],
+  unsupportedRows: AnalysisRow[],
+) {
+  if (!skippedRows.length) return "";
+  const parts: string[] = [];
+  if (screenshotRows.length > 0) {
+    parts.push(
+      `${screenshotRows.length} screenshot/non-photo ${
+        screenshotRows.length === 1 ? "was" : "were"
+      } excluded automatically`,
+    );
+  }
+  if (unsupportedRows.length > 0) {
+    parts.push(
+      `${unsupportedRows.length} unsupported or failed ${
+        unsupportedRows.length === 1 ? "image was" : "images were"
+      } skipped`,
+    );
+  }
+  const explainedIds = new Set([...screenshotRows, ...unsupportedRows].map((row) => row.item.id));
+  const remaining = skippedRows.filter((row) => !explainedIds.has(row.item.id));
+  const duplicateCount = remaining.filter((row) =>
+    /exact duplicate|duplicate/i.test(row.localSkipReason ?? row.error ?? ""),
+  ).length;
+  if (duplicateCount > 0) {
+    parts.push(
+      `${duplicateCount} exact duplicate ${duplicateCount === 1 ? "was" : "were"} skipped`,
+    );
+  }
+  const otherCount = remaining.length - duplicateCount;
+  if (otherCount > 0) {
+    const firstOther = remaining.find(
+      (row) => !/exact duplicate|duplicate/i.test(row.localSkipReason ?? row.error ?? ""),
+    );
+    const firstReason = firstOther?.localSkipReason ?? firstOther?.error;
+    parts.push(
+      firstReason
+        ? `${otherCount} photo${otherCount === 1 ? "" : "s"} skipped: ${firstReason}`
+        : `${otherCount} photo${otherCount === 1 ? "" : "s"} skipped`,
+    );
+  }
+  return parts.join(" · ");
+}
+
 function refinementSnapshot(rows: AnalysisRow[]): RefinementSnapshot {
   const skipped = rows.filter((row) => row.status === "skipped");
   return {
@@ -1317,8 +1386,10 @@ function AnalyzeStage() {
   const backgroundRefiningCount = rows.filter(
     (row) => row.geminiCandidate && ["queued", "analyzing", "retrying"].includes(row.status),
   ).length;
-  const scannedCount = rows.filter((row) =>
-    ["local_complete", "analyzed", "skipped", "failed"].includes(row.status),
+  const scannedCount = rows.filter(
+    (row) =>
+      Boolean(row.photo?.analysis) ||
+      ["local_complete", "analyzed", "skipped", "failed"].includes(row.status),
   ).length;
   const localCompleteCount = rows.filter(
     (row) => row.status === "local_complete" || row.status === "analyzed",
@@ -1328,6 +1399,7 @@ function AnalyzeStage() {
   const usableCount = rows.filter(
     (row) => row.photo?.analysis && row.status !== "failed" && row.status !== "skipped",
   ).length;
+  const skippedReasonSummary = summarizeSkippedRows(skippedRows, screenshotRows, unsupportedRows);
   const hasActiveAnalysis = rows.some(
     (row) =>
       row.status === "local_scanning" ||
@@ -2158,22 +2230,7 @@ function AnalyzeStage() {
               {backgroundRefiningCount ? " · refining details in the background" : ""}
             </p>
             {skippedRows.length > 0 && (
-              <p>
-                {screenshotRows.length > 0
-                  ? `${screenshotRows.length} screenshot/non-photo ${
-                      screenshotRows.length === 1 ? "was" : "were"
-                    } excluded automatically`
-                  : null}
-                {screenshotRows.length > 0 && unsupportedRows.length > 0 ? " · " : ""}
-                {unsupportedRows.length > 0
-                  ? `${unsupportedRows.length} unsupported or failed ${
-                      unsupportedRows.length === 1 ? "image was" : "images were"
-                    } skipped`
-                  : null}
-                {screenshotRows.length === 0 && unsupportedRows.length === 0
-                  ? `${skippedRows.length} photo${skippedRows.length === 1 ? "" : "s"} skipped`
-                  : null}
-              </p>
+              <p>{skippedReasonSummary}</p>
             )}
           </div>
         )}

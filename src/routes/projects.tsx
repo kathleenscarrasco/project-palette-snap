@@ -138,6 +138,7 @@ function openDraftPayload(navigate: ReturnType<typeof useNavigate>, draft: Saved
   sessionStorage.setItem("dumpdeck:activeProjectId", draft.projectId ?? "");
   sessionStorage.setItem("dumpdeck:activeDraftId", draft.id);
   sessionStorage.setItem("dumpdeck:resumeDraft", JSON.stringify(draft.draftPayload));
+  sessionStorage.setItem("dumpdeck:resumeDraftStage", "export");
   void navigate({ to: "/app" });
 }
 
@@ -248,6 +249,9 @@ function ProjectsPage() {
 
   function openProject(id: string) {
     sessionStorage.setItem("dumpdeck:activeProjectId", id);
+    sessionStorage.removeItem("dumpdeck:activeDraftId");
+    sessionStorage.removeItem("dumpdeck:resumeDraft");
+    sessionStorage.removeItem("dumpdeck:resumeDraftStage");
     void navigate({ to: "/projects/$projectId", params: { projectId: id } });
   }
 
@@ -267,6 +271,9 @@ function ProjectsPage() {
     try {
       const project = await createProjectRecord(user.id);
       sessionStorage.setItem("dumpdeck:activeProjectId", project.id);
+      sessionStorage.removeItem("dumpdeck:activeDraftId");
+      sessionStorage.removeItem("dumpdeck:resumeDraft");
+      sessionStorage.removeItem("dumpdeck:resumeDraftStage");
       toast.success("Project created");
       void navigate({ to: "/app" });
     } catch (err) {
@@ -286,6 +293,9 @@ function ProjectsPage() {
       try {
         const project = await createProjectRecord(user.id, "My first DumpDeck Project");
         sessionStorage.setItem("dumpdeck:activeProjectId", project.id);
+        sessionStorage.removeItem("dumpdeck:activeDraftId");
+        sessionStorage.removeItem("dumpdeck:resumeDraft");
+        sessionStorage.removeItem("dumpdeck:resumeDraftStage");
         toast.success("Project created. Add your first photos.");
         void navigate({ to: "/app", replace: true });
       } catch (err) {

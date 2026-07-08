@@ -33,6 +33,8 @@ type ProjectPhotoSummary = {
   firstPhotoUrl: string | null;
 };
 
+type PersistablePhoto = UploadItem | Photo;
+
 export async function persistProjectUploads(
   projectId: string | null | undefined,
   items: UploadItem[],
@@ -99,6 +101,100 @@ export async function persistProjectUploads(
       id: item.id,
       originalStoragePath: item.originalStoragePath,
       previewStoragePath: item.previewStoragePath,
+    })),
+  });
+
+  return stored;
+}
+
+export async function persistFinalDraftPhotos(
+  projectId: string | null | undefined,
+  photos: Photo[],
+): Promise<Map<string, Photo>> {
+  const byId = new Map<string, Photo>();
+  for (const photo of photos) byId.set(photo.id, photo);
+  if (isLocalDevAuth || !projectId || !byId.size) return byId;
+
+  const { data: userData, error: userError } = await supabase.auth.getUser();
+  if (userError || !userData.user) throw userError ?? new Error("Sign in before saving photos.");
+
+  const userId = userData.user.id;
+  const stored = new Map<string, Photo>();
+
+  for (const photo of byId.values()) {
+    if (photo.sourceMetadata?.previewStoragePath || photo.previewStoragePath) {
+      stored.set(photo.id, photo);
+      continue;
+    }
+
+    const sourceUrl = photo.originalFileUrl ?? photo.sourceMetadata?.originalFileUrl ?? photo.url;
+    const previewUrl =
+      photo.previewUrl ?? photo.previewFileUrl ?? photo.sourceMetadata?.previewFileUrl ?? photo.url;
+    const originalBlob = await blobFromUrl(sourceUrl);
+    const previewBlob = await blobFromUrl(previewUrl);
+    const originalMimeType =
+      photo.sourceMetadata?.originalMimeType ?? originalBlob.type ?? photo.sourceMetadata?.mimeType;
+    const previewMimeType =
+      photo.sourceMetadata?.mimeType ?? previewBlob.type ?? originalMimeType ?? "image/jpeg";
+    const originalExt = extensionForMime(originalMimeType, photo.name);
+    const previewExt = extensionForMime(previewMimeType, "preview.jpg");
+    const basePath = `${userId}/${projectId}/${photo.id}`;
+    const originalPath = `${basePath}/original.${originalExt}`;
+    const previewPath = `${basePath}/preview.${previewExt}`;
+
+    await uploadObject(originalPath, originalBlob, originalMimeType);
+    await uploadObject(previewPath, previewBlob, previewMimeType);
+
+    const signed = await signedUrlsForPaths([originalPath, previewPath]);
+    const originalSignedUrl = signed.get(originalPath) ?? sourceUrl;
+    const previewSignedUrl = signed.get(previewPath) ?? previewUrl;
+    const uploadedAt = new Date().toISOString();
+    const next: Photo = {
+      ...photo,
+      url: previewSignedUrl,
+      originalFileUrl: originalSignedUrl,
+      previewFileUrl: previewSignedUrl,
+      previewUrl: previewSignedUrl,
+      storageBucket: DUMPDECK_PHOTOS_BUCKET,
+      originalStoragePath: originalPath,
+      previewStoragePath: previewPath,
+      fileName: photo.name,
+      uploadedAt,
+      sourceMetadata: {
+        ...photo.sourceMetadata,
+        storageBucket: DUMPDECK_PHOTOS_BUCKET,
+        originalStoragePath: originalPath,
+        previewStoragePath: previewPath,
+        fileName: photo.name,
+        uploadedAt,
+        originalMimeType,
+        mimeType: previewMimeType,
+        originalFileUrl: originalSignedUrl,
+        previewFileUrl: previewSignedUrl,
+      },
+    };
+
+    await upsertStoredPhoto({
+      item: next,
+      userId,
+      projectId,
+      originalPath,
+      previewPath,
+      originalBlob,
+      previewBlob,
+      uploadedAt,
+    });
+    stored.set(photo.id, next);
+  }
+
+  console.debug("[dumpdeck] saved final draft photos to Supabase Storage", {
+    projectId,
+    bucket: DUMPDECK_PHOTOS_BUCKET,
+    count: stored.size,
+    paths: Array.from(stored.values()).map((photo) => ({
+      id: photo.id,
+      originalStoragePath: photo.originalStoragePath,
+      previewStoragePath: photo.previewStoragePath,
     })),
   });
 
@@ -290,7 +386,7 @@ async function upsertStoredPhoto({
   previewBlob,
   uploadedAt,
 }: {
-  item: UploadItem;
+  item: PersistablePhoto;
   userId: string;
   projectId: string;
   originalPath: string;
@@ -309,13 +405,13 @@ async function upsertStoredPhoto({
     file_name: item.name,
     original_file_url: null,
     preview_file_url: null,
-    mime_type: item.mimeType ?? previewBlob.type,
-    original_mime_type: item.originalMimeType ?? originalBlob.type,
-    converted_from_heic: item.convertedFromHeic ?? false,
-    conversion_quality: item.conversionQuality ?? null,
+    mime_type: sourceMimeType(item) ?? previewBlob.type,
+    original_mime_type: sourceOriginalMimeType(item) ?? originalBlob.type,
+    converted_from_heic: sourceConvertedFromHeic(item),
+    conversion_quality: sourceConversionQuality(item),
     width: item.width,
     height: item.height,
-    file_size: item.originalByteSize ?? originalBlob.size,
+    file_size: sourceOriginalByteSize(item) ?? originalBlob.size,
     fingerprint: item.fingerprint ?? null,
     uploaded_at: uploadedAt,
     status: "uploaded",
@@ -325,19 +421,51 @@ async function upsertStoredPhoto({
       previewStoragePath: previewPath,
       fileName: item.name,
       uploadedAt,
-      originalMimeType: item.originalMimeType,
-      mimeType: item.mimeType,
-      convertedFromHeic: item.convertedFromHeic,
-      conversionQuality: item.conversionQuality,
-      conversionDecoder: item.conversionDecoder,
-      originalByteSize: item.originalByteSize,
-      previewByteSize: item.previewByteSize,
+      originalMimeType: sourceOriginalMimeType(item),
+      mimeType: sourceMimeType(item),
+      convertedFromHeic: sourceConvertedFromHeic(item),
+      conversionQuality: sourceConversionQuality(item),
+      conversionDecoder: sourceConversionDecoder(item),
+      originalByteSize: sourceOriginalByteSize(item),
+      previewByteSize: sourcePreviewByteSize(item),
     },
   };
   const { error } = await supabase
     .from("saved_project_photos")
     .upsert(row, { onConflict: "project_id,id" });
   if (error) throw error;
+}
+
+function sourceMimeType(item: PersistablePhoto) {
+  return "mimeType" in item ? item.mimeType : item.sourceMetadata?.mimeType;
+}
+
+function sourceOriginalMimeType(item: PersistablePhoto) {
+  return "originalMimeType" in item ? item.originalMimeType : item.sourceMetadata?.originalMimeType;
+}
+
+function sourceConvertedFromHeic(item: PersistablePhoto) {
+  return "convertedFromHeic" in item
+    ? (item.convertedFromHeic ?? false)
+    : (item.sourceMetadata?.convertedFromHeic ?? false);
+}
+
+function sourceConversionQuality(item: PersistablePhoto) {
+  return "conversionQuality" in item
+    ? (item.conversionQuality ?? null)
+    : (item.sourceMetadata?.conversionQuality ?? null);
+}
+
+function sourceConversionDecoder(item: PersistablePhoto) {
+  return "conversionDecoder" in item ? item.conversionDecoder : item.sourceMetadata?.conversionDecoder;
+}
+
+function sourceOriginalByteSize(item: PersistablePhoto) {
+  return "originalByteSize" in item ? item.originalByteSize : item.sourceMetadata?.originalByteSize;
+}
+
+function sourcePreviewByteSize(item: PersistablePhoto) {
+  return "previewByteSize" in item ? item.previewByteSize : item.sourceMetadata?.previewByteSize;
 }
 
 async function uploadObject(path: string, blob: Blob, contentType?: string) {
