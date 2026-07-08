@@ -26,7 +26,7 @@ import {
 import { deleteStoredProjectPhotos, listProjectPhotoSummaries } from "@/lib/dumpdeck/storage";
 
 export const Route = createFileRoute("/projects")({
-  head: () => ({ meta: [{ title: "Your saved projects · dumpify" }] }),
+  head: () => ({ meta: [{ title: "Your saved projects · FotoFairy" }] }),
   errorComponent: ProjectsError,
   component: ProjectsRouteShell,
 });
@@ -61,7 +61,7 @@ function loadLocalProjects(): SavedProject[] {
     {
       id: "local-demo-project",
       user_id: "local-dev-user",
-      title: "Demo DumpDeck Project",
+      title: "Demo FotoFairy Project",
       description: "Local-only test project for upload and sorting flow QA.",
       created_at: new Date().toISOString(),
     },
@@ -144,7 +144,7 @@ function openDraftPayload(navigate: ReturnType<typeof useNavigate>, draft: Saved
   void navigate({ to: "/app" });
 }
 
-async function createProjectRecord(userId: string, title = "Untitled DumpDeck Project") {
+async function createProjectRecord(userId: string, title = "Untitled FotoFairy Project") {
   const now = new Date().toISOString();
   if (isLocalDevAuth) {
     const saved: SavedProject = {
@@ -310,7 +310,7 @@ function ProjectsPage() {
     setAutoCreatingFirstProject(true);
     void (async () => {
       try {
-        const project = await createProjectRecord(user.id, "My first DumpDeck Project");
+        const project = await createProjectRecord(user.id, "My first FotoFairy Project");
         sessionStorage.setItem("dumpdeck:activeProjectId", project.id);
         sessionStorage.removeItem("dumpdeck:activeDraftId");
         sessionStorage.removeItem("dumpdeck:resumeDraft");
@@ -440,12 +440,12 @@ function ProjectsPage() {
           <div className="flex items-center justify-between gap-3">
             <div>
               <h1 className="font-display text-4xl tracking-tight">
-                {view === "home" ? "Start a DumpDeck" : "Saved projects"}
+                {view === "home" ? "Start a FotoFairy" : "Saved projects"}
               </h1>
               <p className="mt-1 text-sm text-muted-foreground">
                 {view === "home"
                   ? "Create a fresh sort or continue an existing project."
-                  : "Open, edit, duplicate, or delete your saved DumpDeck projects."}
+                  : "Open, edit, duplicate, or delete your saved FotoFairy projects."}
               </p>
             </div>
             {view === "saved" && (
@@ -535,7 +535,7 @@ function ProjectsPage() {
               <div className="glass-card rounded-2xl p-8 text-center">
                 <div className="font-display text-2xl">No saved projects yet</div>
                 <p className="mt-2 text-sm text-muted-foreground">
-                  Create your first DumpDeck project, then upload photos and start sorting.
+                  Create your first FotoFairy project, then upload photos and start sorting.
                 </p>
                 <button
                   onClick={startNewProject}

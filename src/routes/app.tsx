@@ -139,7 +139,7 @@ function countPendingUploadItems() {
 export const Route = createFileRoute("/app")({
   head: () => ({
     meta: [
-      { title: "dumpify — Build your dump" },
+      { title: "FotoFairy — Build your dump" },
       {
         name: "description",
         content: "Upload, analyze, curate, order, and export your photo dump.",
@@ -348,7 +348,7 @@ function Shell() {
           <BrandMark className="mx-auto h-12 w-12" />
           <h1 className="mt-4 font-display text-3xl">Choose a project first</h1>
           <p className="mt-2 text-sm text-muted-foreground">
-            DumpDeck saves uploads, cuts, captions, and final order under a project.
+            FotoFairy saves uploads, cuts, captions, and final order under a project.
           </p>
           <div className="mt-5 grid gap-2">
             <button
@@ -3503,7 +3503,7 @@ function ExportStage() {
       const url = URL.createObjectURL(out);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `dumpdeck-${Date.now()}.zip`;
+      a.download = `fotofairy-${Date.now()}.zip`;
       a.click();
       URL.revokeObjectURL(url);
       toast.success("Downloaded! Time to post.");

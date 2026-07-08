@@ -3,17 +3,17 @@ import { createFileRoute, Link } from "@tanstack/react-router";
 export const Route = createFileRoute("/trust")({
   head: () => ({
     meta: [
-      { title: "Trust & Privacy — dumpify" },
+      { title: "Trust & Privacy — FotoFairy" },
       {
         name: "description",
         content:
-          "How dumpify handles security, privacy, and your data. Maintained by the dumpify team.",
+          "How FotoFairy handles security, privacy, and your data. Maintained by the FotoFairy team.",
       },
-      { property: "og:title", content: "Trust & Privacy — dumpify" },
+      { property: "og:title", content: "Trust & Privacy — FotoFairy" },
       {
         property: "og:description",
         content:
-          "How dumpify handles security, privacy, and your data. Maintained by the dumpify team.",
+          "How FotoFairy handles security, privacy, and your data. Maintained by the FotoFairy team.",
       },
     ],
   }),
@@ -40,14 +40,14 @@ function TrustPage() {
           Trust & Privacy
         </h1>
         <p className="mt-3 text-sm text-muted-foreground">
-          This page is maintained by the dumpify team to answer common security and privacy
+          This page is maintained by the FotoFairy team to answer common security and privacy
           questions about the app. It describes our current practices and is editable project
           content — not an independent certification or audit result.
         </p>
 
-        <Section title="What dumpify does">
+        <Section title="What FotoFairy does">
           <p>
-            dumpify is a photo curation tool that helps you select and order images for a photo
+            FotoFairy is a photo curation tool that helps you select and order images for a photo
             dump. Photos you upload are processed in your browser for the curation flow.
           </p>
         </Section>
@@ -70,7 +70,7 @@ function TrustPage() {
 
         <Section title="Cookies & analytics">
           <p>
-            dumpify does not set marketing cookies. Essential storage may be used to keep the app
+            FotoFairy does not set marketing cookies. Essential storage may be used to keep the app
             working in your browser.
           </p>
         </Section>

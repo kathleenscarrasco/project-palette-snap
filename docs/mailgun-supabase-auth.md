@@ -1,6 +1,6 @@
 # Mailgun + Supabase Auth Setup
 
-DumpDeck uses Supabase Auth as the source of truth for users. Mailgun should only
+FotoFairy uses Supabase Auth as the source of truth for users. Mailgun should only
 be connected to Supabase as the transactional SMTP sender for auth email:
 signup confirmation, password reset, magic links, and email changes.
 
@@ -28,7 +28,7 @@ authorized recipients. Use a verified custom domain before production launch.
 
 ## Supabase
 
-1. Open the Supabase dashboard for the DumpDeck project.
+1. Open the Supabase dashboard for the FotoFairy project.
 2. Go to Authentication → Providers and keep Email enabled.
 3. Go to Authentication → SMTP settings.
 4. Enable custom SMTP.
@@ -45,7 +45,7 @@ authorized recipients. Use a verified custom domain before production launch.
    - Reset password
    - Change email address
 
-The DumpDeck app sends these redirects:
+The FotoFairy app sends these redirects:
 
 - Signup confirmation: `/auth?mode=verified`
 - Magic link: `/auth?mode=verified`

@@ -1,6 +1,6 @@
 # Supabase Auth and Project Persistence
 
-DumpDeck uses Supabase Auth as the source of truth for users. Project and draft
+FotoFairy uses Supabase Auth as the source of truth for users. Project and draft
 rows are user-owned and protected by Row-Level Security.
 
 ## Required Redirect URLs
@@ -41,7 +41,7 @@ https://your-domain.com/auth
 ## Email Template URLs
 
 Supabase confirmation, magic-link, and password-reset emails should send users
-back to DumpDeck. The app passes these URLs when it calls Supabase Auth:
+back to FotoFairy. The app passes these URLs when it calls Supabase Auth:
 
 ```text
 Confirmation URL: <app-origin>/auth/callback?mode=verified

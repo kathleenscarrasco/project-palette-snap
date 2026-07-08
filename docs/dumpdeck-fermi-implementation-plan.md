@@ -1,8 +1,8 @@
-# DumpDeck Fermi Lessons 4-10 Implementation Plan
+# FotoFairy Fermi Lessons 4-10 Implementation Plan
 
 ## Current Architecture
 
-DumpDeck is organized around a React/TanStack app flow in `src/routes/app.tsx` and project routes in `src/routes/projects.tsx` and `src/routes/projects.$projectId.tsx`.
+FotoFairy is organized around a React/TanStack app flow in `src/routes/app.tsx` and project routes in `src/routes/projects.tsx` and `src/routes/projects.$projectId.tsx`.
 
 Image understanding lives behind `src/lib/dumpdeck/pipeline`. The pipeline is modular:
 
@@ -143,7 +143,7 @@ Current status: implemented in current ranking pass, should be tuned with real d
 
 Remaining work:
 
-- Build a small evaluation set of real accepted/rejected DumpDeck sessions.
+- Build a small evaluation set of real accepted/rejected FotoFairy sessions.
 - Add thresholds for selected-vibe differences so random/aesthetic/travel sets diverge more predictably.
 
 ### 9. Loading / Analyzing UX

@@ -1,8 +1,8 @@
-# DumpDeck
+# FotoFairy
 
 ## Gemini image analysis
 
-DumpDeck runs Gemini image-understanding requests from the server only. Do not add
+FotoFairy runs Gemini image-understanding requests from the server only. Do not add
 `VITE_GEMINI_API_KEY`; any `VITE_` variable is exposed to the browser.
 
 To configure Gemini locally:
@@ -22,7 +22,7 @@ DUMPDECK_MAX_GEMINI_PHOTOS=70
 `GEMINI_MODEL` is optional. If it is omitted, the server uses `gemini-2.5-flash`.
 `DUMPDECK_ANALYSIS_CONCURRENCY` is optional and defaults to `3`; use it to control
 how many photo-analysis workers run at once for large uploads.
-`DUMPDECK_MAX_GEMINI_PHOTOS` is optional and defaults to `70`; DumpDeck quick-scans
+`DUMPDECK_MAX_GEMINI_PHOTOS` is optional and defaults to `70`; FotoFairy quick-scans
 all uploads locally, then sends only selected candidates to Gemini for deeper
 semantic refinement.
 

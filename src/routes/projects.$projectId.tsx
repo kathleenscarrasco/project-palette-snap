@@ -16,7 +16,7 @@ import {
 import { listProjectPhotoSummaries } from "@/lib/dumpdeck/storage";
 
 export const Route = createFileRoute("/projects/$projectId")({
-  head: () => ({ meta: [{ title: "Project workspace · dumpify" }] }),
+  head: () => ({ meta: [{ title: "Project workspace · FotoFairy" }] }),
   errorComponent: ProjectWorkspaceError,
   component: ProjectWorkspacePage,
 });
@@ -92,7 +92,7 @@ function ProjectWorkspacePage() {
         setProject({
           id: "local-demo-project",
           user_id: "local-dev-user",
-          title: "Demo DumpDeck Project",
+          title: "Demo FotoFairy Project",
           description: "Local-only test project for upload and sorting flow QA.",
           created_at: new Date().toISOString(),
         });
@@ -201,7 +201,7 @@ function ProjectWorkspacePage() {
         user_id: user?.id,
         ...savedDraftDebugSummary(draft),
       });
-      const result = await duplicateFinalDraft(draft.id, project?.title ?? "DumpDeck draft");
+      const result = await duplicateFinalDraft(draft.id, project?.title ?? "FotoFairy draft");
       toast.success("Draft duplicated");
       sessionStorage.setItem("dumpdeck:activeProjectId", result.projectId);
       sessionStorage.setItem("dumpdeck:activeDraftId", result.draftId);

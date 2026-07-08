@@ -6,7 +6,7 @@ import { useAuth } from "@/hooks/use-auth";
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
-      { title: "dumpify" },
+      { title: "FotoFairy" },
       {
         name: "description",
         content: "AI-powered photo dump curator.",

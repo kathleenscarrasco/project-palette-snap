@@ -1,6 +1,6 @@
-# DumpDeck Deployment
+# FotoFairy Deployment
 
-DumpDeck is a TanStack Start app built with Vite and Nitro. It is not a plain
+FotoFairy is a TanStack Start app built with Vite and Nitro. It is not a plain
 static Vite SPA. The deployment must preserve the Nitro server layer because
 Gemini image-analysis requests run server-side.
 

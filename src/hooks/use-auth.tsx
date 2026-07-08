@@ -14,7 +14,7 @@ const Ctx = createContext<AuthCtx | undefined>(undefined);
 
 const localDevUser = {
   id: "local-dev-user",
-  email: "local-dev@dumpdeck.test",
+  email: "local-dev@fotofairy.test",
   app_metadata: {},
   user_metadata: {},
   aud: "authenticated",

@@ -94,7 +94,7 @@ const TAGLINES: Record<Theme, string[]> = {
     "Snack content detected, standards immediately raised...",
     "The food photos are making a convincing argument.",
     "Finding the bites that deserve a spot.",
-    "Camera eats first, DumpDeck sorts second.",
+    "Camera eats first, FotoFairy sorts second.",
     "This batch has excellent menu energy.",
     "Sorting the plates, cups, and tiny treats.",
     "Some delicious little details in here.",

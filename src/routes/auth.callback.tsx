@@ -6,7 +6,7 @@ import { BrandMark, BrandWordmark } from "@/components/dumpdeck/brand";
 import { supabase } from "@/integrations/supabase/client";
 
 export const Route = createFileRoute("/auth/callback")({
-  head: () => ({ meta: [{ title: "Confirming email · dumpify" }] }),
+  head: () => ({ meta: [{ title: "Confirming email · FotoFairy" }] }),
   component: AuthCallbackPage,
 });
 

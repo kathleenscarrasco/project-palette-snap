@@ -77,14 +77,14 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1, viewport-fit=cover" },
-      { title: "dumpify — Turn 200 photos into the perfect photo dump" },
+      { title: "FotoFairy — Turn 200 photos into the perfect photo dump" },
       {
         name: "description",
         content:
           "AI-powered photo dump curator. Upload, narrow down, swipe, and order the perfect Instagram carousel.",
       },
-      { name: "author", content: "dumpify" },
-      { property: "og:title", content: "dumpify — Turn 200 photos into the perfect photo dump" },
+      { name: "author", content: "FotoFairy" },
+      { property: "og:title", content: "FotoFairy — Turn 200 photos into the perfect photo dump" },
       {
         property: "og:description",
         content:
@@ -92,7 +92,7 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
-      { name: "twitter:title", content: "dumpify — Turn 200 photos into the perfect photo dump" },
+      { name: "twitter:title", content: "FotoFairy — Turn 200 photos into the perfect photo dump" },
       {
         name: "twitter:description",
         content:

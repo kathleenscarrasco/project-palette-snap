@@ -341,7 +341,7 @@ export async function duplicateFinalDraft(
     .insert({
       user_id: userData.user.id,
       title: `${projectTitle} copy`,
-      description: "Duplicated from an existing DumpDeck draft.",
+      description: "Duplicated from an existing FotoFairy draft.",
     })
     .select("id")
     .single();
@@ -627,7 +627,7 @@ function duplicateLocalDraft(
     id: projectId,
     user_id: "local-dev-user",
     title: `${projectTitle} copy`,
-    description: "Duplicated from an existing DumpDeck draft.",
+    description: "Duplicated from an existing FotoFairy draft.",
     created_at: now,
   });
   localStorage.setItem("dumpdeck:dev-projects", JSON.stringify(projects));

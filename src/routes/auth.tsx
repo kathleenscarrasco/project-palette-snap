@@ -121,7 +121,7 @@ function AuthPage() {
         console.log("[auth] signUp result:", data.user?.id, "session:", !!data.session);
         if (!data.session) {
           setMode("check-email");
-          setNotice("Check your email to confirm your DumpDeck account.");
+          setNotice("Check your email to confirm your FotoFairy account.");
           return;
         }
         toast.success("Welcome!");
