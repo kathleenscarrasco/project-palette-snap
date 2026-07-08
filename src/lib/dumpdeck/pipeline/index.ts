@@ -287,6 +287,11 @@ function sourceMetadataFromInput(input: ImagePipelineInput) {
   return {
     originalFileUrl: input.originalFileUrl,
     previewFileUrl: input.previewFileUrl ?? input.previewUrl,
+    storageBucket: input.storageBucket,
+    originalStoragePath: input.originalStoragePath,
+    previewStoragePath: input.previewStoragePath,
+    fileName: input.fileName ?? input.name,
+    uploadedAt: input.uploadedAt,
     originalMimeType: input.originalMimeType,
     mimeType: input.mimeType,
     convertedFromHeic: input.convertedFromHeic,

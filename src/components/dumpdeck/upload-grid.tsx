@@ -230,11 +230,15 @@ export function UploadGrid({
   onAdd,
   onRemove,
   onAnalyze,
+  analyzeBusy = false,
+  analyzeLabel = "Saving photos…",
 }: {
   items: UploadItem[];
   onAdd: (items: UploadItem[]) => void;
   onRemove: (id: string) => void;
-  onAnalyze: () => void;
+  onAnalyze: () => void | Promise<void>;
+  analyzeBusy?: boolean;
+  analyzeLabel?: string;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [progress, setProgress] = useState(0);
@@ -383,9 +387,11 @@ export function UploadGrid({
             size="lg"
             className="h-14 w-full rounded-2xl bg-coral text-base font-semibold text-white shadow-lg hover:bg-coral/90"
             onClick={onAnalyze}
-            disabled={busy || items.length < 4}
+            disabled={busy || analyzeBusy || items.length < 4}
           >
-            {items.length < 4 ? (
+            {analyzeBusy ? (
+              analyzeLabel
+            ) : items.length < 4 ? (
               `Add ${4 - items.length} more to analyze`
             ) : (
               <>

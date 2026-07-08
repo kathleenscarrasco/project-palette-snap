@@ -300,6 +300,11 @@ export type Photo = {
   originalFileUrl?: string;
   previewFileUrl?: string;
   previewUrl?: string;
+  storageBucket?: string;
+  originalStoragePath?: string;
+  previewStoragePath?: string;
+  fileName?: string;
+  uploadedAt?: string;
   name: string;
   width: number;
   height: number;
@@ -335,6 +340,11 @@ export type ImageSourceMetadata = {
   previewFileUrl?: string;
   originalMimeType?: string;
   mimeType?: string;
+  storageBucket?: string;
+  originalStoragePath?: string;
+  previewStoragePath?: string;
+  fileName?: string;
+  uploadedAt?: string;
   convertedFromHeic?: boolean;
   conversionQuality?: number;
   conversionDecoder?: string;
@@ -348,6 +358,11 @@ export type UploadItem = {
   originalFileUrl?: string;
   previewFileUrl?: string;
   previewUrl?: string;
+  storageBucket?: string;
+  originalStoragePath?: string;
+  previewStoragePath?: string;
+  fileName?: string;
+  uploadedAt?: string;
   name: string;
   width: number;
   height: number;

@@ -17,7 +17,13 @@ import { toast } from "sonner";
 import { isLocalDevAuth, supabase, type SavedProject } from "@/integrations/supabase/client";
 import { useAuth } from "@/hooks/use-auth";
 import { BrandMark, BrandWordmark } from "@/components/dumpdeck/brand";
-import { duplicateFinalDraft, listFinalDrafts, type SavedFinalDraft } from "@/lib/dumpdeck/drafts";
+import {
+  draftHasDisplayablePhotos,
+  duplicateFinalDraft,
+  listFinalDrafts,
+  type SavedFinalDraft,
+} from "@/lib/dumpdeck/drafts";
+import { deleteStoredProjectPhotos, listProjectPhotoSummaries } from "@/lib/dumpdeck/storage";
 
 export const Route = createFileRoute("/projects")({
   head: () => ({ meta: [{ title: "Your saved projects · dumpify" }] }),
@@ -36,6 +42,12 @@ type ProjectStatus = {
   draftId: string | null;
   latestDraft: SavedFinalDraft | null;
   coverUrl: string | null;
+};
+
+type ProjectPhotoSummary = {
+  projectId: string;
+  count: number;
+  firstPhotoUrl: string | null;
 };
 
 function loadLocalProjects(): SavedProject[] {
@@ -72,14 +84,18 @@ function projectPersistenceErrorMessage(err: unknown, fallback = "Could not save
   return message || fallback;
 }
 
-function statusForProject(project: SavedProject, drafts: SavedFinalDraft[]): ProjectStatus {
+function statusForProject(
+  project: SavedProject,
+  drafts: SavedFinalDraft[],
+  photoSummary?: ProjectPhotoSummary,
+): ProjectStatus {
   const projectDrafts = drafts
     .filter((draft) => draft.projectId === project.id)
     .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
   const latest = projectDrafts[0];
   const uploadedCount = latest
     ? new Set([...latest.orderedPhotoIds, ...latest.rejectedPhotoIds]).size
-    : 0;
+    : (photoSummary?.count ?? 0);
   const selectedCount = latest?.orderedPhotoIds.length ?? 0;
   const hasFinalOrder = selectedCount > 0;
   return {
@@ -94,7 +110,7 @@ function statusForProject(project: SavedProject, drafts: SavedFinalDraft[]): Pro
     updatedAt: latest?.updatedAt ?? project.updated_at ?? project.created_at,
     draftId: latest?.id ?? null,
     latestDraft: latest ?? null,
-    coverUrl: latest ? coverUrlForDraft(latest) : null,
+    coverUrl: latest ? coverUrlForDraft(latest) : (photoSummary?.firstPhotoUrl ?? null),
   };
 }
 
@@ -113,6 +129,10 @@ function coverUrlForDraft(draft: SavedFinalDraft): string | null {
 function openDraftPayload(navigate: ReturnType<typeof useNavigate>, draft: SavedFinalDraft) {
   if (!draft.draftPayload?.finalOrder?.length) {
     toast.error("This older draft is missing photo details. Open the project and save it again.");
+    return;
+  }
+  if (!draftHasDisplayablePhotos(draft)) {
+    toast.error("This older draft is missing stored photo files. Re-upload or save a new draft.");
     return;
   }
   sessionStorage.setItem("dumpdeck:activeProjectId", draft.projectId ?? "");
@@ -176,6 +196,7 @@ function ProjectsPage() {
   const { user, isAuthed, loading: authLoading, signOut } = useAuth();
   const [projects, setProjects] = useState<SavedProject[]>([]);
   const [drafts, setDrafts] = useState<SavedFinalDraft[]>([]);
+  const [photoSummaries, setPhotoSummaries] = useState<Map<string, ProjectPhotoSummary>>(new Map());
   const [view, setView] = useState<"home" | "saved">("home");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -197,6 +218,7 @@ function ProjectsPage() {
       const localProjects = loadLocalProjects();
       setProjects(localProjects);
       setDrafts(await listFinalDrafts());
+      setPhotoSummaries(new Map());
       setError(null);
       setLoading(false);
       return;
@@ -214,6 +236,7 @@ function ProjectsPage() {
       console.log("[saved_projects] loaded", data?.length ?? 0);
       setProjects((data ?? []) as SavedProject[]);
       setDrafts(await listFinalDrafts());
+      setPhotoSummaries(await listProjectPhotoSummaries());
       setError(null);
     }
     setLoading(false);
@@ -229,7 +252,7 @@ function ProjectsPage() {
   }
 
   function continueProject(project: SavedProject) {
-    const status = statusForProject(project, drafts);
+    const status = statusForProject(project, drafts, photoSummaries.get(project.id));
     if (status.latestDraft?.draftPayload?.finalOrder?.length) {
       openDraftPayload(navigate, status.latestDraft);
       return;
@@ -323,6 +346,7 @@ function ProjectsPage() {
       await load();
       return;
     }
+    await deleteStoredProjectPhotos(id);
     const { error } = await supabase.from("saved_projects").delete().eq("id", id);
     if (error) {
       toast.error(error.message);
@@ -503,7 +527,7 @@ function ProjectsPage() {
                   className="glass-card flex cursor-pointer items-start gap-3 rounded-2xl p-4 text-left transition hover:-translate-y-0.5 hover:shadow-lg focus:outline-none focus:ring-2 focus:ring-coral"
                 >
                   {(() => {
-                    const status = statusForProject(p, drafts);
+                    const status = statusForProject(p, drafts, photoSummaries.get(p.id));
                     return (
                       <>
                         <div className="h-24 w-32 shrink-0 overflow-hidden rounded-xl bg-gradient-to-br from-coral/15 via-mint/20 to-lavender/25">

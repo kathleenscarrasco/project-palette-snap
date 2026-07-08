@@ -71,6 +71,7 @@ import { TagBadge } from "@/components/dumpdeck/tag-badge";
 import { BrandMark, BrandWordmark } from "@/components/dumpdeck/brand";
 import { useAuth } from "@/hooks/use-auth";
 import { isLocalDevAuth } from "@/integrations/supabase/client";
+import { persistProjectUploads } from "@/lib/dumpdeck/storage";
 
 const MAX_KEEP = 20;
 const LOCAL_SCAN_CONCURRENCY = 3;
@@ -821,18 +822,35 @@ function UploadStage() {
   const { state, dispatch } = useDumpDeck();
   const [items, setItems] = useState<UploadItem[]>([]);
   const [loadingSamples, setLoadingSamples] = useState(false);
+  const [persistingPhotos, setPersistingPhotos] = useState(false);
 
-  function handleAnalyze() {
+  async function handleAnalyze() {
     const projectId = activeProjectId();
+    setPersistingPhotos(true);
+    let storedItems = items;
+    try {
+      storedItems = await persistProjectUploads(projectId, items);
+      setItems(storedItems);
+    } catch (error) {
+      console.error("[dumpdeck] photo storage upload failed", error);
+      toast.error("Could not save photos to your project. Please try again.");
+      setPersistingPhotos(false);
+      return;
+    }
     sessionStorage.setItem(
       "dumpdeck:pending",
       JSON.stringify(
-        items.map((it) => ({
+        storedItems.map((it) => ({
           id: it.id,
           url: it.url,
           originalFileUrl: it.originalFileUrl,
           previewFileUrl: it.previewFileUrl,
           previewUrl: it.previewUrl,
+          storageBucket: it.storageBucket,
+          originalStoragePath: it.originalStoragePath,
+          previewStoragePath: it.previewStoragePath,
+          fileName: it.fileName,
+          uploadedAt: it.uploadedAt,
           name: it.name,
           width: it.width,
           height: it.height,
@@ -849,12 +867,13 @@ function UploadStage() {
         })),
       ),
     );
-    sessionStorage.setItem("dumpdeck:lastUploadCount", String(items.length));
+    sessionStorage.setItem("dumpdeck:lastUploadCount", String(storedItems.length));
     if (projectId) {
-      sessionStorage.setItem(projectUploadCountKey(projectId), String(items.length));
-      localStorage.setItem(projectUploadCountKey(projectId), String(items.length));
+      sessionStorage.setItem(projectUploadCountKey(projectId), String(storedItems.length));
+      localStorage.setItem(projectUploadCountKey(projectId), String(storedItems.length));
     }
     dispatch({ type: "clearRemoved" });
+    setPersistingPhotos(false);
     dispatch({ type: "setStage", stage: "analyze" });
   }
 
@@ -883,6 +902,8 @@ function UploadStage() {
           onAdd={(added) => setItems((cur) => [...cur, ...added])}
           onRemove={(id) => setItems((cur) => cur.filter((x) => x.id !== id))}
           onAnalyze={handleAnalyze}
+          analyzeBusy={persistingPhotos}
+          analyzeLabel="Saving photos to your project…"
         />
       </div>
       {isLocalDevAuth && (

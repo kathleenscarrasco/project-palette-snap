@@ -7,7 +7,13 @@ import { BrandMark, BrandWordmark } from "@/components/dumpdeck/brand";
 import { Button } from "@/components/ui/button";
 import { useAuth } from "@/hooks/use-auth";
 import { isLocalDevAuth, supabase, type SavedProject } from "@/integrations/supabase/client";
-import { duplicateFinalDraft, listFinalDrafts, type SavedFinalDraft } from "@/lib/dumpdeck/drafts";
+import {
+  draftHasDisplayablePhotos,
+  duplicateFinalDraft,
+  listFinalDrafts,
+  type SavedFinalDraft,
+} from "@/lib/dumpdeck/drafts";
+import { listProjectPhotoSummaries } from "@/lib/dumpdeck/storage";
 
 export const Route = createFileRoute("/projects/$projectId")({
   head: () => ({ meta: [{ title: "Project workspace · dumpify" }] }),
@@ -134,16 +140,20 @@ function ProjectWorkspacePage() {
   }, [loadDrafts, user]);
 
   useEffect(() => {
-    try {
-      const key = `dumpdeck:project:${projectId}:uploadCount`;
-      const count = Number(sessionStorage.getItem(key) ?? localStorage.getItem(key) ?? 0);
-      const pending = sessionStorage.getItem("dumpdeck:pending");
-      setUploadedCount(Number.isFinite(count) ? Math.max(0, count) : 0);
-      setRefinementRunning(Boolean(pending));
-    } catch {
-      setUploadedCount(0);
-      setRefinementRunning(false);
-    }
+    void (async () => {
+      try {
+        const key = `dumpdeck:project:${projectId}:uploadCount`;
+        const count = Number(sessionStorage.getItem(key) ?? localStorage.getItem(key) ?? 0);
+        const summaries = await listProjectPhotoSummaries();
+        const storedCount = summaries.get(projectId)?.count ?? 0;
+        const pending = sessionStorage.getItem("dumpdeck:pending");
+        setUploadedCount(Math.max(Number.isFinite(count) ? count : 0, storedCount));
+        setRefinementRunning(Boolean(pending));
+      } catch {
+        setUploadedCount(0);
+        setRefinementRunning(false);
+      }
+    })();
   }, [projectId]);
 
   function openUploadFlow() {
@@ -160,6 +170,10 @@ function ProjectWorkspacePage() {
   function openDraft(draft: SavedFinalDraft) {
     if (!draft.draftPayload?.finalOrder?.length) {
       toast.error("This older draft is missing photo details. Save a new draft to reopen it here.");
+      return;
+    }
+    if (!draftHasDisplayablePhotos(draft)) {
+      toast.error("This older draft is missing stored photo files. Re-upload or save a new draft.");
       return;
     }
     sessionStorage.setItem("dumpdeck:activeProjectId", draft.projectId ?? projectId);

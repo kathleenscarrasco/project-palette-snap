@@ -1,5 +1,6 @@
 import { isLocalDevAuth, supabase } from "@/integrations/supabase/client";
-import { generateCaptions, type CaptionIdea } from "./captions";
+import { generateCaptions } from "./captions";
+import { copyStoredProjectPhotosForDraft, hydrateStoredDrafts } from "./storage";
 import type { Photo, RemovedPhoto, Settings } from "./types";
 
 const DRAFTS_TABLE = "dumpdeck_drafts";
@@ -45,6 +46,15 @@ export type SavedFinalDraft = {
   updatedAt: string;
   storage: "supabase" | "local";
 };
+
+export function draftHasDisplayablePhotos(draft: SavedFinalDraft) {
+  return Boolean(
+    draft.draftPayload?.finalOrder?.some((photo) => {
+      const url = photo.previewUrl ?? photo.previewFileUrl ?? photo.url;
+      return Boolean(url && !url.startsWith("blob:"));
+    }),
+  );
+}
 
 export async function saveFinalDraft(input: SaveDraftInput): Promise<SaveDraftResult> {
   const payload = await makeDraftPayloadDurable(buildDraftPayload(input));
@@ -184,7 +194,7 @@ export async function listFinalDrafts(projectId?: string | null): Promise<SavedF
     console.warn("[dumpdeck] Supabase draft list failed; falling back to local drafts", error);
     return listLocalDrafts(projectId);
   }
-  return ((data ?? []) as DraftRow[]).map(normalizeDraftRow);
+  return hydrateStoredDrafts(((data ?? []) as DraftRow[]).map(normalizeDraftRow));
 }
 
 export async function duplicateFinalDraft(
@@ -220,6 +230,10 @@ export async function duplicateFinalDraft(
 
   const projectId = String((project as { id: string }).id);
   const source = draft as DraftRow;
+  const sourcePhotoIds = Array.from(
+    new Set([...(source.ordered_photo_ids ?? []), ...(source.rejected_photo_ids ?? [])]),
+  );
+  await copyStoredProjectPhotosForDraft(source.project_id, projectId, sourcePhotoIds);
   const draftPayload = {
     ...(source.draft_payload ?? {}),
     projectId,
@@ -242,6 +256,12 @@ export async function duplicateFinalDraft(
     .select("id")
     .single();
   if (copyError || !copied) throw copyError ?? new Error("Could not duplicate draft");
+  await updateProjectSummary(
+    projectId,
+    userData.user.id,
+    draftPayload as FinalDraftPayload,
+    String(copied.id),
+  );
 
   return {
     projectId,
@@ -316,6 +336,29 @@ async function makeDraftPayloadDurable(payload: ReturnType<typeof buildDraftPayl
 }
 
 async function toDurablePhoto(photo: Photo): Promise<Photo> {
+  if (photo.sourceMetadata?.previewStoragePath || photo.previewStoragePath) {
+    const originalStoragePath =
+      photo.sourceMetadata?.originalStoragePath ?? photo.originalStoragePath;
+    const previewStoragePath = photo.sourceMetadata?.previewStoragePath ?? photo.previewStoragePath;
+    return {
+      ...photo,
+      url: "",
+      originalFileUrl: undefined,
+      previewFileUrl: undefined,
+      previewUrl: undefined,
+      storageBucket: photo.sourceMetadata?.storageBucket ?? photo.storageBucket,
+      originalStoragePath,
+      previewStoragePath,
+      sourceMetadata: {
+        ...photo.sourceMetadata,
+        storageBucket: photo.sourceMetadata?.storageBucket ?? photo.storageBucket,
+        originalStoragePath,
+        previewStoragePath,
+        originalFileUrl: undefined,
+        previewFileUrl: undefined,
+      },
+    };
+  }
   const source = photo.previewUrl ?? photo.previewFileUrl ?? photo.url;
   const durableUrl = await durableUrlFor(source);
   if (!durableUrl) return photo;
