@@ -231,7 +231,7 @@ export function UploadGrid({
   onRemove,
   onAnalyze,
   analyzeBusy = false,
-  analyzeLabel = "Saving photos…",
+  analyzeLabel = "Getting photos ready…",
 }: {
   items: UploadItem[];
   onAdd: (items: UploadItem[]) => void;
@@ -257,7 +257,7 @@ export function UploadGrid({
     if (!arr.length) return;
     setBusy(true);
     setProgress(0);
-    setStatus(`0/${arr.length} photos uploaded…`);
+    setStatus(`0/${arr.length} photos ready…`);
     const out: UploadItem[] = [];
     const failed: string[] = [];
     for (let i = 0; i < arr.length; i++) {
@@ -270,7 +270,7 @@ export function UploadGrid({
       }
       setProgress(Math.round(((i + 1) / arr.length) * 100));
       const suffix = out.length === arr.length ? "" : "…";
-      setStatus(`${out.length}/${arr.length} photos uploaded${suffix}`);
+      setStatus(`${out.length}/${arr.length} photos ready${suffix}`);
     }
     setErrors([...unsupported, ...failed]);
     onAdd(out);

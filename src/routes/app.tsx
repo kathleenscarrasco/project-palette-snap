@@ -861,12 +861,14 @@ function UploadStage() {
   const [items, setItems] = useState<UploadItem[]>([]);
   const [loadingSamples, setLoadingSamples] = useState(false);
 
-  async function handleAnalyze() {
+  function handleAnalyze() {
+    const pendingItems = [...items];
+    if (!pendingItems.length) return;
     const projectId = activeProjectId();
     sessionStorage.setItem(
       "dumpdeck:pending",
       JSON.stringify(
-        items.map((it) => ({
+        pendingItems.map((it) => ({
           id: it.id,
           url: it.url,
           originalFileUrl: it.originalFileUrl,
@@ -893,10 +895,10 @@ function UploadStage() {
         })),
       ),
     );
-    sessionStorage.setItem("dumpdeck:lastUploadCount", String(items.length));
+    sessionStorage.setItem("dumpdeck:lastUploadCount", String(pendingItems.length));
     if (projectId) {
-      sessionStorage.setItem(projectUploadCountKey(projectId), String(items.length));
-      localStorage.setItem(projectUploadCountKey(projectId), String(items.length));
+      sessionStorage.setItem(projectUploadCountKey(projectId), String(pendingItems.length));
+      localStorage.setItem(projectUploadCountKey(projectId), String(pendingItems.length));
     }
     dispatch({ type: "clearRemoved" });
     dispatch({ type: "setStage", stage: "analyze" });
@@ -1400,6 +1402,16 @@ function AnalyzeStage() {
     (row) => row.photo?.analysis && row.status !== "failed" && row.status !== "skipped",
   ).length;
   const skippedReasonSummary = summarizeSkippedRows(skippedRows, screenshotRows, unsupportedRows);
+  const accountedCount = rows.filter(
+    (row) =>
+      Boolean(row.photo?.analysis) ||
+      row.status === "skipped" ||
+      row.status === "failed" ||
+      row.status === "analyzed",
+  ).length;
+  const mainProgress = rows.length
+    ? Math.min(1, accountedCount / Math.max(1, rows.length))
+    : Math.min(1, progress);
   const hasActiveAnalysis = rows.some(
     (row) =>
       row.status === "local_scanning" ||
@@ -1414,20 +1426,24 @@ function AnalyzeStage() {
     phase === "preparing"
       ? "Preparing your photo dump…"
       : phase === "local-scanning"
-        ? `${scannedCount}/${rows.length} photos scanned…`
-        : phase === "refining" && retryingCount > 0
-          ? "Taking a little longer on the best candidates…"
-          : phase === "refining"
-            ? "Quick scan complete — refining top photos…"
-            : canStartSorting
-              ? backgroundRefiningCount
-                ? "Ready to sort — refining details in the background"
-                : "Ready to sort"
-              : hasActiveAnalysis
-                ? `${scannedCount}/${rows.length} photos scanned…`
-                : failedRows.length
-                  ? `${failedRows.length} photo${failedRows.length === 1 ? "" : "s"} couldn't be scanned`
-                  : "Preparing analysis…";
+        ? `Scanning ${Math.min(scannedCount + 1, rows.length)} of ${rows.length} photos`
+      : phase === "refining" && retryingCount > 0
+        ? "Taking a little longer on the best candidates…"
+      : phase === "refining"
+        ? "Quick scan complete — refining top photos…"
+      : canStartSorting
+        ? `${rows.length} photo${rows.length === 1 ? "" : "s"} scanned`
+      : hasActiveAnalysis
+        ? `Scanning ${Math.min(scannedCount + 1, rows.length)} of ${rows.length} photos`
+      : failedRows.length
+        ? `${failedRows.length} photo${failedRows.length === 1 ? "" : "s"} couldn't be scanned`
+        : "Preparing analysis…";
+  const progressDetail =
+    rows.length > 0
+      ? `${usableCount} usable photo${usableCount === 1 ? "" : "s"} found${
+          backgroundRefiningCount ? " · refining details in the background" : ""
+        }`
+      : "";
   const taglinePhotos = useMemo(
     () => rows.map((row) => row.photo).filter((photo): photo is Photo => !!photo),
     [rows],
@@ -2205,11 +2221,11 @@ function AnalyzeStage() {
         />
       </div>
 
-      <div className="mx-auto mt-8 max-w-xs">
+      <div className="mx-auto mt-8 max-w-sm">
         <div className="h-2 overflow-hidden rounded-full bg-ink/10">
           <motion.div
             className={`h-full rounded-full ${canStartSorting ? "bg-mint" : "bg-coral"}`}
-            animate={{ width: `${Math.round(progress * 100)}%` }}
+            animate={{ width: `${Math.round(mainProgress * 100)}%` }}
           />
         </div>
         <AnimatePresence mode="wait">
@@ -2218,20 +2234,15 @@ function AnalyzeStage() {
             initial={{ opacity: 0, y: 6 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -6 }}
-            className="mt-3 font-display text-xl"
+            className="mx-auto mt-4 max-w-full px-2 text-center text-base font-semibold leading-snug text-ink sm:text-lg"
           >
             {progressLabel}
           </motion.div>
         </AnimatePresence>
         {rows.length > 0 && (
-          <div className="mt-2 space-y-1 text-xs text-muted-foreground">
-            <p>
-              {usableCount} usable photo{usableCount === 1 ? "" : "s"} found
-              {backgroundRefiningCount ? " · refining details in the background" : ""}
-            </p>
-            {skippedRows.length > 0 && (
-              <p>{skippedReasonSummary}</p>
-            )}
+          <div className="mx-auto mt-2 max-w-xs space-y-1 text-center text-xs leading-relaxed text-muted-foreground">
+            <p>{progressDetail}</p>
+            {skippedRows.length > 0 && <p>{skippedReasonSummary}</p>}
           </div>
         )}
       </div>
