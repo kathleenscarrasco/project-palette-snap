@@ -41,7 +41,9 @@ import {
 } from "@/lib/dumpdeck/pipeline/duplicate-clustering";
 import { organizePhotos } from "@/lib/dumpdeck/pipeline/organization";
 import {
+  autosaveWorkspaceDraft,
   getFinalDraftById,
+  listFinalDrafts,
   missingDraftFields,
   saveFinalDraft,
   savedDraftDebugSummary,
@@ -231,11 +233,15 @@ function Shell() {
   const { user, isAuthed, loading } = useAuth();
   const navigate = useNavigate();
   const [draftHydrationChecked, setDraftHydrationChecked] = useState(false);
+  const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const hydrationCompleteRef = useRef(false);
+  const lastAutosaveSignatureRef = useRef("");
 
   useEffect(() => {
     if (loading) return;
     if (!isAuthed) {
       setDraftHydrationChecked(true);
+      hydrationCompleteRef.current = true;
       return;
     }
 
@@ -244,19 +250,33 @@ function Shell() {
       setDraftHydrationChecked(false);
       const raw = sessionStorage.getItem("dumpdeck:resumeDraft");
       const draftId = activeDraftId();
-      const targetStage =
-        sessionStorage.getItem("dumpdeck:resumeDraftStage") === "final" ? "final" : "export";
+      const resumeStage = sessionStorage.getItem("dumpdeck:resumeDraftStage");
       try {
         let draft: FinalDraftPayload | null = null;
+        let resolvedDraftId = draftId;
         if (draftId) {
           const saved = await getFinalDraftById(draftId);
           console.debug("[dumpdeck] app restore fetched saved draft", {
             action: "app_restore",
             user_id: user?.id,
-            routeChosen: targetStage,
+            routeChosen: resumeStage ?? saved?.draftPayload?.workspaceStage ?? "saved-draft",
             ...savedDraftDebugSummary(saved),
           });
           draft = saved?.draftPayload ?? null;
+        }
+        if (!draft && activeProjectId()) {
+          const [latest] = await listFinalDrafts(activeProjectId());
+          if (latest?.draftPayload) {
+            resolvedDraftId = latest.id;
+            sessionStorage.setItem("dumpdeck:activeDraftId", latest.id);
+            draft = latest.draftPayload;
+            console.debug("[dumpdeck] app restore fetched latest project autosave", {
+              action: "app_restore_latest_project_draft",
+              user_id: user?.id,
+              routeChosen: draft.workspaceStage ?? "autosaved-stage",
+              ...savedDraftDebugSummary(latest),
+            });
+          }
         }
         if (!draft && raw) {
           draft = JSON.parse(raw) as FinalDraftPayload;
@@ -286,7 +306,14 @@ function Shell() {
           });
         }
         if (!draft) return;
-        if (!Array.isArray(draft.finalOrder) || draft.finalOrder.length === 0) {
+        const workspaceStage =
+          resumeStage === "final" || resumeStage === "export"
+            ? resumeStage
+            : draft.workspaceStage ?? (draft.finalOrder?.length ? "export" : "upload");
+        if (
+          (workspaceStage === "final" || workspaceStage === "export") &&
+          (!Array.isArray(draft.finalOrder) || draft.finalOrder.length === 0)
+        ) {
           console.warn("[dumpdeck] app restore missing final order", {
             draftId,
             projectId: activeProjectId(),
@@ -296,30 +323,35 @@ function Shell() {
           return;
         }
         if (cancelled) return;
-        const finalOrder = orderWithPinned(draft.finalOrder, draft.pinnedCoverPhotoId);
+        const finalOrder = orderWithPinned(draft.finalOrder ?? [], draft.pinnedCoverPhotoId);
         const removed = Array.isArray(draft.removed) ? draft.removed : [];
+        const photos = mergeDraftPhotos(draft.uploadedPhotos, finalOrder, removed);
         dispatch({
           type: "hydrate",
           state: {
-            stage: targetStage,
+            stage: workspaceStage,
             settings: draft.selectedPreferences ?? { formats: ["portrait"], vibes: ["random"] },
-            photos: mergeDraftPhotos(draft.uploadedPhotos, finalOrder, removed),
-            shortlist: finalOrder,
-            kept: finalOrder,
+            photos,
+            shortlist: draft.shortlist?.length ? draft.shortlist : finalOrder.length ? finalOrder : photos,
+            kept: draft.kept?.length ? draft.kept : finalOrder,
             finalOrder,
             removed,
             duplicateDecisions: draft.duplicateDecisions ?? [],
             pinnedCoverId: draft.pinnedCoverPhotoId ?? null,
           },
         });
-        toast.success("Draft opened");
+        if (resolvedDraftId) sessionStorage.setItem("dumpdeck:activeDraftId", resolvedDraftId);
+        toast.success("Progress restored");
       } catch (err) {
         console.error("[dumpdeck] failed to resume draft", err);
-        toast.error("Could not open that draft.");
+        toast.error("Could not restore saved progress.");
       } finally {
         sessionStorage.removeItem("dumpdeck:resumeDraft");
         sessionStorage.removeItem("dumpdeck:resumeDraftStage");
-        if (!cancelled) setDraftHydrationChecked(true);
+        if (!cancelled) {
+          hydrationCompleteRef.current = true;
+          setDraftHydrationChecked(true);
+        }
       }
     }
 
@@ -328,6 +360,78 @@ function Shell() {
       cancelled = true;
     };
   }, [dispatch, isAuthed, loading, user?.id]);
+
+  useEffect(() => {
+    if (!draftHydrationChecked || !hydrationCompleteRef.current) return;
+    const projectId = activeProjectId();
+    if (!projectId) return;
+    if (state.stage === "setup" && state.photos.length === 0 && state.finalOrder.length === 0) return;
+
+    const signature = JSON.stringify({
+      projectId,
+      draftId: activeDraftId(),
+      stage: state.stage,
+      settings: state.settings,
+      photos: state.photos.map((photo) => [
+        photo.id,
+        photo.previewStoragePath ?? photo.sourceMetadata?.previewStoragePath ?? "",
+        photo.originalStoragePath ?? photo.sourceMetadata?.originalStoragePath ?? "",
+      ]),
+      shortlist: state.shortlist.map((photo) => photo.id),
+      kept: state.kept.map((photo) => photo.id),
+      finalOrder: state.finalOrder.map((photo) => photo.id),
+      removed: state.removed.map((entry) => [entry.photo.id, entry.reason, entry.source]),
+      duplicateDecisions: state.duplicateDecisions,
+      pinnedCoverId: state.pinnedCoverId,
+    });
+    if (signature === lastAutosaveSignatureRef.current) return;
+    lastAutosaveSignatureRef.current = signature;
+
+    let cancelled = false;
+    const timeout = window.setTimeout(() => {
+      setSaveStatus("saving");
+      void autosaveWorkspaceDraft({
+        draftId: activeDraftId(),
+        projectId,
+        stage: state.stage,
+        allPhotos: state.photos,
+        shortlist: state.shortlist,
+        kept: state.kept,
+        finalOrder: state.finalOrder,
+        removed: state.removed,
+        settings: state.settings,
+        duplicateDecisions: state.duplicateDecisions,
+        pinnedCoverPhotoId: state.pinnedCoverId,
+      })
+        .then((result) => {
+          if (cancelled || result.skipped) return;
+          sessionStorage.setItem("dumpdeck:activeDraftId", result.id);
+          setSaveStatus("saved");
+        })
+        .catch((err) => {
+          if (cancelled) return;
+          console.error("[dumpdeck] autosave failed", err);
+          setSaveStatus("error");
+          toast.error("Autosave failed. Your latest changes may not be saved yet.");
+        });
+    }, 900);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeout);
+    };
+  }, [
+    draftHydrationChecked,
+    state.duplicateDecisions,
+    state.finalOrder,
+    state.kept,
+    state.photos,
+    state.pinnedCoverId,
+    state.removed,
+    state.settings,
+    state.shortlist,
+    state.stage,
+  ]);
 
   if (loading || (isAuthed && !draftHydrationChecked)) {
     return (
@@ -385,6 +489,7 @@ function Shell() {
   return (
     <main className="relative mx-auto min-h-screen max-w-md px-4 pb-28 pt-6">
       <TopBar />
+      <AutosaveIndicator status={saveStatus} />
       <ProgressDots stage={state.stage} />
 
       <AnimatePresence mode="wait">
@@ -407,6 +512,26 @@ function Shell() {
         </motion.div>
       </AnimatePresence>
     </main>
+  );
+}
+
+function AutosaveIndicator({ status }: { status: "idle" | "saving" | "saved" | "error" }) {
+  if (status === "idle") return null;
+  const copy =
+    status === "saving"
+      ? "Saving…"
+      : status === "saved"
+        ? "Saved"
+        : "Autosave needs attention";
+  return (
+    <div
+      className={`mt-3 inline-flex items-center rounded-full px-3 py-1 text-[11px] font-semibold ${
+        status === "error" ? "bg-coral/15 text-coral" : "bg-mint/45 text-ink"
+      }`}
+      aria-live="polite"
+    >
+      {copy}
+    </div>
   );
 }
 

@@ -5,7 +5,7 @@ import {
   hydrateStoredDrafts,
   persistFinalDraftPhotos,
 } from "./storage";
-import type { Photo, RemovedPhoto, Settings } from "./types";
+import type { Photo, RemovedPhoto, Settings, Stage } from "./types";
 
 const DRAFTS_TABLE = "dumpdeck_drafts";
 const LOCAL_DRAFTS_KEY = "dumpdeck:local-drafts";
@@ -29,13 +29,35 @@ export type SaveDraftInput = {
   saveAsNew?: boolean;
 };
 
+export type AutosaveDraftInput = {
+  draftId?: string | null;
+  projectId?: string | null;
+  stage: Stage;
+  allPhotos: Photo[];
+  shortlist: Photo[];
+  kept: Photo[];
+  finalOrder: Photo[];
+  removed: RemovedPhoto[];
+  settings: Settings;
+  duplicateDecisions: DuplicateDecisionDraft[];
+  pinnedCoverPhotoId?: string | null;
+};
+
+export type AutosaveDraftResult = SaveDraftResult & {
+  skipped?: boolean;
+};
+
 export type SaveDraftResult = {
   id: string;
   storage: "supabase" | "local";
   updatedAt: string;
 };
 
-export type FinalDraftPayload = ReturnType<typeof buildDraftPayload>;
+export type FinalDraftPayload = ReturnType<typeof buildDraftPayload> & {
+  workspaceStage?: Stage;
+  shortlist?: Photo[];
+  kept?: Photo[];
+};
 
 export type SavedFinalDraft = {
   id: string;
@@ -253,6 +275,129 @@ export async function saveFinalDraft(input: SaveDraftInput): Promise<SaveDraftRe
     id: String((data as { id: string }).id),
     storage: "supabase",
     updatedAt: String((data as { updated_at: string }).updated_at),
+  };
+}
+
+export async function autosaveWorkspaceDraft(
+  input: AutosaveDraftInput,
+): Promise<AutosaveDraftResult> {
+  if (!input.projectId || !hasMeaningfulAutosaveState(input)) {
+    return {
+      id: input.draftId ?? input.projectId ?? "autosave-skipped",
+      storage: isLocalDevAuth ? "local" : "supabase",
+      updatedAt: new Date().toISOString(),
+      skipped: true,
+    };
+  }
+
+  const payload = makeCompactAutosavePayload(input);
+
+  if (isLocalDevAuth) return saveLocalDraft(payload);
+
+  const { data: userData, error: userError } = await supabase.auth.getUser();
+  if (userError || !userData.user) throw userError ?? new Error("Sign in before autosaving.");
+
+  const projectId = asUuid(input.projectId);
+  if (!projectId) throw new Error("Choose or create a collection before autosaving.");
+
+  const row = {
+    user_id: userData.user.id,
+    project_id: projectId,
+    ordered_photo_ids: input.finalOrder.map((photo) => photo.id),
+    rejected_photo_ids: input.removed.map((entry) => entry.photo.id),
+    duplicate_decisions: input.duplicateDecisions,
+    selected_preferences: {
+      ...input.settings,
+      pinnedCoverPhotoId: input.pinnedCoverPhotoId ?? null,
+      autosaveStage: input.stage,
+    },
+    scores_reasons: payload.scoresReasons,
+    draft_payload: payload,
+    updated_at: payload.updatedAt,
+  };
+
+  const query =
+    input.draftId && asUuid(input.draftId)
+      ? supabase
+          .from(DRAFTS_TABLE)
+          .update(row)
+          .eq("id", input.draftId)
+          .eq("user_id", userData.user.id)
+          .select("id,updated_at")
+          .single()
+      : supabase
+          .from(DRAFTS_TABLE)
+          .upsert(row, { onConflict: "user_id,project_id" })
+          .select("id,updated_at")
+          .single();
+
+  const { data, error } = await query;
+  if (error) throw error;
+  await updateProjectSummary(projectId, userData.user.id, payload, String(data.id));
+  return {
+    id: String((data as { id: string }).id),
+    storage: "supabase",
+    updatedAt: String((data as { updated_at: string }).updated_at),
+  };
+}
+
+function hasMeaningfulAutosaveState(input: AutosaveDraftInput) {
+  return (
+    input.stage !== "setup" ||
+    input.allPhotos.length > 0 ||
+    input.shortlist.length > 0 ||
+    input.kept.length > 0 ||
+    input.finalOrder.length > 0 ||
+    input.removed.length > 0 ||
+    input.duplicateDecisions.length > 0 ||
+    Boolean(input.pinnedCoverPhotoId)
+  );
+}
+
+function makeCompactAutosavePayload(input: AutosaveDraftInput): FinalDraftPayload {
+  const allPhotos = uniquePhotos([
+    ...input.allPhotos,
+    ...input.shortlist,
+    ...input.kept,
+    ...input.finalOrder,
+    ...input.removed.map((entry) => entry.photo),
+  ]).map(stripLargeInlinePhotoUrls);
+  const replacePhoto = (photo: Photo) =>
+    allPhotos.find((candidate) => candidate.id === photo.id) ?? stripLargeInlinePhotoUrls(photo);
+  const now = new Date().toISOString();
+  const finalOrder = input.finalOrder.map(replacePhoto);
+  const removed = input.removed.map((entry) => ({
+    ...entry,
+    photo: replacePhoto(entry.photo),
+  }));
+  return {
+    projectId: input.projectId ?? null,
+    draftId: input.draftId ?? null,
+    workspaceStage: input.stage,
+    uploadedPhotos: allPhotos,
+    shortlist: input.shortlist.map(replacePhoto),
+    kept: input.kept.map(replacePhoto),
+    finalOrder,
+    removed,
+    restoredPhotoIds: finalOrder.map((photo) => photo.id),
+    orderedPhotoIds: finalOrder.map((photo) => photo.id),
+    pinnedCoverPhotoId: input.pinnedCoverPhotoId ?? null,
+    rejectedPhotoIds: removed.map((entry) => entry.photo.id),
+    duplicateDecisions: input.duplicateDecisions,
+    selectedPreferences: input.settings,
+    captionIdeas: finalOrder.length ? generateCaptions(finalOrder, input.settings.vibes, 0) : [],
+    scoresReasons: allPhotos.map((photo) => ({
+      id: photo.id,
+      name: photo.name,
+      score: photo.ranking?.overallScore ?? photo.overall,
+      ranking: photo.ranking,
+      tags: photo.tags,
+      reasons: photo.reasons,
+      duplicateClusterId: photo.duplicateClusterId ?? null,
+      sourceMetadata: photo.sourceMetadata,
+    })),
+    createdAt: now,
+    updatedAt: now,
   };
 }
 
@@ -646,7 +791,7 @@ function stripLargeInlinePhotoUrls(photo: Photo): Photo {
 
 function stripLargeInlineUrl(url: string | undefined) {
   if (!url) return url;
-  return url.startsWith("data:") ? undefined : url;
+  return url.startsWith("data:") || url.startsWith("blob:") ? undefined : url;
 }
 
 function loadLocalDrafts() {
