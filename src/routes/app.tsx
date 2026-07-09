@@ -80,6 +80,9 @@ import { isLocalDevAuth } from "@/integrations/supabase/client";
 
 const MAX_KEEP = 20;
 const LOCAL_SCAN_CONCURRENCY = 5;
+const LOCAL_SCAN_BATCH_SIZE = 15;
+const LOCAL_SCAN_TIMEOUT_MS = 30_000;
+const LOCAL_SCAN_MAX_ATTEMPTS = 2;
 
 function analysisOf(photo: Photo) {
   return photo.unifiedAnalysis?.analysis;
@@ -167,7 +170,7 @@ export const Route = createFileRoute("/app")({
   component: () => (
     <DumpDeckProvider>
       <Shell />
-      <Toaster position="top-center" richColors />
+      <Toaster position="top-center" richColors duration={6500} />
     </DumpDeckProvider>
   ),
 });
@@ -309,7 +312,7 @@ function Shell() {
         const workspaceStage =
           resumeStage === "final" || resumeStage === "export"
             ? resumeStage
-            : draft.workspaceStage ?? (draft.finalOrder?.length ? "export" : "upload");
+            : (draft.workspaceStage ?? (draft.finalOrder?.length ? "export" : "upload"));
         if (
           (workspaceStage === "final" || workspaceStage === "export") &&
           (!Array.isArray(draft.finalOrder) || draft.finalOrder.length === 0)
@@ -319,7 +322,9 @@ function Shell() {
             projectId: activeProjectId(),
             hasSessionPayload: Boolean(raw),
           });
-      toast.error("That draft is missing photo details. Start from the saved collection instead.");
+          toast.error(
+            "That draft is missing photo details. Start from the saved collection instead.",
+          );
           return;
         }
         if (cancelled) return;
@@ -332,7 +337,11 @@ function Shell() {
             stage: workspaceStage,
             settings: draft.selectedPreferences ?? { formats: ["portrait"], vibes: ["random"] },
             photos,
-            shortlist: draft.shortlist?.length ? draft.shortlist : finalOrder.length ? finalOrder : photos,
+            shortlist: draft.shortlist?.length
+              ? draft.shortlist
+              : finalOrder.length
+                ? finalOrder
+                : photos,
             kept: draft.kept?.length ? draft.kept : finalOrder,
             finalOrder,
             removed,
@@ -365,7 +374,8 @@ function Shell() {
     if (!draftHydrationChecked || !hydrationCompleteRef.current) return;
     const projectId = activeProjectId();
     if (!projectId) return;
-    if (state.stage === "setup" && state.photos.length === 0 && state.finalOrder.length === 0) return;
+    if (state.stage === "setup" && state.photos.length === 0 && state.finalOrder.length === 0)
+      return;
 
     const signature = JSON.stringify({
       projectId,
@@ -518,11 +528,7 @@ function Shell() {
 function AutosaveIndicator({ status }: { status: "idle" | "saving" | "saved" | "error" }) {
   if (status === "idle") return null;
   const copy =
-    status === "saving"
-      ? "Saving…"
-      : status === "saved"
-        ? "Saved"
-        : "Autosave needs attention";
+    status === "saving" ? "Saving…" : status === "saved" ? "Saved" : "Autosave needs attention";
   return (
     <div
       className={`mt-3 inline-flex items-center rounded-full px-3 py-1 text-[11px] font-semibold ${
@@ -556,11 +562,7 @@ function TopBar() {
         <BrandMark className="h-9 w-9" />
         <BrandWordmark size="text-lg" />
       </Link>
-      <button
-        onClick={() => setConfirmReset(true)}
-        className="chip"
-        type="button"
-      >
+      <button onClick={() => setConfirmReset(true)} className="chip" type="button">
         <RotateCcw className="h-3 w-3" /> Reset
       </button>
       <AnimatePresence>
@@ -1324,6 +1326,33 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function yieldToBrowser() {
+  return new Promise((resolve) => window.setTimeout(resolve, 0));
+}
+
+function chunkArray<T>(items: T[], size: number) {
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
+}
+
+async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timeoutId: number | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = window.setTimeout(
+      () => reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`)),
+      ms,
+    );
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timeoutId !== undefined) window.clearTimeout(timeoutId);
+  }
+}
+
 function slowestStage(stages: Record<string, number>) {
   return Object.entries(stages).reduce(
     (slowest, [name, ms]) => (ms > slowest.ms ? { name, ms } : slowest),
@@ -1549,20 +1578,36 @@ function summarizeSkippedRows(
   return parts.join(" · ");
 }
 
-function photoAccountingSummary(
-  total: number,
-  usable: number,
-  skipped: number,
-  failed: number,
-) {
-  const accounted = usable + skipped + failed;
-  if (accounted >= total) {
-    const details = [`${usable} usable`];
-    if (skipped) details.push(`${skipped} skipped`);
-    if (failed) details.push(`${failed} failed`);
-    return `All ${total} photo${total === 1 ? "" : "s"} accounted for · ${details.join(" · ")}`;
+function photoAccountingSummary(total: number, usable: number, unusable: number, pending: number) {
+  const scanned = Math.min(total, usable + unusable);
+  const parts = [
+    `${usable} usable photo${usable === 1 ? "" : "s"} found`,
+    `${unusable} photo${unusable === 1 ? "" : "s"} need${unusable === 1 ? "s" : ""} review or ${unusable === 1 ? "was" : "were"} skipped`,
+  ];
+  if (pending > 0) {
+    parts.push(`${pending} photo${pending === 1 ? "" : "s"} still being checked`);
+  } else {
+    parts.unshift(`${scanned} of ${total} photo${total === 1 ? "" : "s"} scanned`);
   }
-  return `${usable} usable photo${usable === 1 ? "" : "s"} found`;
+  return parts.join(" · ");
+}
+
+function rowHasQuickScanResult(row: AnalysisRow) {
+  return Boolean(row.photo?.analysis) || row.status === "skipped" || row.status === "failed";
+}
+
+function rowIsUsable(row: AnalysisRow) {
+  return Boolean(row.photo?.analysis) && row.status !== "failed" && row.status !== "skipped";
+}
+
+function rowFinalReason(row: AnalysisRow) {
+  return (
+    row.localSkipReason ??
+    row.error ??
+    (row.status === "failed"
+      ? "The photo could not be scanned."
+      : "The photo was skipped during the basic scan.")
+  );
 }
 
 function refinementSnapshot(rows: AnalysisRow[]): RefinementSnapshot {
@@ -1703,13 +1748,15 @@ function AnalyzeStage() {
     );
     const storedPhotos = nextRows
       .map((row) => row.photo)
-      .filter((photo): photo is Photo => Boolean(photo?.previewStoragePath || photo?.originalStoragePath));
+      .filter((photo): photo is Photo =>
+        Boolean(photo?.previewStoragePath || photo?.originalStoragePath),
+      );
     if (storedPhotos.length) dispatch({ type: "updatePhotoSources", photos: storedPhotos });
   }
 
-  const analyzedCount = rows.filter((row) => row.status === "analyzed").length;
   const failedRows = rows.filter((row) => row.status === "failed");
   const skippedRows = rows.filter((row) => row.status === "skipped");
+  const unusableRows = rows.filter((row) => rowHasQuickScanResult(row) && !rowIsUsable(row));
   const screenshotRows = skippedRows.filter((row) =>
     isScreenshotSkipReason(row.localSkipReason ?? row.error),
   );
@@ -1721,58 +1768,54 @@ function AnalyzeStage() {
   const backgroundRefiningCount = rows.filter(
     (row) => row.geminiCandidate && ["queued", "analyzing", "retrying"].includes(row.status),
   ).length;
-  const scannedCount = rows.filter(
-    (row) =>
-      Boolean(row.photo?.analysis) ||
-      ["local_complete", "analyzed", "skipped", "failed"].includes(row.status),
-  ).length;
-  const localCompleteCount = rows.filter(
-    (row) => row.status === "local_complete" || row.status === "analyzed",
-  ).length;
+  const scannedCount = rows.filter(rowHasQuickScanResult).length;
+  const pendingCount = Math.max(0, rows.length - scannedCount);
   const retryingCount = rows.filter((row) => row.status === "retrying").length;
-  const geminiCandidateCount = rows.filter((row) => row.geminiCandidate).length;
-  const usableCount = rows.filter(
-    (row) => row.photo?.analysis && row.status !== "failed" && row.status !== "skipped",
-  ).length;
+  const usableCount = rows.filter(rowIsUsable).length;
   const skippedReasonSummary = summarizeSkippedRows(skippedRows, screenshotRows, unsupportedRows);
-  const accountedCount = rows.filter(
-    (row) =>
-      Boolean(row.photo?.analysis) ||
-      row.status === "skipped" ||
-      row.status === "failed" ||
-      row.status === "analyzed",
-  ).length;
+  const accountedCount = scannedCount;
   const mainProgress = rows.length
     ? Math.min(1, accountedCount / Math.max(1, rows.length))
     : Math.min(1, progress);
-  const hasActiveAnalysis = rows.some(
-    (row) =>
-      row.status === "local_scanning" ||
-      row.status === "queued" ||
-      row.status === "analyzing" ||
-      row.status === "retrying",
+  const hasActiveQuickScan =
+    rows.length > 0 &&
+    (pendingCount > 0 ||
+      phase === "loading" ||
+      phase === "local-scanning" ||
+      rows.some((row) => row.status === "uploaded" || row.status === "local_scanning"));
+  const hasActiveRefinement = rows.some(
+    (row) => row.status === "queued" || row.status === "analyzing" || row.status === "retrying",
   );
+  const hasActiveAnalysis = hasActiveQuickScan || hasActiveRefinement;
   const canStartSorting =
-    rows.length > 0 && phase !== "loading" && phase !== "local-scanning" && usableCount >= 4;
+    rows.length > 0 &&
+    phase !== "loading" &&
+    phase !== "local-scanning" &&
+    pendingCount === 0 &&
+    usableCount >= 4;
 
   const progressLabel =
     phase === "preparing"
       ? "Preparing your collection…"
-      : phase === "local-scanning"
-        ? `Scanning ${Math.min(scannedCount + 1, rows.length)} of ${rows.length} photos`
-      : phase === "refining" && retryingCount > 0
-        ? "Taking a little longer on the best candidates…"
-      : phase === "refining"
-        ? "Picking out the hidden gems…"
-      : canStartSorting
-        ? "Ready to sort!"
-      : hasActiveAnalysis
-        ? `Scanning ${Math.min(scannedCount + 1, rows.length)} of ${rows.length} photos`
-      : failedRows.length
-        ? `${failedRows.length} photo${failedRows.length === 1 ? "" : "s"} couldn't be scanned`
-        : "Preparing analysis…";
+      : rows.length > 0 && pendingCount === 0
+        ? `${rows.length} photo${rows.length === 1 ? "" : "s"} scanned`
+        : phase === "local-scanning"
+          ? `Scanning ${scannedCount} of ${rows.length} photos`
+          : phase === "refining" && retryingCount > 0
+            ? "Taking a little longer on the best candidates…"
+            : phase === "refining"
+              ? "Picking out the hidden gems…"
+              : canStartSorting
+                ? "Ready to sort!"
+                : hasActiveQuickScan
+                  ? `Scanning ${scannedCount} of ${rows.length} photos`
+                  : failedRows.length
+                    ? `${failedRows.length} photo${failedRows.length === 1 ? "" : "s"} couldn't be scanned`
+                    : "Preparing analysis…";
   const progressDetail =
-    rows.length > 0 ? photoAccountingSummary(rows.length, usableCount, skippedRows.length, failedRows.length) : "";
+    rows.length > 0
+      ? photoAccountingSummary(rows.length, usableCount, unusableRows.length, pendingCount)
+      : "";
   const taglinePhotos = useMemo(
     () => rows.map((row) => row.photo).filter((photo): photo is Photo => !!photo),
     [rows],
@@ -1978,88 +2021,121 @@ function AnalyzeStage() {
       workItems.push(item);
     }
 
-    let cursor = 0;
-    async function worker() {
-      while (cursor < workItems.length && runIdRef.current === runId) {
-        const item = workItems[cursor++];
-        await scanOneLocalItem(item);
-      }
-    }
-
     async function scanOneLocalItem(item: UploadItem) {
       updateRows((current) =>
         current.map((row) =>
           row.item.id === item.id ? { ...row, status: "local_scanning" } : row,
         ),
       );
-      try {
-        const { photo, clipEmbeddingVector } = await pipeline.processLocalImage({
-          ...item,
-          settings: state.settings,
-        });
-        const localSkipReason = localRemovalReason(photo);
-        updateRows((current) =>
-          current.map((row) =>
-            row.item.id === item.id
-              ? {
-                  ...row,
-                  status: localSkipReason ? "skipped" : "local_complete",
-                  photo,
-                  clipEmbeddingVector,
-                  localSkipReason,
-                  error: localSkipReason,
-                }
-              : row,
-          ),
-        );
-        if (item.convertedFromHeic) {
-          console.debug("[dumpdeck] HEIC quick scan completed", {
+      for (let attempt = 1; attempt <= LOCAL_SCAN_MAX_ATTEMPTS; attempt++) {
+        try {
+          const { photo, clipEmbeddingVector } = await withTimeout(
+            pipeline.processLocalImage({
+              ...item,
+              settings: state.settings,
+            }),
+            LOCAL_SCAN_TIMEOUT_MS,
+            `Quick scan for ${item.name}`,
+          );
+          const localSkipReason = localRemovalReason(photo);
+          updateRows((current) =>
+            current.map((row) =>
+              row.item.id === item.id
+                ? {
+                    ...row,
+                    status: localSkipReason ? "skipped" : "local_complete",
+                    photo,
+                    clipEmbeddingVector,
+                    localSkipReason,
+                    error: localSkipReason,
+                  }
+                : row,
+            ),
+          );
+          updateLocalScanProgress(items.length);
+          if (item.convertedFromHeic) {
+            console.debug("[dumpdeck] HEIC quick scan completed", {
+              id: item.id,
+              name: item.name,
+              conversionQuality: item.conversionQuality,
+              conversionDecoder: item.conversionDecoder,
+              sharpness: photo.imageQuality?.sharpness,
+              technicalQuality: photo.imageQuality?.overallTechnicalQuality,
+              localSkipReason,
+            });
+          }
+          return;
+        } catch (err) {
+          const message = err instanceof Error ? err.message : "Local quick scan failed";
+          console.warn("[dumpdeck] local quick scan failed", {
             id: item.id,
             name: item.name,
-            conversionQuality: item.conversionQuality,
-            conversionDecoder: item.conversionDecoder,
-            sharpness: photo.imageQuality?.sharpness,
-            technicalQuality: photo.imageQuality?.overallTechnicalQuality,
-            localSkipReason,
+            attempt,
+            maxAttempts: LOCAL_SCAN_MAX_ATTEMPTS,
+            message,
           });
+          if (attempt < LOCAL_SCAN_MAX_ATTEMPTS) {
+            updateRows((current) =>
+              current.map((row) =>
+                row.item.id === item.id
+                  ? {
+                      ...row,
+                      status: "local_scanning",
+                      attempts: attempt,
+                      error: `${message} Retrying quick scan…`,
+                    }
+                  : row,
+              ),
+            );
+            await sleep(350);
+            continue;
+          }
+          updateRows((current) =>
+            current.map((row) =>
+              row.item.id === item.id
+                ? {
+                    ...row,
+                    status: "failed",
+                    attempts: attempt,
+                    error: message,
+                  }
+                : row,
+            ),
+          );
+          updateLocalScanProgress(items.length);
         }
-      } catch (err) {
-        const message = err instanceof Error ? err.message : "Local quick scan failed";
-        updateRows((current) =>
-          current.map((row) =>
-            row.item.id === item.id
-              ? {
-                  ...row,
-                  status: "failed",
-                  error: message,
-                }
-              : row,
-          ),
-        );
-      } finally {
-        const completed = rowsRef.current.filter((row) =>
-          ["local_complete", "analyzed", "skipped", "failed"].includes(row.status),
-        ).length;
-        updateLocalScanProgress(items.length, completed);
       }
     }
 
-    await Promise.all(
-      Array.from({ length: Math.min(LOCAL_SCAN_CONCURRENCY, Math.max(1, workItems.length)) }, () =>
-        worker(),
-      ),
-    );
+    for (const batch of chunkArray(workItems, LOCAL_SCAN_BATCH_SIZE)) {
+      if (runIdRef.current !== runId) break;
+      console.debug("[dumpdeck] quick scan batch started", {
+        batchSize: batch.length,
+        totalPhotos: items.length,
+        completedBeforeBatch: rowsRef.current.filter(rowHasQuickScanResult).length,
+      });
+      let cursor = 0;
+      async function worker() {
+        while (cursor < batch.length && runIdRef.current === runId) {
+          const item = batch[cursor++];
+          await scanOneLocalItem(item);
+        }
+      }
+      await Promise.all(
+        Array.from({ length: Math.min(LOCAL_SCAN_CONCURRENCY, Math.max(1, batch.length)) }, () =>
+          worker(),
+        ),
+      );
+      updateLocalScanProgress(items.length);
+      await yieldToBrowser();
+    }
 
     localScanDurationMsRef.current = Math.round(performance.now() - localScanStartedAtRef.current);
     return rowsRef.current.filter((row) => row.photo && row.status === "local_complete");
   }
 
   function updateLocalScanProgress(total: number, completedOverride?: number) {
-    const completed =
-      completedOverride ??
-      rowsRef.current.filter((row) =>
-        ["local_complete", "analyzed", "skipped", "failed"].includes(row.status),
-      ).length;
+    const completed = completedOverride ?? rowsRef.current.filter(rowHasQuickScanResult).length;
     const p = Math.min(0.5, (completed / Math.max(1, total)) * 0.5);
     setProgress(p);
   }
@@ -2559,8 +2635,9 @@ function AnalyzeStage() {
       void persistProjectUploads(activeProjectId(), items)
         .then((storedItems) => {
           storageUploadRef.current = {
-            uploaded: storedItems.filter((item) => item.previewStoragePath || item.originalStoragePath)
-              .length,
+            uploaded: storedItems.filter(
+              (item) => item.previewStoragePath || item.originalStoragePath,
+            ).length,
             durationMs: Math.round(performance.now() - storageStartedAt),
             failed: false,
           };
@@ -2630,7 +2707,7 @@ function AnalyzeStage() {
             initial={{ opacity: 0, y: 6 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -6 }}
-            className="mx-auto mt-4 max-w-full px-2 text-center text-base font-semibold leading-snug text-ink sm:text-lg"
+            className="mx-auto mt-4 max-w-full px-2 text-center font-display text-2xl leading-tight text-ink sm:text-3xl"
           >
             {progressLabel}
           </motion.div>
@@ -2639,11 +2716,25 @@ function AnalyzeStage() {
           <div className="mx-auto mt-2 max-w-xs space-y-1 text-center text-xs leading-relaxed text-muted-foreground">
             <p>{progressDetail}</p>
             {skippedRows.length > 0 && <p>{skippedReasonSummary}</p>}
-            {accountedCount < rows.length && (
-              <p>
-                {rows.length - accountedCount} photo
-                {rows.length - accountedCount === 1 ? "" : "s"} still being checked.
-              </p>
+            <p className="text-[11px] leading-snug">
+              Usable means the photo loaded successfully and passed the basic scan. Screenshots,
+              corrupted files, unsupported formats, or failed uploads may be skipped.
+            </p>
+            {unusableRows.length > 0 && (
+              <details className="mx-auto mt-2 rounded-2xl bg-white/70 px-3 py-2 text-left text-[11px] text-ink/75">
+                <summary className="cursor-pointer text-center font-semibold text-ink">
+                  {rows.length} uploaded · {usableCount} ready · {unusableRows.length} skipped ·
+                  View skipped reasons
+                </summary>
+                <ul className="mt-2 max-h-28 space-y-1 overflow-y-auto">
+                  {unusableRows.map((row) => (
+                    <li key={row.item.id}>
+                      <span className="font-semibold">{row.item.name}:</span>{" "}
+                      <span>{rowFinalReason(row)}</span>
+                    </li>
+                  ))}
+                </ul>
+              </details>
             )}
           </div>
         )}
@@ -2651,8 +2742,8 @@ function AnalyzeStage() {
           <div className="mt-4 rounded-2xl bg-mint/20 px-4 py-3 text-left text-xs leading-relaxed text-ink">
             <div className="font-semibold">Your photos are ready to review.</div>
             <p className="mt-1 text-muted-foreground">
-              You can start sorting now, or wait while FotoFairy finishes a deeper analysis that
-              may improve your results.
+              You can start sorting now, or wait while FotoFairy finishes a deeper analysis that may
+              improve your results.
             </p>
           </div>
         )}
@@ -2702,14 +2793,19 @@ function AnalyzeStage() {
           {phase === "preparing"
             ? "Preparing your collection…"
             : canStartSorting
-              ? failedRows.length
-                ? `Start Sorting with ${usableCount} usable photos`
+              ? unusableRows.length
+                ? `Start Sorting with ${usableCount} ready photos`
                 : "Start Sorting"
-              : hasActiveAnalysis
+              : hasActiveQuickScan
                 ? "Start Sorting unlocks after quick scan"
                 : "Not enough analyzed photos"}
         </Button>
-        {failedRows.length > 0 && analyzedCount >= 4 && !hasActiveAnalysis && (
+        {!canStartSorting && hasActiveQuickScan && (
+          <p className="px-3 text-xs leading-relaxed text-muted-foreground">
+            Please don’t refresh this page until sorting starts — we’re still saving your photos.
+          </p>
+        )}
+        {failedRows.length > 0 && usableCount >= 4 && !hasActiveQuickScan && (
           <p className="text-xs text-muted-foreground">
             Failed photos will be skipped unless you retry them first.
           </p>
@@ -3558,7 +3654,10 @@ function friendlyReason(r: RemovedPhoto): string {
   if (cat === "similar") return r.reason || "Too similar to another photo.";
   if (cat === "ai") {
     if (/^Keep:\s*/i.test(r.reason)) {
-      const positiveSignal = r.reason.replace(/^Keep:\s*/i, "").replace(/\.$/, "").trim();
+      const positiveSignal = r.reason
+        .replace(/^Keep:\s*/i, "")
+        .replace(/\.$/, "")
+        .trim();
       return positiveSignal
         ? `Cut because stronger options ranked higher, even though this had ${positiveSignal.toLowerCase()}.`
         : "Cut because stronger options ranked higher.";

@@ -134,7 +134,9 @@ function openDraftPayload(navigate: ReturnType<typeof useNavigate>, draft: Saved
   });
   if (!draft.draftPayload?.finalOrder?.length) {
     console.warn("[dumpdeck] saved project draft cannot open", savedDraftDebugSummary(draft));
-    toast.error("This draft is missing its final photo order. Open the collection and save it again.");
+    toast.error(
+      "This draft is missing its final photo order. Open the collection and save it again.",
+    );
     return;
   }
   sessionStorage.setItem("dumpdeck:activeProjectId", draft.projectId ?? "");
@@ -276,7 +278,9 @@ function ProjectsPage() {
       saved_photo_count: photoSummaries.get(project.id)?.count ?? 0,
       final_selected_photo_count: status.latestDraft?.draftPayload?.finalOrder?.length ?? 0,
       final_order_photo_ids:
-        status.latestDraft?.draftPayload?.orderedPhotoIds ?? status.latestDraft?.orderedPhotoIds ?? [],
+        status.latestDraft?.draftPayload?.orderedPhotoIds ??
+        status.latestDraft?.orderedPhotoIds ??
+        [],
       pinned_cover_photo_id:
         status.latestDraft?.draftPayload?.pinnedCoverPhotoId ??
         status.latestDraft?.selectedPreferences?.pinnedCoverPhotoId ??
@@ -389,21 +393,35 @@ function ProjectsPage() {
   }
 
   async function remove(id: string) {
-    if (isLocalDevAuth) {
-      saveLocalProjects(loadLocalProjects().filter((project) => project.id !== id));
-      toast.success("Deleted");
-      await load();
-      return;
+    const previousProjects = projects;
+    const previousDrafts = drafts;
+    const previousPhotoSummaries = photoSummaries;
+
+    setProjects((current) => current.filter((project) => project.id !== id));
+    setDrafts((current) => current.filter((draft) => draft.projectId !== id));
+    setPhotoSummaries((current) => {
+      const next = new Map(current);
+      next.delete(id);
+      return next;
+    });
+    toast.success("Collection deleted");
+
+    try {
+      if (isLocalDevAuth) {
+        saveLocalProjects(loadLocalProjects().filter((project) => project.id !== id));
+        return;
+      }
+      await deleteStoredProjectPhotos(id);
+      const { error } = await supabase.from("saved_projects").delete().eq("id", id);
+      if (error) throw error;
+    } catch (err) {
+      setProjects(previousProjects);
+      setDrafts(previousDrafts);
+      setPhotoSummaries(previousPhotoSummaries);
+      const message = err instanceof Error ? err.message : "Could not delete collection";
+      toast.error(message);
+      console.error("[saved_projects] delete failed:", err);
     }
-    await deleteStoredProjectPhotos(id);
-    const { error } = await supabase.from("saved_projects").delete().eq("id", id);
-    if (error) {
-      toast.error(error.message);
-      console.error(error);
-      return;
-    }
-    toast.success("Deleted");
-    await load();
   }
 
   if (authLoading || !isAuthed) {
@@ -828,7 +846,9 @@ function ProjectForm({
         className="w-full max-w-md rounded-3xl bg-white p-6 shadow-2xl"
       >
         <div className="flex items-center justify-between">
-          <h2 className="font-display text-2xl">{initial ? "Edit collection" : "New collection"}</h2>
+          <h2 className="font-display text-2xl">
+            {initial ? "Edit collection" : "New collection"}
+          </h2>
           <button
             type="button"
             onClick={onClose}
