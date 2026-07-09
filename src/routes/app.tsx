@@ -7,6 +7,7 @@ import {
   Check,
   Download,
   Eye,
+  HelpCircle,
   Heart,
   Laugh,
   Palette,
@@ -1532,64 +1533,9 @@ function isUnsupportedSkipReason(reason?: string) {
   return /unsupported|corrupt|couldn't|failed|invalid/i.test(reason ?? "");
 }
 
-function summarizeSkippedRows(
-  skippedRows: AnalysisRow[],
-  screenshotRows: AnalysisRow[],
-  unsupportedRows: AnalysisRow[],
-) {
-  if (!skippedRows.length) return "";
-  const parts: string[] = [];
-  if (screenshotRows.length > 0) {
-    parts.push(
-      `${screenshotRows.length} screenshot/non-photo ${
-        screenshotRows.length === 1 ? "was" : "were"
-      } excluded automatically`,
-    );
-  }
-  if (unsupportedRows.length > 0) {
-    parts.push(
-      `${unsupportedRows.length} unsupported or failed ${
-        unsupportedRows.length === 1 ? "image was" : "images were"
-      } skipped`,
-    );
-  }
-  const explainedIds = new Set([...screenshotRows, ...unsupportedRows].map((row) => row.item.id));
-  const remaining = skippedRows.filter((row) => !explainedIds.has(row.item.id));
-  const duplicateCount = remaining.filter((row) =>
-    /exact duplicate|duplicate/i.test(row.localSkipReason ?? row.error ?? ""),
-  ).length;
-  if (duplicateCount > 0) {
-    parts.push(
-      `${duplicateCount} exact duplicate ${duplicateCount === 1 ? "was" : "were"} skipped`,
-    );
-  }
-  const otherCount = remaining.length - duplicateCount;
-  if (otherCount > 0) {
-    const firstOther = remaining.find(
-      (row) => !/exact duplicate|duplicate/i.test(row.localSkipReason ?? row.error ?? ""),
-    );
-    const firstReason = firstOther?.localSkipReason ?? firstOther?.error;
-    parts.push(
-      firstReason
-        ? `${otherCount} photo${otherCount === 1 ? "" : "s"} skipped: ${firstReason}`
-        : `${otherCount} photo${otherCount === 1 ? "" : "s"} skipped`,
-    );
-  }
-  return parts.join(" · ");
-}
-
-function photoAccountingSummary(total: number, usable: number, unusable: number, pending: number) {
+function scanTooltipSummary(total: number, usable: number, unusable: number, pending: number) {
   const scanned = Math.min(total, usable + unusable);
-  const parts = [
-    `${usable} usable photo${usable === 1 ? "" : "s"} found`,
-    `${unusable} photo${unusable === 1 ? "" : "s"} need${unusable === 1 ? "s" : ""} review or ${unusable === 1 ? "was" : "were"} skipped`,
-  ];
-  if (pending > 0) {
-    parts.push(`${pending} photo${pending === 1 ? "" : "s"} still being checked`);
-  } else {
-    parts.unshift(`${scanned} of ${total} photo${total === 1 ? "" : "s"} scanned`);
-  }
-  return parts.join(" · ");
+  return `${scanned} of ${total} photo${total === 1 ? "" : "s"} scanned · ${usable} usable photo${usable === 1 ? "" : "s"} found · ${unusable} photo${unusable === 1 ? "" : "s"} need${unusable === 1 ? "s" : ""} review or ${unusable === 1 ? "was" : "were"} skipped${pending > 0 ? ` · ${pending} pending` : ""}`;
 }
 
 function rowHasQuickScanResult(row: AnalysisRow) {
@@ -1674,6 +1620,7 @@ function AnalyzeStage() {
   const [sample, setSample] = useState<{ url: string; previewUrl?: string }[]>([]);
   const [rows, setRows] = useState<AnalysisRow[]>([]);
   const [phase, setPhase] = useState<AnalysisPhase>("loading");
+  const [showScanHelp, setShowScanHelp] = useState(false);
   const [imagePipelineVersion, setImagePipelineVersion] = useState("");
   const [analysisConcurrency, setAnalysisConcurrency] = useState(3);
   const [maxGeminiPhotos, setMaxGeminiPhotos] = useState(70);
@@ -1755,16 +1702,7 @@ function AnalyzeStage() {
   }
 
   const failedRows = rows.filter((row) => row.status === "failed");
-  const skippedRows = rows.filter((row) => row.status === "skipped");
   const unusableRows = rows.filter((row) => rowHasQuickScanResult(row) && !rowIsUsable(row));
-  const screenshotRows = skippedRows.filter((row) =>
-    isScreenshotSkipReason(row.localSkipReason ?? row.error),
-  );
-  const unsupportedRows = rows.filter(
-    (row) =>
-      row.status === "failed" ||
-      (row.status === "skipped" && isUnsupportedSkipReason(row.localSkipReason ?? row.error)),
-  );
   const backgroundRefiningCount = rows.filter(
     (row) => row.geminiCandidate && ["queued", "analyzing", "retrying"].includes(row.status),
   ).length;
@@ -1772,7 +1710,6 @@ function AnalyzeStage() {
   const pendingCount = Math.max(0, rows.length - scannedCount);
   const retryingCount = rows.filter((row) => row.status === "retrying").length;
   const usableCount = rows.filter(rowIsUsable).length;
-  const skippedReasonSummary = summarizeSkippedRows(skippedRows, screenshotRows, unsupportedRows);
   const accountedCount = scannedCount;
   const mainProgress = rows.length
     ? Math.min(1, accountedCount / Math.max(1, rows.length))
@@ -1787,18 +1724,15 @@ function AnalyzeStage() {
     (row) => row.status === "queued" || row.status === "analyzing" || row.status === "retrying",
   );
   const hasActiveAnalysis = hasActiveQuickScan || hasActiveRefinement;
+  const quickScanComplete = rows.length > 0 && pendingCount === 0;
   const canStartSorting =
-    rows.length > 0 &&
-    phase !== "loading" &&
-    phase !== "local-scanning" &&
-    pendingCount === 0 &&
-    usableCount >= 4;
+    quickScanComplete && phase !== "loading" && phase !== "preparing" && usableCount >= 4;
 
   const progressLabel =
     phase === "preparing"
       ? "Preparing your collection…"
-      : rows.length > 0 && pendingCount === 0
-        ? `${rows.length} photo${rows.length === 1 ? "" : "s"} scanned`
+      : quickScanComplete
+        ? `${scannedCount} photo${scannedCount === 1 ? "" : "s"} scanned`
         : phase === "local-scanning"
           ? `Scanning ${scannedCount} of ${rows.length} photos`
           : phase === "refining" && retryingCount > 0
@@ -1812,9 +1746,9 @@ function AnalyzeStage() {
                   : failedRows.length
                     ? `${failedRows.length} photo${failedRows.length === 1 ? "" : "s"} couldn't be scanned`
                     : "Preparing analysis…";
-  const progressDetail =
+  const scanHelpText =
     rows.length > 0
-      ? photoAccountingSummary(rows.length, usableCount, unusableRows.length, pendingCount)
+      ? scanTooltipSummary(rows.length, usableCount, unusableRows.length, pendingCount)
       : "";
   const taglinePhotos = useMemo(
     () => rows.map((row) => row.photo).filter((photo): photo is Photo => !!photo),
@@ -2701,43 +2635,59 @@ function AnalyzeStage() {
             animate={{ width: `${Math.round(mainProgress * 100)}%` }}
           />
         </div>
-        <AnimatePresence mode="wait">
-          <motion.div
-            key={progressLabel}
-            initial={{ opacity: 0, y: 6 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -6 }}
-            className="mx-auto mt-4 max-w-full px-2 text-center font-display text-2xl leading-tight text-ink sm:text-3xl"
-          >
-            {progressLabel}
-          </motion.div>
-        </AnimatePresence>
-        {rows.length > 0 && (
-          <div className="mx-auto mt-2 max-w-xs space-y-1 text-center text-xs leading-relaxed text-muted-foreground">
-            <p>{progressDetail}</p>
-            {skippedRows.length > 0 && <p>{skippedReasonSummary}</p>}
-            <p className="text-[11px] leading-snug">
-              Usable means the photo loaded successfully and passed the basic scan. Screenshots,
-              corrupted files, unsupported formats, or failed uploads may be skipped.
-            </p>
-            {unusableRows.length > 0 && (
-              <details className="mx-auto mt-2 rounded-2xl bg-white/70 px-3 py-2 text-left text-[11px] text-ink/75">
-                <summary className="cursor-pointer text-center font-semibold text-ink">
-                  {rows.length} uploaded · {usableCount} ready · {unusableRows.length} skipped ·
-                  View skipped reasons
-                </summary>
-                <ul className="mt-2 max-h-28 space-y-1 overflow-y-auto">
-                  {unusableRows.map((row) => (
-                    <li key={row.item.id}>
-                      <span className="font-semibold">{row.item.name}:</span>{" "}
-                      <span>{rowFinalReason(row)}</span>
-                    </li>
-                  ))}
-                </ul>
-              </details>
+        <div className="relative mx-auto mt-4 flex max-w-full items-center justify-center gap-2 px-2">
+          <AnimatePresence mode="wait">
+            <motion.div
+              key={progressLabel}
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -6 }}
+              className="text-center font-display text-2xl leading-tight text-ink sm:text-3xl"
+            >
+              {progressLabel}
+            </motion.div>
+          </AnimatePresence>
+          {rows.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setShowScanHelp((open) => !open)}
+              aria-expanded={showScanHelp}
+              aria-label="What does this scan status mean?"
+              className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-white/80 text-ink shadow-sm ring-1 ring-ink/10 transition hover:bg-white"
+            >
+              <HelpCircle className="h-4 w-4" />
+            </button>
+          )}
+          <AnimatePresence>
+            {showScanHelp && rows.length > 0 && (
+              <motion.div
+                initial={{ opacity: 0, y: 4, scale: 0.98 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                exit={{ opacity: 0, y: 4, scale: 0.98 }}
+                className="absolute left-1/2 top-full z-20 mt-3 w-[min(20rem,calc(100vw-3rem))] -translate-x-1/2 rounded-2xl bg-white p-3 text-left text-xs leading-relaxed text-ink shadow-xl ring-1 ring-ink/10"
+              >
+                <p>{scanHelpText}</p>
+                <p className="mt-2 text-muted-foreground">
+                  Usable means the photo loaded successfully and passed the basic scan. Screenshots,
+                  corrupted files, unsupported formats, or failed uploads may be skipped.
+                </p>
+                {unusableRows.length > 0 && (
+                  <div className="mt-2 border-t border-ink/10 pt-2">
+                    <div className="font-semibold">Skipped reasons</div>
+                    <ul className="mt-1 max-h-24 space-y-1 overflow-y-auto">
+                      {unusableRows.map((row) => (
+                        <li key={row.item.id}>
+                          <span className="font-semibold">{row.item.name}:</span>{" "}
+                          <span>{rowFinalReason(row)}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </motion.div>
             )}
-          </div>
-        )}
+          </AnimatePresence>
+        </div>
         {canStartSorting && backgroundRefiningCount > 0 && (
           <div className="mt-4 rounded-2xl bg-mint/20 px-4 py-3 text-left text-xs leading-relaxed text-ink">
             <div className="font-semibold">Your photos are ready to review.</div>
@@ -2800,9 +2750,9 @@ function AnalyzeStage() {
                 ? "Start Sorting unlocks after quick scan"
                 : "Not enough analyzed photos"}
         </Button>
-        {!canStartSorting && hasActiveQuickScan && (
+        {phase !== "preparing" && state.stage === "analyze" && (
           <p className="px-3 text-xs leading-relaxed text-muted-foreground">
-            Please don’t refresh this page until sorting starts — we’re still saving your photos.
+            Do not refresh FotoFairy until after you start sorting.
           </p>
         )}
         {failedRows.length > 0 && usableCount >= 4 && !hasActiveQuickScan && (
@@ -2852,6 +2802,16 @@ function SimilarStage() {
     });
     return out;
   });
+  const [zoomPhoto, setZoomPhoto] = useState<Photo | null>(null);
+
+  useEffect(() => {
+    if (!zoomPhoto) return;
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") setZoomPhoto(null);
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [zoomPhoto]);
 
   function togglePick(groupId: number, photoId: string) {
     setPicked((cur) => {
@@ -3026,48 +2986,64 @@ function SimilarStage() {
                   const isAiPick = idx === 0;
                   const photoBadges = badges[p.id] ?? [];
                   return (
-                    <button
+                    <div
                       key={p.id}
-                      type="button"
-                      onClick={() => togglePick(g.id, p.id)}
                       className={`relative overflow-hidden rounded-xl bg-muted transition ${
                         isPicked ? "ring-4 ring-coral" : "opacity-75"
                       }`}
                       style={{ aspectRatio: "1 / 1" }}
                     >
-                      <img
-                        src={p.previewUrl ?? p.url}
-                        alt=""
-                        decoding="async"
-                        loading="lazy"
-                        className="h-full w-full object-cover"
-                      />
-                      <div className="absolute left-1 top-1 rounded-full bg-white/90 px-1.5 py-0.5 text-[10px] font-bold text-ink">
-                        {Math.round(rankingScore(p) * 100)}
-                      </div>
-                      {isAiPick && (
-                        <div className="absolute right-1 top-1 rounded-md bg-coral px-1 py-0.5 text-[9px] font-bold text-white shadow">
-                          BEST
+                      <button
+                        type="button"
+                        onClick={() => togglePick(g.id, p.id)}
+                        className="absolute inset-0 h-full w-full text-left"
+                        aria-label={`${isPicked ? "Unselect" : "Select"} ${p.name}`}
+                      >
+                        <img
+                          src={p.previewUrl ?? p.url}
+                          alt=""
+                          decoding="async"
+                          loading="lazy"
+                          className="h-full w-full object-cover"
+                        />
+                        <div className="absolute left-1 top-1 rounded-full bg-white/90 px-1.5 py-0.5 text-[10px] font-bold text-ink">
+                          {Math.round(rankingScore(p) * 100)}
                         </div>
-                      )}
-                      {photoBadges.length > 0 && (
-                        <div className="absolute inset-x-1 bottom-1 flex flex-wrap gap-0.5">
-                          {photoBadges.slice(0, 2).map((b) => (
-                            <span
-                              key={b}
-                              className="rounded-sm bg-black/70 px-1 py-0.5 text-[8px] font-bold uppercase tracking-wide text-white"
-                            >
-                              {b}
-                            </span>
-                          ))}
-                        </div>
-                      )}
-                      {isPicked && (
-                        <div className="absolute right-1 bottom-1 grid h-6 w-6 place-items-center rounded-full bg-coral text-white shadow">
-                          <Check className="h-3.5 w-3.5" />
-                        </div>
-                      )}
-                    </button>
+                        {isAiPick && (
+                          <div className="absolute right-1 top-1 rounded-md bg-coral px-1 py-0.5 text-[9px] font-bold text-white shadow">
+                            BEST
+                          </div>
+                        )}
+                        {photoBadges.length > 0 && (
+                          <div className="absolute inset-x-8 bottom-1 flex flex-wrap gap-0.5">
+                            {photoBadges.slice(0, 2).map((b) => (
+                              <span
+                                key={b}
+                                className="rounded-sm bg-black/70 px-1 py-0.5 text-[8px] font-bold uppercase tracking-wide text-white"
+                              >
+                                {b}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                        {isPicked && (
+                          <div className="absolute right-1 bottom-1 grid h-6 w-6 place-items-center rounded-full bg-coral text-white shadow">
+                            <Check className="h-3.5 w-3.5" />
+                          </div>
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`Zoom ${p.name}`}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setZoomPhoto(p);
+                        }}
+                        className="absolute left-1 bottom-1 grid h-6 w-6 place-items-center rounded-full bg-white/90 text-ink shadow ring-1 ring-ink/10"
+                      >
+                        <Eye className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
                   );
                 })}
               </div>
@@ -3091,6 +3067,56 @@ function SimilarStage() {
           );
         })}
       </div>
+
+      <AnimatePresence>
+        {zoomPhoto && (
+          <motion.div
+            className="fixed inset-0 z-50 grid place-items-center bg-ink/75 p-4"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={() => setZoomPhoto(null)}
+          >
+            <motion.div
+              className="relative w-full max-w-3xl overflow-hidden rounded-3xl bg-white p-3 shadow-2xl"
+              initial={{ scale: 0.96, y: 10 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.96, y: 10 }}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <button
+                type="button"
+                onClick={() => setZoomPhoto(null)}
+                className="absolute right-4 top-4 z-10 grid h-10 w-10 place-items-center rounded-full bg-white/90 text-ink shadow ring-1 ring-ink/10"
+                aria-label="Close photo preview"
+              >
+                <X className="h-5 w-5" />
+              </button>
+              <div className="max-h-[75vh] overflow-hidden rounded-2xl bg-muted">
+                <img
+                  src={zoomPhoto.previewUrl ?? zoomPhoto.url}
+                  alt={zoomPhoto.name}
+                  decoding="async"
+                  className="max-h-[75vh] w-full object-contain"
+                />
+              </div>
+              <div className="mt-3 flex flex-wrap items-center justify-between gap-2 px-1 text-sm">
+                <div className="min-w-0">
+                  <div className="truncate font-semibold text-ink">{zoomPhoto.name}</div>
+                  <div className="text-xs text-muted-foreground">
+                    Score {Math.round(rankingScore(zoomPhoto) * 100)}
+                  </div>
+                </div>
+                <span className="chip bg-mint/40">
+                  {Object.values(picked).some((set) => set.has(zoomPhoto.id))
+                    ? "Selected"
+                    : "Not selected"}
+                </span>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       <StickyAction>
         <Button
