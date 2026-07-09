@@ -436,7 +436,7 @@ function Shell() {
   if (loading || (isAuthed && !draftHydrationChecked)) {
     return (
       <main className="grid min-h-screen place-items-center text-sm text-muted-foreground">
-        Loading…
+        Restoring your project…
       </main>
     );
   }
@@ -1646,21 +1646,28 @@ function AnalyzeStage() {
   }, [rows]);
 
   function updateRows(updater: (current: AnalysisRow[]) => AnalysisRow[]) {
+    let nextRows = rowsRef.current;
     setRows((current) => {
       const next = updater(current);
       rowsRef.current = next;
+      nextRows = next;
       return next;
     });
+    return nextRows;
   }
 
   function mergeStoredUploads(storedItems: UploadItem[]) {
     const byId = new Map(storedItems.map((item) => [item.id, item] as const));
-    updateRows((current) =>
+    const nextRows = updateRows((current) =>
       current.map((row) => {
         const stored = byId.get(row.item.id);
         if (!stored) return row;
         const nextItem = {
           ...row.item,
+          url: stored.previewUrl ?? stored.previewFileUrl ?? stored.url,
+          originalFileUrl: stored.originalFileUrl,
+          previewFileUrl: stored.previewFileUrl,
+          previewUrl: stored.previewUrl,
           storageBucket: stored.storageBucket,
           originalStoragePath: stored.originalStoragePath,
           previewStoragePath: stored.previewStoragePath,
@@ -1673,6 +1680,10 @@ function AnalyzeStage() {
               storageBucket: stored.storageBucket,
               originalStoragePath: stored.originalStoragePath,
               previewStoragePath: stored.previewStoragePath,
+              url: stored.previewUrl ?? stored.previewFileUrl ?? stored.url,
+              originalFileUrl: stored.originalFileUrl,
+              previewFileUrl: stored.previewFileUrl,
+              previewUrl: stored.previewUrl,
               fileName: stored.fileName,
               uploadedAt: stored.uploadedAt,
               sourceMetadata: {
@@ -1680,6 +1691,8 @@ function AnalyzeStage() {
                 storageBucket: stored.storageBucket,
                 originalStoragePath: stored.originalStoragePath,
                 previewStoragePath: stored.previewStoragePath,
+                originalFileUrl: stored.originalFileUrl,
+                previewFileUrl: stored.previewUrl ?? stored.previewFileUrl,
                 fileName: stored.fileName,
                 uploadedAt: stored.uploadedAt,
               },
@@ -1688,6 +1701,10 @@ function AnalyzeStage() {
         return { ...row, item: nextItem, photo: nextPhoto };
       }),
     );
+    const storedPhotos = nextRows
+      .map((row) => row.photo)
+      .filter((photo): photo is Photo => Boolean(photo?.previewStoragePath || photo?.originalStoragePath));
+    if (storedPhotos.length) dispatch({ type: "updatePhotoSources", photos: storedPhotos });
   }
 
   const analyzedCount = rows.filter((row) => row.status === "analyzed").length;
@@ -3881,7 +3898,8 @@ function ExportStage() {
       );
     } catch (err) {
       console.error("[dumpdeck] draft save failed", err);
-      toast.error("Couldn't save draft.");
+      const message = err instanceof Error ? err.message : "Unknown save error";
+      toast.error(`Couldn't save draft: ${message}`);
     } finally {
       setSaving(false);
     }

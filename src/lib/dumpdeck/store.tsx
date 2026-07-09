@@ -29,6 +29,7 @@ type Action =
   | { type: "setShortlist"; photos: Photo[] }
   | { type: "setKept"; photos: Photo[] }
   | { type: "setFinalOrder"; photos: Photo[] }
+  | { type: "updatePhotoSources"; photos: Photo[] }
   | { type: "addRemoved"; entries: RemovedPhoto[] }
   | { type: "setDuplicateDecisions"; decisions: DuplicateDecisionDraft[] }
   | { type: "setPinnedCover"; id: string | null }
@@ -74,6 +75,21 @@ function reducer(state: State, action: Action): State {
       return { ...state, kept: action.photos };
     case "setFinalOrder":
       return { ...state, finalOrder: action.photos };
+    case "updatePhotoSources": {
+      const replacements = new Map(action.photos.map((photo) => [photo.id, photo] as const));
+      const replacePhoto = (photo: Photo) => replacements.get(photo.id) ?? photo;
+      return {
+        ...state,
+        photos: state.photos.map(replacePhoto),
+        shortlist: state.shortlist.map(replacePhoto),
+        kept: state.kept.map(replacePhoto),
+        finalOrder: state.finalOrder.map(replacePhoto),
+        removed: state.removed.map((entry) => ({
+          ...entry,
+          photo: replacePhoto(entry.photo),
+        })),
+      };
+    }
     case "addRemoved": {
       const existing = new Set(state.removed.map((r) => r.photo.id));
       const merged = [...state.removed, ...action.entries.filter((e) => !existing.has(e.photo.id))];

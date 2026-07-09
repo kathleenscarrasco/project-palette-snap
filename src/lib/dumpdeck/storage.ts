@@ -302,6 +302,8 @@ export async function hydrateStoredDrafts(drafts: SavedFinalDraft[]): Promise<Sa
       draftPayload: {
         ...payload,
         uploadedPhotos: payload.uploadedPhotos.map(hydratePhoto),
+        shortlist: payload.shortlist?.map(hydratePhoto),
+        kept: payload.kept?.map(hydratePhoto),
         finalOrder: payload.finalOrder.map(hydratePhoto),
         removed: payload.removed.map((entry) => ({
           ...entry,

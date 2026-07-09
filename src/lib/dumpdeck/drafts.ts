@@ -290,9 +290,7 @@ export async function autosaveWorkspaceDraft(
     };
   }
 
-  const payload = makeCompactAutosavePayload(input);
-
-  if (isLocalDevAuth) return saveLocalDraft(payload);
+  if (isLocalDevAuth) return saveLocalDraft(makeCompactAutosavePayload(input));
 
   const { data: userData, error: userError } = await supabase.auth.getUser();
   if (userError || !userData.user) throw userError ?? new Error("Sign in before autosaving.");
@@ -300,16 +298,29 @@ export async function autosaveWorkspaceDraft(
   const projectId = asUuid(input.projectId);
   if (!projectId) throw new Error("Choose or create a collection before autosaving.");
 
+  const autosavePhotos = uniquePhotos([
+    ...input.allPhotos,
+    ...input.shortlist,
+    ...input.kept,
+    ...input.finalOrder,
+    ...input.removed.map((entry) => entry.photo),
+  ]);
+  const storagePhotos = autosavePhotos.length
+    ? await persistFinalDraftPhotos(projectId, autosavePhotos)
+    : new Map<string, Photo>();
+  const storageBackedInput = replaceWorkspacePhotos(input, storagePhotos);
+  const payload = makeCompactAutosavePayload(storageBackedInput);
+
   const row = {
     user_id: userData.user.id,
     project_id: projectId,
-    ordered_photo_ids: input.finalOrder.map((photo) => photo.id),
-    rejected_photo_ids: input.removed.map((entry) => entry.photo.id),
-    duplicate_decisions: input.duplicateDecisions,
+    ordered_photo_ids: storageBackedInput.finalOrder.map((photo) => photo.id),
+    rejected_photo_ids: storageBackedInput.removed.map((entry) => entry.photo.id),
+    duplicate_decisions: storageBackedInput.duplicateDecisions,
     selected_preferences: {
-      ...input.settings,
-      pinnedCoverPhotoId: input.pinnedCoverPhotoId ?? null,
-      autosaveStage: input.stage,
+      ...storageBackedInput.settings,
+      pinnedCoverPhotoId: storageBackedInput.pinnedCoverPhotoId ?? null,
+      autosaveStage: storageBackedInput.stage,
     },
     scores_reasons: payload.scoresReasons,
     draft_payload: payload,
@@ -338,6 +349,24 @@ export async function autosaveWorkspaceDraft(
     id: String((data as { id: string }).id),
     storage: "supabase",
     updatedAt: String((data as { updated_at: string }).updated_at),
+  };
+}
+
+function replaceWorkspacePhotos(
+  input: AutosaveDraftInput,
+  replacements: Map<string, Photo>,
+): AutosaveDraftInput {
+  const replacePhoto = (photo: Photo) => replacements.get(photo.id) ?? photo;
+  return {
+    ...input,
+    allPhotos: input.allPhotos.map(replacePhoto),
+    shortlist: input.shortlist.map(replacePhoto),
+    kept: input.kept.map(replacePhoto),
+    finalOrder: input.finalOrder.map(replacePhoto),
+    removed: input.removed.map((entry) => ({
+      ...entry,
+      photo: replacePhoto(entry.photo),
+    })),
   };
 }
 
