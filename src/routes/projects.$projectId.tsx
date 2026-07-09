@@ -16,7 +16,7 @@ import {
 import { listProjectPhotoSummaries } from "@/lib/dumpdeck/storage";
 
 export const Route = createFileRoute("/projects/$projectId")({
-  head: () => ({ meta: [{ title: "Project workspace · FotoFairy" }] }),
+  head: () => ({ meta: [{ title: "Collection workspace · FotoFairy" }] }),
   errorComponent: ProjectWorkspaceError,
   component: ProjectWorkspacePage,
 });
@@ -49,16 +49,16 @@ function ProjectWorkspaceError({ reset }: { reset: () => void }) {
   return (
     <main className="grid min-h-screen place-items-center px-5 text-center">
       <div className="max-w-sm">
-        <h1 className="font-display text-3xl">Project did not load</h1>
+        <h1 className="font-display text-3xl">Collection did not load</h1>
         <p className="mt-2 text-sm text-muted-foreground">
-          The project workspace hit a temporary issue.
+          The collection workspace hit a temporary issue.
         </p>
         <div className="mt-5 flex justify-center gap-2">
           <button type="button" onClick={reset} className="chip bg-ink text-cream">
             Try again
           </button>
           <Link to="/projects" className="chip">
-            Back to projects
+            Back to collections
           </Link>
         </div>
       </div>
@@ -92,8 +92,8 @@ function ProjectWorkspacePage() {
         setProject({
           id: "local-demo-project",
           user_id: "local-dev-user",
-          title: "Demo FotoFairy Project",
-          description: "Local-only test project for upload and sorting flow QA.",
+          title: "Demo FotoFairy Collection",
+          description: "Local-only test collection for upload and sorting flow QA.",
           created_at: new Date().toISOString(),
         });
       } else {
@@ -187,7 +187,15 @@ function ProjectWorkspacePage() {
     }
     sessionStorage.setItem("dumpdeck:activeProjectId", draft.projectId ?? projectId);
     sessionStorage.setItem("dumpdeck:activeDraftId", draft.id);
-    sessionStorage.removeItem("dumpdeck:resumeDraft");
+    try {
+      sessionStorage.setItem("dumpdeck:resumeDraft", JSON.stringify(draft.draftPayload));
+    } catch (err) {
+      console.warn("[dumpdeck] could not stage project draft payload for app fallback", {
+        error: err,
+        ...savedDraftDebugSummary(draft),
+      });
+      sessionStorage.removeItem("dumpdeck:resumeDraft");
+    }
     sessionStorage.setItem("dumpdeck:resumeDraftStage", "export");
     void navigate({ to: "/app" });
   }
@@ -240,7 +248,7 @@ function ProjectWorkspacePage() {
     return (
       <main className="grid min-h-screen place-items-center text-sm text-muted-foreground">
         <span className="inline-flex items-center gap-2">
-          <Loader2 className="h-4 w-4 animate-spin" /> Loading project…
+          <Loader2 className="h-4 w-4 animate-spin" /> Loading collection…
         </span>
       </main>
     );
@@ -251,15 +259,15 @@ function ProjectWorkspacePage() {
       <main className="grid min-h-screen place-items-center px-5 text-center">
         <div className="max-w-sm">
           <BrandMark className="mx-auto h-12 w-12" />
-          <h1 className="mt-4 font-display text-3xl">Project not found</h1>
+          <h1 className="mt-4 font-display text-3xl">Collection not found</h1>
           <p className="mt-2 text-sm text-muted-foreground">
-            {error ?? "This project may have been deleted or belongs to another account."}
+            {error ?? "This collection may have been deleted or belongs to another account."}
           </p>
           <Link
             to="/projects"
             className="mt-5 inline-flex h-11 items-center rounded-xl bg-ink px-4 font-semibold text-cream"
           >
-            Back to saved projects
+            Back to saved collections
           </Link>
         </div>
       </main>
@@ -278,13 +286,13 @@ function ProjectWorkspacePage() {
             <BrandWordmark size="text-xl" />
           </Link>
           <Link to="/projects" className="chip">
-            <ArrowLeft className="h-3 w-3" /> Projects
+            <ArrowLeft className="h-3 w-3" /> Collections
           </Link>
         </header>
 
         <section className="mt-10">
           <div className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">
-            Project workspace
+            Collection workspace
           </div>
           <h1 className="mt-1 font-display text-4xl tracking-tight">{project.title}</h1>
           {project.description && (
@@ -315,7 +323,7 @@ function ProjectWorkspacePage() {
               </div>
               <div className="p-5">
                 <div className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">
-                  Completed project
+                  Completed collection
                 </div>
                 <h2 className="mt-1 font-display text-3xl">Final draft saved</h2>
                 <div className="mt-3 flex flex-wrap gap-2">
@@ -354,7 +362,7 @@ function ProjectWorkspacePage() {
                       ) : (
                         <Copy className="h-3 w-3" />
                       )}
-                      Duplicate as new project
+                      Duplicate collection
                     </button>
                     <button type="button" onClick={openUploadFlow} className="chip">
                       <Upload className="h-3 w-3" /> Replace/add photos
@@ -377,7 +385,7 @@ function ProjectWorkspacePage() {
                 </span>
                 <div className="mt-4 font-display text-2xl">Upload photos</div>
                 <p className="mt-1 text-sm text-muted-foreground">
-                  Add or replace photos for this project.
+                  Add or replace photos for this collection.
                 </p>
               </button>
 
@@ -431,7 +439,7 @@ function ProjectWorkspacePage() {
 
           {!draftsLoading && drafts.length === 0 ? (
             <div className="rounded-2xl border border-dashed border-ink/15 bg-white/55 p-5 text-sm text-muted-foreground">
-              No saved drafts yet. Finish a sort and tap Save draft to store one here.
+              No saved drafts yet. Finish a sort and tap Save collection to store one here.
             </div>
           ) : (
             <div className="space-y-2">

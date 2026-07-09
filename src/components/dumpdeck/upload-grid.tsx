@@ -32,6 +32,7 @@ const INPUT_ACCEPT = [
 
 const HEIC_CONVERSION_QUALITY = 0.95;
 const PREVIEW_QUALITY = 0.9;
+const PREPARE_CONCURRENCY = 4;
 
 type Heic2Any = (typeof import("heic2any"))["default"];
 type HeicTo = (typeof import("heic-to"))["heicTo"];
@@ -70,6 +71,7 @@ function makePreviewUrl(img: HTMLImageElement, maxSide = 1600): Promise<string> 
 }
 
 async function readImage(file: File): Promise<UploadItem> {
+  const startedAt = performance.now();
   const fingerprint = await fingerprintFile(file);
   const source = await prepareImageSource(file);
 
@@ -79,6 +81,15 @@ async function readImage(file: File): Promise<UploadItem> {
     const img = new Image();
     img.onload = async () => {
       const previewUrl = await makePreviewUrl(img);
+      console.debug("[perf] photo prepared", {
+        name: file.name,
+        mimeType: source.mimeType,
+        originalMimeType: source.originalMimeType,
+        convertedFromHeic: source.convertedFromHeic,
+        originalBytes: file.size,
+        preparedBytes: source.blob.size,
+        previewGenerationMs: Math.round(performance.now() - startedAt),
+      });
       resolve({
         id: crypto.randomUUID(),
         url,
@@ -213,12 +224,19 @@ function friendlyDecodeError(file: File) {
 }
 
 async function fingerprintFile(file: File): Promise<string | undefined> {
+  const startedAt = performance.now();
   try {
     const buffer = await file.arrayBuffer();
     const hash = await crypto.subtle.digest("SHA-256", buffer);
-    return Array.from(new Uint8Array(hash))
+    const fingerprint = Array.from(new Uint8Array(hash))
       .map((byte) => byte.toString(16).padStart(2, "0"))
       .join("");
+    console.debug("[perf] file fingerprinted", {
+      name: file.name,
+      bytes: file.size,
+      fingerprintMs: Math.round(performance.now() - startedAt),
+    });
+    return fingerprint;
   } catch (err) {
     console.warn("[upload] Failed to fingerprint image", err);
     return undefined;
@@ -248,6 +266,7 @@ export function UploadGrid({
   const [status, setStatus] = useState("");
 
   async function handleFiles(files: FileList | File[]) {
+    const batchStartedAt = performance.now();
     const selected = Array.from(files);
     const arr = selected.filter(isSupportedPhotoFile);
     const unsupported = selected
@@ -258,24 +277,58 @@ export function UploadGrid({
     setBusy(true);
     setProgress(0);
     setStatus(`0/${arr.length} photos ready…`);
-    const out: UploadItem[] = [];
+    let completed = 0;
+    let ready = 0;
     const failed: string[] = [];
-    for (let i = 0; i < arr.length; i++) {
-      const file = arr[i];
-      try {
-        out.push(await readImage(file));
-      } catch (err) {
-        console.warn("[upload] Failed to load image", err);
-        failed.push(err instanceof Error ? err.message : `${file.name} could not be loaded.`);
+    let cursor = 0;
+    let firstPreviewMs: number | null = null;
+
+    async function worker() {
+      while (cursor < arr.length) {
+        const file = arr[cursor++];
+        const itemStartedAt = performance.now();
+        try {
+          const item = await readImage(file);
+          ready += 1;
+          if (firstPreviewMs === null) firstPreviewMs = Math.round(performance.now() - batchStartedAt);
+          onAdd([item]);
+          console.debug("[perf] upload file selection item ready", {
+            name: file.name,
+            ready,
+            total: arr.length,
+            itemMs: Math.round(performance.now() - itemStartedAt),
+          });
+        } catch (err) {
+          console.warn("[upload] Failed to load image", err);
+          failed.push(err instanceof Error ? err.message : `${file.name} could not be loaded.`);
+        } finally {
+          completed += 1;
+          setProgress(Math.round((completed / arr.length) * 100));
+          const suffix = completed === arr.length ? "" : "…";
+          setStatus(`${ready}/${arr.length} photos ready${suffix}`);
+        }
       }
-      setProgress(Math.round(((i + 1) / arr.length) * 100));
-      const suffix = out.length === arr.length ? "" : "…";
-      setStatus(`${out.length}/${arr.length} photos ready${suffix}`);
     }
-    setErrors([...unsupported, ...failed]);
-    onAdd(out);
-    setBusy(false);
-    setStatus("");
+
+    try {
+      await Promise.all(
+        Array.from({ length: Math.min(PREPARE_CONCURRENCY, arr.length) }, () => worker()),
+      );
+    } finally {
+      console.debug("[perf] upload batch prepared", {
+        totalSelected: selected.length,
+        supportedSelected: arr.length,
+        unsupported: unsupported.length,
+        ready,
+        failed: failed.length,
+        timeToFirstPreviewMs: firstPreviewMs,
+        totalFileSelectionMs: Math.round(performance.now() - batchStartedAt),
+        prepareConcurrency: PREPARE_CONCURRENCY,
+      });
+      setErrors([...unsupported, ...failed]);
+      setBusy(false);
+      setStatus("");
+    }
   }
 
   return (

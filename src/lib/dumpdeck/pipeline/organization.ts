@@ -152,9 +152,14 @@ function eventTitle(photos: Photo[]) {
   }
   if (labels.city) return hasPeople ? "City Portraits" : "City Views";
   if (labels.mountains || labels.landscape) return hasPeople ? "Scenic Portraits" : "Scenic Views";
-  if (objects[0]) return titleCase(objects[0]);
+  const specificObject = objects.find(isSpecificObjectLabel);
+  if (specificObject) return titleCase(specificObject);
   const scene = sceneKey(photos[0]);
-  return scene === "unknown" || scene === "random" ? "Single Moment" : titleCase(scene);
+  return scene === "unknown" || scene === "random"
+    ? photos.length > 1
+      ? "Similar Moment"
+      : "Photo Moment"
+    : titleCase(scene);
 }
 
 function eventDescription(photos: Photo[]) {
@@ -247,10 +252,40 @@ function objectOverlap(a: Photo, b: Photo) {
 }
 
 function meaningfulObjects(photo: Photo) {
-  const ignored = new Set(["person", "people", "human", "face", "clothing", "sky", "outdoor"]);
   return (photo.detectedObjects ?? [])
     .map((object) => object.labelNormalized)
-    .filter((label) => label && !ignored.has(label));
+    .filter((label) => label && isSpecificObjectLabel(label));
+}
+
+function isSpecificObjectLabel(label: string) {
+  const ignored = new Set([
+    "person",
+    "people",
+    "human",
+    "face",
+    "clothing",
+    "sky",
+    "outdoor",
+    "indoor",
+    "text",
+    "text box",
+    "button",
+    "icon",
+    "screen",
+    "screenshot",
+    "rectangle",
+    "circle",
+    "line",
+    "shape",
+    "document",
+    "receipt",
+    "paper",
+    "website",
+    "app",
+    "ui",
+    "unknown",
+  ]);
+  return Boolean(label) && !ignored.has(label.toLowerCase());
 }
 
 function topObjects(photos: Photo[]) {

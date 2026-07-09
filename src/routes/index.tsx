@@ -9,7 +9,7 @@ export const Route = createFileRoute("/")({
       { title: "FotoFairy" },
       {
         name: "description",
-        content: "AI-powered photo dump curator.",
+        content: "AI-powered photo collection curator.",
       },
     ],
   }),

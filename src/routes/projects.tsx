@@ -26,7 +26,7 @@ import {
 import { deleteStoredProjectPhotos, listProjectPhotoSummaries } from "@/lib/dumpdeck/storage";
 
 export const Route = createFileRoute("/projects")({
-  head: () => ({ meta: [{ title: "Your saved projects · FotoFairy" }] }),
+  head: () => ({ meta: [{ title: "Your saved collections · FotoFairy" }] }),
   errorComponent: ProjectsError,
   component: ProjectsRouteShell,
 });
@@ -61,8 +61,8 @@ function loadLocalProjects(): SavedProject[] {
     {
       id: "local-demo-project",
       user_id: "local-dev-user",
-      title: "Demo FotoFairy Project",
-      description: "Local-only test project for upload and sorting flow QA.",
+      title: "Demo FotoFairy Collection",
+      description: "Local-only test collection for upload and sorting flow QA.",
       created_at: new Date().toISOString(),
     },
   ];
@@ -74,12 +74,12 @@ function saveLocalProjects(projects: SavedProject[]) {
   localStorage.setItem(LOCAL_PROJECTS_KEY, JSON.stringify(projects));
 }
 
-function projectPersistenceErrorMessage(err: unknown, fallback = "Could not save project") {
+function projectPersistenceErrorMessage(err: unknown, fallback = "Could not save collection") {
   const message = err instanceof Error ? err.message : String(err || fallback);
   if (
     /saved_projects|schema cache|relation .* does not exist|table .* does not exist/i.test(message)
   ) {
-    return "Project storage is not set up yet. Apply the Supabase project persistence migration, then try again.";
+    return "Collection storage is not set up yet. Apply the Supabase persistence migration, then try again.";
   }
   return message || fallback;
 }
@@ -134,17 +134,25 @@ function openDraftPayload(navigate: ReturnType<typeof useNavigate>, draft: Saved
   });
   if (!draft.draftPayload?.finalOrder?.length) {
     console.warn("[dumpdeck] saved project draft cannot open", savedDraftDebugSummary(draft));
-    toast.error("This draft is missing its final photo order. Open the project and save it again.");
+    toast.error("This draft is missing its final photo order. Open the collection and save it again.");
     return;
   }
   sessionStorage.setItem("dumpdeck:activeProjectId", draft.projectId ?? "");
   sessionStorage.setItem("dumpdeck:activeDraftId", draft.id);
-  sessionStorage.removeItem("dumpdeck:resumeDraft");
+  try {
+    sessionStorage.setItem("dumpdeck:resumeDraft", JSON.stringify(draft.draftPayload));
+  } catch (err) {
+    console.warn("[dumpdeck] could not stage draft payload for app fallback", {
+      error: err,
+      ...savedDraftDebugSummary(draft),
+    });
+    sessionStorage.removeItem("dumpdeck:resumeDraft");
+  }
   sessionStorage.setItem("dumpdeck:resumeDraftStage", "export");
   void navigate({ to: "/app" });
 }
 
-async function createProjectRecord(userId: string, title = "Untitled FotoFairy Project") {
+async function createProjectRecord(userId: string, title = "Untitled FotoFairy Collection") {
   const now = new Date().toISOString();
   if (isLocalDevAuth) {
     const saved: SavedProject = {
@@ -172,9 +180,9 @@ function ProjectsError({ reset }: { reset: () => void }) {
   return (
     <main className="grid min-h-screen place-items-center px-5 text-center">
       <div className="max-w-sm">
-        <h1 className="font-display text-3xl">Projects did not load</h1>
+        <h1 className="font-display text-3xl">Collections did not load</h1>
         <p className="mt-2 text-sm text-muted-foreground">
-          We could not open your saved projects. Try again or sign back in.
+          We could not open your saved collections. Try again or sign back in.
         </p>
         <div className="mt-5 flex justify-center gap-2">
           <button type="button" onClick={reset} className="chip bg-ink text-cream">
@@ -293,10 +301,10 @@ function ProjectsPage() {
       sessionStorage.removeItem("dumpdeck:activeDraftId");
       sessionStorage.removeItem("dumpdeck:resumeDraft");
       sessionStorage.removeItem("dumpdeck:resumeDraftStage");
-      toast.success("Project created");
+      toast.success("Collection created");
       void navigate({ to: "/app" });
     } catch (err) {
-      const msg = projectPersistenceErrorMessage(err, "Could not create project");
+      const msg = projectPersistenceErrorMessage(err, "Could not create collection");
       console.error("[saved_projects] create project failed:", err);
       setError(msg);
       toast.error(msg);
@@ -310,15 +318,15 @@ function ProjectsPage() {
     setAutoCreatingFirstProject(true);
     void (async () => {
       try {
-        const project = await createProjectRecord(user.id, "My first FotoFairy Project");
+        const project = await createProjectRecord(user.id, "My first FotoFairy Collection");
         sessionStorage.setItem("dumpdeck:activeProjectId", project.id);
         sessionStorage.removeItem("dumpdeck:activeDraftId");
         sessionStorage.removeItem("dumpdeck:resumeDraft");
         sessionStorage.removeItem("dumpdeck:resumeDraftStage");
-        toast.success("Project created. Add your first photos.");
+        toast.success("Collection created. Add your first photos.");
         void navigate({ to: "/app", replace: true });
       } catch (err) {
-        const msg = projectPersistenceErrorMessage(err, "Could not create your first project");
+        const msg = projectPersistenceErrorMessage(err, "Could not create your first collection");
         console.error("[saved_projects] auto-create first project failed:", err);
         setError(msg);
         toast.error(msg);
@@ -335,7 +343,7 @@ function ProjectsPage() {
       const status = statusForProject(project, drafts);
       if (status.draftId) {
         const result = await duplicateFinalDraft(status.draftId, project.title);
-        toast.success("Project duplicated");
+        toast.success("Collection duplicated");
         await load();
         sessionStorage.setItem("dumpdeck:activeProjectId", result.projectId);
         sessionStorage.setItem("dumpdeck:activeDraftId", result.draftId);
@@ -368,11 +376,11 @@ function ProjectsPage() {
             .eq("user_id", user!.id);
         }
       }
-      toast.success("Project duplicated");
+      toast.success("Collection duplicated");
       await load();
       openProject(copy.id);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Could not duplicate project";
+      const msg = err instanceof Error ? err.message : "Could not duplicate collection";
       console.error("[saved_projects] duplicate failed:", err);
       toast.error(msg);
     } finally {
@@ -440,12 +448,12 @@ function ProjectsPage() {
           <div className="flex items-center justify-between gap-3">
             <div>
               <h1 className="font-display text-4xl tracking-tight">
-                {view === "home" ? "Start a FotoFairy" : "Saved projects"}
+                {view === "home" ? "Keep the memories. Lose the clutter." : "Saved collections"}
               </h1>
               <p className="mt-1 text-sm text-muted-foreground">
                 {view === "home"
-                  ? "Create a fresh sort or continue an existing project."
-                  : "Open, edit, duplicate, or delete your saved FotoFairy projects."}
+                  ? "Turn hundreds of photos into the ones you'll actually keep."
+                  : "Open, edit, duplicate, or delete your saved FotoFairy collections."}
               </p>
             </div>
             {view === "saved" && (
@@ -459,7 +467,7 @@ function ProjectsPage() {
                 ) : (
                   <Plus className="h-4 w-4" />
                 )}
-                New project
+                New collection
               </button>
             )}
           </div>
@@ -473,7 +481,7 @@ function ProjectsPage() {
 
         {autoCreatingFirstProject && (
           <div className="mt-6 flex items-center gap-2 rounded-2xl bg-white/70 px-4 py-3 text-sm text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin" /> Creating your first project…
+            <Loader2 className="h-4 w-4 animate-spin" /> Creating your first collection…
           </div>
         )}
 
@@ -492,9 +500,9 @@ function ProjectsPage() {
                   <Plus className="h-5 w-5" />
                 )}
               </span>
-              <div className="mt-5 font-display text-3xl">New project</div>
+              <div className="mt-5 font-display text-3xl">New collection</div>
               <p className="mt-2 text-sm text-muted-foreground">
-                Create a project and jump into the upload and sorting flow.
+                Upload your photos and let the magic begin.
               </p>
             </button>
 
@@ -506,9 +514,9 @@ function ProjectsPage() {
               <span className="grid h-12 w-12 place-items-center rounded-2xl bg-mint/60 text-ink">
                 <FolderOpen className="h-5 w-5" />
               </span>
-              <div className="mt-5 font-display text-3xl">Saved projects</div>
+              <div className="mt-5 font-display text-3xl">Saved collections</div>
               <p className="mt-2 text-sm text-muted-foreground">
-                Continue one of your {projects.length} saved project
+                Continue one of your {projects.length} saved collection
                 {projects.length === 1 ? "" : "s"}.
               </p>
             </button>
@@ -533,9 +541,9 @@ function ProjectsPage() {
 
             {!loading && projects.length === 0 && (
               <div className="glass-card rounded-2xl p-8 text-center">
-                <div className="font-display text-2xl">No saved projects yet</div>
+                <div className="font-display text-2xl">No saved collections yet</div>
                 <p className="mt-2 text-sm text-muted-foreground">
-                  Create your first FotoFairy project, then upload photos and start sorting.
+                  Create your first FotoFairy collection, then upload photos and start sorting.
                 </p>
                 <button
                   onClick={startNewProject}
@@ -547,7 +555,7 @@ function ProjectsPage() {
                   ) : (
                     <Plus className="h-4 w-4" />
                   )}
-                  Create your first project
+                  Create your first collection
                 </button>
               </div>
             )}
@@ -594,7 +602,7 @@ function ProjectsPage() {
                             </div>
                           )}
                           <div className="mt-3 flex flex-wrap items-center gap-2">
-                            <span className="chip bg-ink text-cream">Continue project</span>
+                            <span className="chip bg-ink text-cream">Open collection</span>
                             <span className="chip bg-mint/40">{status.countLabel}</span>
                             <span className="chip bg-white/80">
                               {status.hasFinalOrder ? "Final order saved" : "No final order yet"}
@@ -699,10 +707,10 @@ function DeleteProjectDialog({
         className="w-full max-w-sm rounded-3xl bg-white p-6 shadow-2xl"
       >
         <h2 id="delete-project-title" className="font-display text-2xl">
-          Delete project?
+          Delete collection?
         </h2>
         <p className="mt-2 text-sm text-muted-foreground">
-          This removes "{project.title}" from your saved projects.
+          This removes "{project.title}" from your saved collections.
         </p>
         <div className="mt-5 flex gap-2">
           <button
@@ -820,7 +828,7 @@ function ProjectForm({
         className="w-full max-w-md rounded-3xl bg-white p-6 shadow-2xl"
       >
         <div className="flex items-center justify-between">
-          <h2 className="font-display text-2xl">{initial ? "Edit project" : "New project"}</h2>
+          <h2 className="font-display text-2xl">{initial ? "Edit collection" : "New collection"}</h2>
           <button
             type="button"
             onClick={onClose}

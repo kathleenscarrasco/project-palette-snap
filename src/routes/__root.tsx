@@ -77,26 +77,26 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1, viewport-fit=cover" },
-      { title: "FotoFairy — Turn 200 photos into the perfect photo dump" },
+      { title: "FotoFairy — Turn hundreds of photos into the ones you keep" },
       {
         name: "description",
         content:
-          "AI-powered photo dump curator. Upload, narrow down, swipe, and order the perfect Instagram carousel.",
+          "AI-powered photo collection curator. Upload, narrow down, swipe, and order the perfect Instagram carousel.",
       },
       { name: "author", content: "FotoFairy" },
-      { property: "og:title", content: "FotoFairy — Turn 200 photos into the perfect photo dump" },
+      { property: "og:title", content: "FotoFairy — Turn hundreds of photos into the ones you keep" },
       {
         property: "og:description",
         content:
-          "AI-powered photo dump curator. Upload, narrow down, swipe, and order the perfect Instagram carousel.",
+          "AI-powered photo collection curator. Upload, narrow down, swipe, and order the perfect Instagram carousel.",
       },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
-      { name: "twitter:title", content: "FotoFairy — Turn 200 photos into the perfect photo dump" },
+      { name: "twitter:title", content: "FotoFairy — Turn hundreds of photos into the ones you keep" },
       {
         name: "twitter:description",
         content:
-          "AI-powered photo dump curator. Upload, narrow down, swipe, and order the perfect Instagram carousel.",
+          "AI-powered photo collection curator. Upload, narrow down, swipe, and order the perfect Instagram carousel.",
       },
     ],
     links: [

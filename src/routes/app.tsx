@@ -57,6 +57,7 @@ import {
   saveDuplicateClusterAssignments,
   savePhotoRankings,
 } from "@/lib/dumpdeck/pipeline/metadata-cache";
+import { persistProjectUploads } from "@/lib/dumpdeck/storage";
 import type {
   Photo,
   PostFormat,
@@ -76,7 +77,7 @@ import { useAuth } from "@/hooks/use-auth";
 import { isLocalDevAuth } from "@/integrations/supabase/client";
 
 const MAX_KEEP = 20;
-const LOCAL_SCAN_CONCURRENCY = 3;
+const LOCAL_SCAN_CONCURRENCY = 5;
 
 function analysisOf(photo: Photo) {
   return photo.unifiedAnalysis?.analysis;
@@ -95,6 +96,20 @@ function orderWithPinned(photos: Photo[], pinnedCoverId?: string | null) {
 
 function reasoningFor(photo: Photo) {
   return analysisOf(photo)?.reasoning ?? photo.reasons[0] ?? "";
+}
+
+function averagePhotoScore(photos: Photo[], scorer: (photo: Photo) => number) {
+  if (!photos.length) return 0;
+  return photos.reduce((sum, photo) => sum + scorer(photo), 0) / photos.length;
+}
+
+function vibeAlignmentScore(photo: Photo) {
+  return (
+    photo.ranking?.scoreBreakdown?.sceneTagMatch ??
+    photo.ranking?.scoreBreakdown?.objectTagMatch ??
+    photo.ranking?.signals?.tagMatch ??
+    photo.scores.postWorthy
+  );
 }
 
 function activeProjectId() {
@@ -139,10 +154,10 @@ function countPendingUploadItems() {
 export const Route = createFileRoute("/app")({
   head: () => ({
     meta: [
-      { title: "FotoFairy — Build your dump" },
+      { title: "FotoFairy — Build your collection" },
       {
         name: "description",
-        content: "Upload, analyze, curate, order, and export your photo dump.",
+        content: "Upload, analyze, curate, order, and export your photo collection.",
       },
     ],
   }),
@@ -277,7 +292,7 @@ function Shell() {
             projectId: activeProjectId(),
             hasSessionPayload: Boolean(raw),
           });
-          toast.error("That draft is missing photo details. Start from the saved project instead.");
+      toast.error("That draft is missing photo details. Start from the saved collection instead.");
           return;
         }
         if (cancelled) return;
@@ -328,7 +343,7 @@ function Shell() {
         <div className="max-w-sm">
           <h1 className="font-display text-3xl">Sign in to start sorting</h1>
           <p className="mt-2 text-sm text-muted-foreground">
-            Your projects and sorting sessions are saved to your account.
+            Your collections and sorting sessions are saved to your account.
           </p>
           <Link
             to="/auth"
@@ -346,9 +361,9 @@ function Shell() {
       <main className="grid min-h-screen place-items-center px-5 text-center">
         <div className="max-w-sm">
           <BrandMark className="mx-auto h-12 w-12" />
-          <h1 className="mt-4 font-display text-3xl">Choose a project first</h1>
+          <h1 className="mt-4 font-display text-3xl">Choose a collection first</h1>
           <p className="mt-2 text-sm text-muted-foreground">
-            FotoFairy saves uploads, cuts, captions, and final order under a project.
+            FotoFairy saves uploads, cuts, captions, and final order under a collection.
           </p>
           <div className="mt-5 grid gap-2">
             <button
@@ -359,7 +374,7 @@ function Shell() {
               Back to home
             </button>
             <Link to="/projects" className="chip justify-center">
-              Saved projects
+              Saved collections
             </Link>
           </div>
         </div>
@@ -409,6 +424,7 @@ function mergeDraftPhotos(
 
 function TopBar() {
   const { dispatch } = useDumpDeck();
+  const [confirmReset, setConfirmReset] = useState(false);
   return (
     <header className="flex items-center justify-between">
       <Link to="/projects" className="flex items-center gap-2">
@@ -416,15 +432,61 @@ function TopBar() {
         <BrandWordmark size="text-lg" />
       </Link>
       <button
-        onClick={() => {
-          if (confirm("Start over? Your current progress will be cleared."))
-            dispatch({ type: "reset" });
-        }}
+        onClick={() => setConfirmReset(true)}
         className="chip"
         type="button"
       >
         <RotateCcw className="h-3 w-3" /> Reset
       </button>
+      <AnimatePresence>
+        {confirmReset && (
+          <motion.div
+            className="fixed inset-0 z-50 grid place-items-center bg-ink/35 px-5 backdrop-blur-sm"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={() => setConfirmReset(false)}
+          >
+            <motion.div
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="reset-flow-title"
+              className="w-full max-w-sm rounded-3xl bg-cream p-6 text-center shadow-2xl"
+              initial={{ scale: 0.96, y: 12 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.96, y: 12 }}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <h2 id="reset-flow-title" className="font-display text-3xl">
+                Start over?
+              </h2>
+              <p className="mt-2 text-sm text-muted-foreground">
+                This clears the current in-progress sort on this device. Saved collections and
+                drafts stay in your account.
+              </p>
+              <div className="mt-6 grid gap-2 sm:grid-cols-2">
+                <button
+                  type="button"
+                  className="h-11 rounded-xl bg-white font-semibold text-ink ring-1 ring-ink/10"
+                  onClick={() => setConfirmReset(false)}
+                >
+                  Keep sorting
+                </button>
+                <button
+                  type="button"
+                  className="h-11 rounded-xl bg-coral font-semibold text-white"
+                  onClick={() => {
+                    setConfirmReset(false);
+                    dispatch({ type: "reset" });
+                  }}
+                >
+                  Reset
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </header>
   );
 }
@@ -571,7 +633,7 @@ function SetupStage() {
     },
     {
       id: "random",
-      label: "Random dump",
+      label: "Random mix",
       Icon: Shuffle,
       hint: "A little of everything",
       tile: "from-lavender to-coral/70",
@@ -1137,6 +1199,13 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function slowestStage(stages: Record<string, number>) {
+  return Object.entries(stages).reduce(
+    (slowest, [name, ms]) => (ms > slowest.ms ? { name, ms } : slowest),
+    { name: "none", ms: 0 },
+  );
+}
+
 function useAnalyzingTagline({
   items,
   photos,
@@ -1355,6 +1424,22 @@ function summarizeSkippedRows(
   return parts.join(" · ");
 }
 
+function photoAccountingSummary(
+  total: number,
+  usable: number,
+  skipped: number,
+  failed: number,
+) {
+  const accounted = usable + skipped + failed;
+  if (accounted >= total) {
+    const details = [`${usable} usable`];
+    if (skipped) details.push(`${skipped} skipped`);
+    if (failed) details.push(`${failed} failed`);
+    return `All ${total} photo${total === 1 ? "" : "s"} accounted for · ${details.join(" · ")}`;
+  }
+  return `${usable} usable photo${usable === 1 ? "" : "s"} found`;
+}
+
 function refinementSnapshot(rows: AnalysisRow[]): RefinementSnapshot {
   const skipped = rows.filter((row) => row.status === "skipped");
   return {
@@ -1429,6 +1514,7 @@ function AnalyzeStage() {
   const localScanStartedAtRef = useRef(0);
   const localScanDurationMsRef = useRef(0);
   const meaningfulReadyAtRef = useRef(0);
+  const storageUploadRef = useRef({ uploaded: 0, durationMs: 0, failed: false });
 
   useEffect(() => {
     rowsRef.current = rows;
@@ -1440,6 +1526,43 @@ function AnalyzeStage() {
       rowsRef.current = next;
       return next;
     });
+  }
+
+  function mergeStoredUploads(storedItems: UploadItem[]) {
+    const byId = new Map(storedItems.map((item) => [item.id, item] as const));
+    updateRows((current) =>
+      current.map((row) => {
+        const stored = byId.get(row.item.id);
+        if (!stored) return row;
+        const nextItem = {
+          ...row.item,
+          storageBucket: stored.storageBucket,
+          originalStoragePath: stored.originalStoragePath,
+          previewStoragePath: stored.previewStoragePath,
+          fileName: stored.fileName,
+          uploadedAt: stored.uploadedAt,
+        };
+        const nextPhoto = row.photo
+          ? {
+              ...row.photo,
+              storageBucket: stored.storageBucket,
+              originalStoragePath: stored.originalStoragePath,
+              previewStoragePath: stored.previewStoragePath,
+              fileName: stored.fileName,
+              uploadedAt: stored.uploadedAt,
+              sourceMetadata: {
+                ...row.photo.sourceMetadata,
+                storageBucket: stored.storageBucket,
+                originalStoragePath: stored.originalStoragePath,
+                previewStoragePath: stored.previewStoragePath,
+                fileName: stored.fileName,
+                uploadedAt: stored.uploadedAt,
+              },
+            }
+          : row.photo;
+        return { ...row, item: nextItem, photo: nextPhoto };
+      }),
+    );
   }
 
   const analyzedCount = rows.filter((row) => row.status === "analyzed").length;
@@ -1492,26 +1615,22 @@ function AnalyzeStage() {
 
   const progressLabel =
     phase === "preparing"
-      ? "Preparing your photo dump…"
+      ? "Preparing your collection…"
       : phase === "local-scanning"
         ? `Scanning ${Math.min(scannedCount + 1, rows.length)} of ${rows.length} photos`
       : phase === "refining" && retryingCount > 0
         ? "Taking a little longer on the best candidates…"
       : phase === "refining"
-        ? "Quick scan complete — refining top photos…"
+        ? "Picking out the hidden gems…"
       : canStartSorting
-        ? `${rows.length} photo${rows.length === 1 ? "" : "s"} scanned`
+        ? "Ready to sort!"
       : hasActiveAnalysis
         ? `Scanning ${Math.min(scannedCount + 1, rows.length)} of ${rows.length} photos`
       : failedRows.length
         ? `${failedRows.length} photo${failedRows.length === 1 ? "" : "s"} couldn't be scanned`
         : "Preparing analysis…";
   const progressDetail =
-    rows.length > 0
-      ? `${usableCount} usable photo${usableCount === 1 ? "" : "s"} found${
-          backgroundRefiningCount ? " · refining details in the background" : ""
-        }`
-      : "";
+    rows.length > 0 ? photoAccountingSummary(rows.length, usableCount, skippedRows.length, failedRows.length) : "";
   const taglinePhotos = useMemo(
     () => rows.map((row) => row.photo).filter((photo): photo is Photo => !!photo),
     [rows],
@@ -1649,6 +1768,28 @@ function AnalyzeStage() {
           status: photo.status,
           error: photo.error,
         })),
+      });
+      console.debug("[perf] upload analysis batch summary", {
+        totalPhotosSelected: items.length,
+        totalPhotosUploadedToStorage: storageUploadRef.current.uploaded,
+        totalPhotosScannedLocally: localRows.length,
+        totalPhotosSentToGemini: candidates.length,
+        totalGeminiRequests: audit.requests,
+        retries: audit.retries,
+        cacheHits: audit.cacheHits,
+        totalTimeMs: totalUploadTimeMs,
+        stages: {
+          localScanMs: localScanDurationMsRef.current,
+          geminiRefinementMs: totalRefinementTimeMs,
+          meaningfulReadyMs: meaningfulReadyTimeMs,
+          backgroundStorageUploadMs: storageUploadRef.current.durationMs,
+        },
+        slowestStage: slowestStage({
+          localScanMs: localScanDurationMsRef.current,
+          geminiRefinementMs: totalRefinementTimeMs,
+          meaningfulReadyMs: meaningfulReadyTimeMs,
+          backgroundStorageUploadMs: storageUploadRef.current.durationMs,
+        }),
       });
       logRefinementSnapshot(
         "remaining refinement work after Gemini queue settled",
@@ -2122,6 +2263,7 @@ function AnalyzeStage() {
   async function startSorting() {
     if (!canStartSorting || phase === "preparing") return;
     setPhase("preparing");
+    const sortingStartedAt = performance.now();
     try {
       const processed = rowsRef.current
         .filter((row) => row.status !== "failed" && row.status !== "skipped" && row.photo?.analysis)
@@ -2136,9 +2278,15 @@ function AnalyzeStage() {
         return;
       }
 
+      const duplicateStartedAt = performance.now();
       const { photos: clusteredPhotos } = assignDuplicateClusters(processed);
+      const duplicateDetectionMs = Math.round(performance.now() - duplicateStartedAt);
+      const rankingStartedAt = performance.now();
       const { photos: rankedPhotos } = rankPhotos(clusteredPhotos, { settings: state.settings });
+      const finalRankingMs = Math.round(performance.now() - rankingStartedAt);
+      const groupingStartedAt = performance.now();
       const { photos: out, events, collections } = organizePhotos(rankedPhotos);
+      const eventGroupingMs = Math.round(performance.now() - groupingStartedAt);
       await Promise.all([
         saveDuplicateClusterAssignments(out, imagePipelineVersion),
         savePhotoRankings(out, imagePipelineVersion),
@@ -2167,6 +2315,19 @@ function AnalyzeStage() {
           breakdown: photo.ranking?.scoreBreakdown,
           duplicateClusterId: photo.duplicateClusterId,
         })),
+      });
+      console.debug("[perf] sorting preparation summary", {
+        totalPhotosSelected: rowsRef.current.length,
+        totalPhotosScannedLocally: processed.length,
+        duplicateDetectionMs,
+        finalRankingMs,
+        eventGroupingMs,
+        totalSortingPreparationMs: Math.round(performance.now() - sortingStartedAt),
+        slowestStage: slowestStage({
+          duplicateDetectionMs,
+          finalRankingMs,
+          eventGroupingMs,
+        }),
       });
       console.debug(
         "[dumpdeck] duplicate groups",
@@ -2252,6 +2413,31 @@ function AnalyzeStage() {
       rowsRef.current = initialRows;
       setProgress(0);
       setMaxGeminiPhotos(config.maxGeminiPhotos);
+      const storageStartedAt = performance.now();
+      void persistProjectUploads(activeProjectId(), items)
+        .then((storedItems) => {
+          storageUploadRef.current = {
+            uploaded: storedItems.filter((item) => item.previewStoragePath || item.originalStoragePath)
+              .length,
+            durationMs: Math.round(performance.now() - storageStartedAt),
+            failed: false,
+          };
+          mergeStoredUploads(storedItems);
+          console.debug("[perf] background project storage upload complete", {
+            projectId: activeProjectId(),
+            totalPhotosSelected: items.length,
+            totalPhotosUploadedToStorage: storageUploadRef.current.uploaded,
+            storageUploadMs: storageUploadRef.current.durationMs,
+          });
+        })
+        .catch((err) => {
+          storageUploadRef.current = {
+            uploaded: 0,
+            durationMs: Math.round(performance.now() - storageStartedAt),
+            failed: true,
+          };
+          console.warn("[dumpdeck] background project storage upload failed", err);
+        });
       await analyzeRows(items, runId, config.analysisConcurrency);
     })();
     return () => {
@@ -2311,6 +2497,21 @@ function AnalyzeStage() {
           <div className="mx-auto mt-2 max-w-xs space-y-1 text-center text-xs leading-relaxed text-muted-foreground">
             <p>{progressDetail}</p>
             {skippedRows.length > 0 && <p>{skippedReasonSummary}</p>}
+            {accountedCount < rows.length && (
+              <p>
+                {rows.length - accountedCount} photo
+                {rows.length - accountedCount === 1 ? "" : "s"} still being checked.
+              </p>
+            )}
+          </div>
+        )}
+        {canStartSorting && backgroundRefiningCount > 0 && (
+          <div className="mt-4 rounded-2xl bg-mint/20 px-4 py-3 text-left text-xs leading-relaxed text-ink">
+            <div className="font-semibold">Your photos are ready to review.</div>
+            <p className="mt-1 text-muted-foreground">
+              You can start sorting now, or wait while FotoFairy finishes a deeper analysis that
+              may improve your results.
+            </p>
           </div>
         )}
       </div>
@@ -2357,7 +2558,7 @@ function AnalyzeStage() {
           className="h-14 w-full rounded-2xl bg-ink text-base font-semibold text-cream hover:bg-coral disabled:opacity-55"
         >
           {phase === "preparing"
-            ? "Preparing your photo dump…"
+            ? "Preparing your collection…"
             : canStartSorting
               ? failedRows.length
                 ? `Start Sorting with ${usableCount} usable photos`
@@ -2688,7 +2889,7 @@ function ResultsStage() {
       ],
     });
     dispatch({ type: "removePhoto", id: photo.id });
-    toast("Removed from this dump");
+    toast("Removed from this collection");
   }
 
   return (
@@ -3120,7 +3321,7 @@ function CurateStage() {
             onClick={continueToFinal}
             className="h-14 w-full rounded-2xl bg-ink text-base font-semibold text-cream hover:bg-coral"
           >
-            Next: Order my dump ({remaining.length}) →
+            Next: Order my collection ({remaining.length}) →
           </Button>
         </StickyAction>
       ) : (
@@ -3214,7 +3415,13 @@ function friendlyReason(r: RemovedPhoto): string {
   const cat = categorize(r);
   if (cat === "similar") return r.reason || "Too similar to another photo.";
   if (cat === "ai") {
-    if (r.reason) return r.reason.replace(/^Keep:\s*/i, "Cut because ");
+    if (/^Keep:\s*/i.test(r.reason)) {
+      const positiveSignal = r.reason.replace(/^Keep:\s*/i, "").replace(/\.$/, "").trim();
+      return positiveSignal
+        ? `Cut because stronger options ranked higher, even though this had ${positiveSignal.toLowerCase()}.`
+        : "Cut because stronger options ranked higher.";
+    }
+    if (r.reason) return r.reason;
     const reasoning = analysisOf(r.photo)?.reasoning;
     if (reasoning && !/^Keep:/i.test(reasoning)) return reasoning;
     if (/shortlist/i.test(r.reason)) return "Lower quality / sharpness score.";
@@ -3359,7 +3566,7 @@ function FinalStage() {
           score: rankingScore(photo),
         })),
       });
-      toast.success("AI ordered your post");
+      toast.success("AI ordered your collection");
     }, 700);
   }
 
@@ -3367,20 +3574,26 @@ function FinalStage() {
     <section>
       <Heading
         eyebrow="Step 6"
-        title="Your final dump"
+        title="Your final collection"
         body="Drag to reorder, or let AI build a balanced, dispersed flow."
       />
 
       <div className="mt-4 grid grid-cols-3 gap-2">
-        <ScoreBadge label="Slides" value={state.finalOrder.length / 20} />
+        <ScoreBadge
+          label="Slides"
+          value={state.finalOrder.length / 20}
+          title="How full this carousel is relative to FotoFairy's 20-slide working limit."
+        />
         <ScoreBadge
           label="Avg score"
-          value={
-            state.finalOrder.reduce((a, p) => a + rankingScore(p), 0) /
-            Math.max(1, state.finalOrder.length)
-          }
+          value={averagePhotoScore(state.finalOrder, rankingScore)}
+          title="Average final ranking score from quality, aesthetic, duplicate, and preference signals."
         />
-        <ScoreBadge label="Vibe" value={0.92} />
+        <ScoreBadge
+          label="Vibe match"
+          value={averagePhotoScore(state.finalOrder, vibeAlignmentScore)}
+          title="Average alignment with the selected vibe/tags. This is computed from ranking metadata, not a fixed score."
+        />
       </div>
 
       <Button
@@ -3389,7 +3602,7 @@ function FinalStage() {
         className="mt-5 h-12 w-full rounded-2xl bg-coral text-base font-semibold text-white shadow-lg hover:bg-coral/90"
       >
         <Wand2 className="mr-2 h-4 w-4" />
-        {ordering ? "Arranging the flow…" : "AI order my post"}
+        {ordering ? "Arranging the flow…" : "AI order my collection"}
       </Button>
 
       <div className="glass-card mt-5 rounded-3xl p-4">
@@ -3481,12 +3694,12 @@ function ExportStage() {
     if (photo) {
       dispatch({
         type: "addRemoved",
-        entries: [{ photo, reason: "Removed from final post.", source: "user" }],
+        entries: [{ photo, reason: "Removed from final collection.", source: "user" }],
       });
     }
     if (state.pinnedCoverId === id) dispatch({ type: "setPinnedCover", id: null });
     dispatch({ type: "setFinalOrder", photos: state.finalOrder.filter((p) => p.id !== id) });
-    toast("Removed from post");
+    toast("Removed from collection");
   }
 
   async function download() {
@@ -3539,7 +3752,7 @@ function ExportStage() {
       });
       sessionStorage.setItem("dumpdeck:activeDraftId", result.id);
       toast.success(
-        result.storage === "supabase" ? "Project saved" : "Saved locally only for this browser.",
+        result.storage === "supabase" ? "Collection saved" : "Saved locally only for this browser.",
       );
     } catch (err) {
       console.error("[dumpdeck] draft save failed", err);
@@ -3626,7 +3839,7 @@ function ExportStage() {
             disabled={saving || state.finalOrder.length === 0}
             className="h-12 rounded-2xl border-ink/15 bg-white/70 font-semibold"
           >
-            <Save className="mr-2 h-4 w-4" /> {saving ? "Saving…" : "Save project"}
+            <Save className="mr-2 h-4 w-4" /> {saving ? "Saving…" : "Save collection"}
           </Button>
           <Button
             variant="outline"
@@ -3639,7 +3852,7 @@ function ExportStage() {
       </div>
 
       <p className="mt-6 text-center text-xs text-muted-foreground">
-        Projects save to Supabase when signed in. Local-only saves are only used in dev mode.
+        Collections save to Supabase when signed in. Local-only saves are only used in dev mode.
       </p>
       <DebugPanel />
     </section>
@@ -3778,7 +3991,7 @@ function CaptionIdeas() {
           </span>
           <h2 className="font-display mt-2 text-2xl leading-tight">Pick a caption</h2>
           <p className="mt-1 text-xs text-muted-foreground">
-            Generated from your vibes and the tags in your final post. Tap to copy.
+            Generated from your vibes and the tags in your final collection. Tap to copy.
           </p>
         </div>
         <button

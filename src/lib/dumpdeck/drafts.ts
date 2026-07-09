@@ -118,21 +118,32 @@ export function missingDraftFields(draft: SavedFinalDraft | null | undefined) {
 }
 
 export async function saveFinalDraft(input: SaveDraftInput): Promise<SaveDraftResult> {
+  const saveStartedAt = performance.now();
   if (isLocalDevAuth) {
-    const payload = await makeDraftPayloadDurable(buildDraftPayload(input));
-    return saveLocalDraft(payload);
+    const payload = makeLocalDraftPayload(buildDraftPayload(input));
+    const result = saveLocalDraft(payload);
+    console.debug("[perf] final draft save complete", {
+      storage: "local",
+      projectId: input.projectId,
+      finalSelectedPhotos: input.finalOrder.length,
+      removedPhotos: input.removed.length,
+      finalDraftSaveMs: Math.round(performance.now() - saveStartedAt),
+    });
+    return result;
   }
 
   const { data: userData, error: userError } = await supabase.auth.getUser();
   if (userError || !userData.user) {
-    throw userError ?? new Error("Sign in before saving this project.");
+    throw userError ?? new Error("Sign in before saving this collection.");
   }
   if (!asUuid(input.projectId)) {
-    throw new Error("Choose or create a project before saving.");
+    throw new Error("Choose or create a collection before saving.");
   }
 
   const draftPhotos = uniquePhotos([...input.finalOrder, ...input.removed.map((entry) => entry.photo)]);
+  const storageStartedAt = performance.now();
   const storagePhotos = await persistFinalDraftPhotos(input.projectId, draftPhotos);
+  const storageMs = Math.round(performance.now() - storageStartedAt);
   const storageBackedInput = replaceDraftPhotos(
     {
       ...input,
@@ -171,7 +182,16 @@ export async function saveFinalDraft(input: SaveDraftInput): Promise<SaveDraftRe
       throw error;
     }
     await updateProjectSummary(input.projectId, userData.user.id, payload, String(data.id));
-
+    console.debug("[perf] final draft save complete", {
+      storage: "supabase",
+      mode: "update",
+      projectId: input.projectId,
+      draftId: data.id,
+      finalSelectedPhotos: input.finalOrder.length,
+      removedPhotos: input.removed.length,
+      storageMs,
+      finalDraftSaveMs: Math.round(performance.now() - saveStartedAt),
+    });
     return {
       id: String((data as { id: string }).id),
       storage: "supabase",
@@ -191,7 +211,16 @@ export async function saveFinalDraft(input: SaveDraftInput): Promise<SaveDraftRe
       throw error;
     }
     await updateProjectSummary(input.projectId, userData.user.id, payload, String(data.id));
-
+    console.debug("[perf] final draft save complete", {
+      storage: "supabase",
+      mode: "insert",
+      projectId: input.projectId,
+      draftId: data.id,
+      finalSelectedPhotos: input.finalOrder.length,
+      removedPhotos: input.removed.length,
+      storageMs,
+      finalDraftSaveMs: Math.round(performance.now() - saveStartedAt),
+    });
     return {
       id: String((data as { id: string }).id),
       storage: "supabase",
@@ -210,7 +239,16 @@ export async function saveFinalDraft(input: SaveDraftInput): Promise<SaveDraftRe
     throw error;
   }
   await updateProjectSummary(input.projectId, userData.user.id, payload, String(data.id));
-
+  console.debug("[perf] final draft save complete", {
+    storage: "supabase",
+    mode: "upsert",
+    projectId: input.projectId,
+    draftId: data.id,
+    finalSelectedPhotos: input.finalOrder.length,
+    removedPhotos: input.removed.length,
+    storageMs,
+    finalDraftSaveMs: Math.round(performance.now() - saveStartedAt),
+  });
   return {
     id: String((data as { id: string }).id),
     storage: "supabase",
@@ -270,7 +308,10 @@ export async function listFinalDrafts(projectId?: string | null): Promise<SavedF
   if (isLocalDevAuth) return listLocalDrafts(projectId);
 
   const { data: userData, error: userError } = await supabase.auth.getUser();
-  if (userError || !userData.user) return listLocalDrafts(projectId);
+  if (userError || !userData.user) {
+    console.warn("[dumpdeck] Supabase draft list skipped; user is not authenticated", userError);
+    return [];
+  }
 
   let query = supabase
     .from(DRAFTS_TABLE)
@@ -284,8 +325,8 @@ export async function listFinalDrafts(projectId?: string | null): Promise<SavedF
 
   const { data, error } = await query;
   if (error) {
-    console.warn("[dumpdeck] Supabase draft list failed; falling back to local drafts", error);
-    return listLocalDrafts(projectId);
+    console.warn("[dumpdeck] Supabase draft list failed", error);
+    throw error;
   }
   return hydrateStoredDrafts(((data ?? []) as DraftRow[]).map(normalizeDraftRow));
 }
@@ -323,7 +364,9 @@ export async function duplicateFinalDraft(
   if (isLocalDevAuth) return duplicateLocalDraft(draftId, projectTitle);
 
   const { data: userData, error: userError } = await supabase.auth.getUser();
-  if (userError || !userData.user) return duplicateLocalDraft(draftId, projectTitle);
+  if (userError || !userData.user) {
+    throw userError ?? new Error("Sign in before duplicating this collection.");
+  }
 
   const { data: draft, error: draftError } = await supabase
     .from(DRAFTS_TABLE)
@@ -345,7 +388,7 @@ export async function duplicateFinalDraft(
     })
     .select("id")
     .single();
-  if (projectError || !project) throw projectError ?? new Error("Could not duplicate project");
+  if (projectError || !project) throw projectError ?? new Error("Could not duplicate collection");
 
   const projectId = String((project as { id: string }).id);
   const source = draft as DraftRow;
@@ -525,12 +568,85 @@ function saveLocalDraft(payload: FinalDraftPayload): SaveDraftResult {
   const id = payload.draftId ?? payload.projectId ?? `local-draft-${Date.now()}`;
   const drafts = loadLocalDrafts();
   drafts[id] = { ...payload, id };
-  localStorage.setItem(LOCAL_DRAFTS_KEY, JSON.stringify(drafts));
+  try {
+    localStorage.setItem(LOCAL_DRAFTS_KEY, JSON.stringify(drafts));
+  } catch (error) {
+    console.warn("[dumpdeck] local draft fallback was too large; saving manifest only", error);
+    const compact = makeCompactLocalDraftPayload({ ...payload, draftId: id });
+    localStorage.setItem(
+      LOCAL_DRAFTS_KEY,
+      JSON.stringify({
+        ...loadLocalDrafts(),
+        [id]: { ...compact, id },
+      }),
+    );
+  }
   return {
     id,
     storage: "local",
     updatedAt: payload.updatedAt,
   };
+}
+
+function makeLocalDraftPayload(payload: FinalDraftPayload): FinalDraftPayload {
+  return {
+    ...payload,
+    uploadedPhotos: payload.uploadedPhotos.map(stripLargeInlinePhotoUrls),
+    finalOrder: payload.finalOrder.map(stripLargeInlinePhotoUrls),
+    removed: payload.removed.map((entry) => ({
+      ...entry,
+      photo: stripLargeInlinePhotoUrls(entry.photo),
+    })),
+  };
+}
+
+function makeCompactLocalDraftPayload(payload: FinalDraftPayload): FinalDraftPayload {
+  const compactPhoto = (photo: Photo) => ({
+    ...stripLargeInlinePhotoUrls(photo),
+    analysis: photo.analysis,
+    unifiedAnalysis: photo.unifiedAnalysis,
+    ranking: photo.ranking,
+    sourceMetadata: {
+      ...photo.sourceMetadata,
+      originalFileUrl: stripLargeInlineUrl(photo.sourceMetadata?.originalFileUrl),
+      previewFileUrl: stripLargeInlineUrl(photo.sourceMetadata?.previewFileUrl),
+    },
+  });
+  const finalOrder = payload.finalOrder.map(compactPhoto);
+  const removed = payload.removed.map((entry) => ({ ...entry, photo: compactPhoto(entry.photo) }));
+  const byId = new Map<string, Photo>();
+  for (const photo of finalOrder) byId.set(photo.id, photo);
+  for (const entry of removed) byId.set(entry.photo.id, entry.photo);
+  return {
+    ...payload,
+    uploadedPhotos: Array.from(byId.values()),
+    finalOrder,
+    removed,
+  };
+}
+
+function stripLargeInlinePhotoUrls(photo: Photo): Photo {
+  const url = stripLargeInlineUrl(photo.url) ?? "";
+  const previewUrl = stripLargeInlineUrl(photo.previewUrl);
+  const previewFileUrl = stripLargeInlineUrl(photo.previewFileUrl);
+  const originalFileUrl = stripLargeInlineUrl(photo.originalFileUrl);
+  return {
+    ...photo,
+    url,
+    previewUrl,
+    previewFileUrl,
+    originalFileUrl,
+    sourceMetadata: {
+      ...photo.sourceMetadata,
+      originalFileUrl: stripLargeInlineUrl(photo.sourceMetadata?.originalFileUrl),
+      previewFileUrl: stripLargeInlineUrl(photo.sourceMetadata?.previewFileUrl),
+    },
+  };
+}
+
+function stripLargeInlineUrl(url: string | undefined) {
+  if (!url) return url;
+  return url.startsWith("data:") ? undefined : url;
 }
 
 function loadLocalDrafts() {
@@ -619,7 +735,12 @@ function duplicateLocalDraft(
     updatedAt: now,
   };
   drafts[nextDraftId] = payload;
-  localStorage.setItem(LOCAL_DRAFTS_KEY, JSON.stringify(drafts));
+  try {
+    localStorage.setItem(LOCAL_DRAFTS_KEY, JSON.stringify(drafts));
+  } catch {
+    drafts[nextDraftId] = makeCompactLocalDraftPayload(payload as FinalDraftPayload);
+    localStorage.setItem(LOCAL_DRAFTS_KEY, JSON.stringify(drafts));
+  }
 
   const projectsRaw = localStorage.getItem("dumpdeck:dev-projects");
   const projects = projectsRaw ? (JSON.parse(projectsRaw) as unknown[]) : [];

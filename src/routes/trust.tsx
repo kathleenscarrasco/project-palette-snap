@@ -41,51 +41,70 @@ function TrustPage() {
         </h1>
         <p className="mt-3 text-sm text-muted-foreground">
           This page is maintained by the FotoFairy team to answer common security and privacy
-          questions about the app. It describes our current practices and is editable project
-          content — not an independent certification or audit result.
+          questions about the app. It describes our current practices — not an independent
+          certification or audit result.
         </p>
 
         <Section title="What FotoFairy does">
           <p>
-            FotoFairy is a photo curation tool that helps you select and order images for a photo
-            dump. Photos you upload are processed in your browser for the curation flow.
+            FotoFairy helps you curate camera-roll batches into a cleaner final collection. The app
+            runs fast local checks in your browser, then may use server-side AI analysis to improve
+            scene understanding, duplicate handling, ranking, captions, and final order.
           </p>
         </Section>
 
         <Section title="Access & authentication">
           <p>
-            The core curation flow does not require an account. The shared todos demo page is
-            intentionally public — anyone with the link can read and edit it. We will note clearly
-            on any future feature whether sign-in is required.
+            FotoFairy currently requires a Supabase Auth account for private collections. Email
+            confirmation, magic links, and password reset links are handled through Supabase Auth.
+            Auth emails should point back to FotoFairy&apos;s <code>/auth/callback</code> route, not
+            to localhost in production.
           </p>
         </Section>
 
         <Section title="Data we store">
           <p>
-            Items you add to the public shared list (task text and completion state) are stored in
-            our database. We do not collect names, emails, or payment information for the current
-            features.
+            For saved collections, FotoFairy stores project metadata, uploaded photo records,
+            analysis metadata, duplicate/group decisions, removed/restored states, final ordering,
+            pinned cover photo, captions, and selected preferences. This lets you leave and come
+            back without losing a completed draft.
+          </p>
+          <p>
+            Photo files are stored in a private Supabase Storage bucket. Database rows store storage
+            paths and metadata; display URLs are generated as fresh signed URLs when you reopen a
+            collection.
+          </p>
+        </Section>
+
+        <Section title="AI processing">
+          <p>
+            FotoFairy uses local/browser analysis first where possible. When deeper analysis is
+            needed, images or optimized previews may be sent to the server-side Gemini pipeline. API
+            keys stay on the server and should never be exposed to the browser.
           </p>
         </Section>
 
         <Section title="Cookies & analytics">
           <p>
-            FotoFairy does not set marketing cookies. Essential storage may be used to keep the app
-            working in your browser.
+            FotoFairy uses essential browser storage for sign-in state and short-lived workflow
+            handoff state. Local browser storage is not treated as the permanent source of truth for
+            saved collections.
           </p>
         </Section>
 
         <Section title="Retention & deletion">
           <p>
-            Public shared list items remain until someone deletes them from the app. For deletion
-            requests related to anything else, contact us using the address below.
+            Saved collection rows remain until you delete them. Deleting a collection should remove
+            the associated database records and request cleanup of associated private Storage
+            objects. Older drafts with missing photo files may show a specific fallback message
+            rather than silently restarting the flow.
           </p>
         </Section>
 
         <Section title="Security contact">
           <p>
-            To report a security or privacy concern, please open an issue from the project page or
-            contact the maintainer listed there. We will respond as soon as we are able.
+            To report a security or privacy concern, contact the FotoFairy maintainer through the
+            project repository or support channel. We will respond as soon as we are able.
           </p>
         </Section>
       </div>

@@ -17,14 +17,14 @@ function AuthError({ reset }: { reset: () => void }) {
       <div className="max-w-sm">
         <h1 className="font-display text-3xl">Sign-in hit a snag</h1>
         <p className="mt-2 text-sm text-muted-foreground">
-          Try again, or head back to your projects if you are already signed in.
+          Try again, or head back to your collections if you are already signed in.
         </p>
         <div className="mt-5 flex justify-center gap-2">
           <button type="button" onClick={reset} className="chip bg-ink text-cream">
             Try again
           </button>
           <Link to="/projects" className="chip">
-            Projects
+            Collections
           </Link>
         </div>
       </div>
@@ -47,7 +47,7 @@ function AuthPage() {
     if (!isAuthed) return;
     if (mode === "reset") return;
     if (mode === "verified") {
-      setNotice("Email confirmed. Opening your projects…");
+      setNotice("Email confirmed. Opening your collections…");
       window.setTimeout(() => void navigate({ to: "/projects", replace: true }), 900);
       return;
     }
@@ -67,7 +67,7 @@ function AuthPage() {
             to="/projects"
             className="mt-5 inline-flex h-11 items-center rounded-xl bg-ink px-4 font-semibold text-cream"
           >
-            Open projects
+            Open collections
           </Link>
         </div>
       </main>
@@ -288,7 +288,7 @@ function titleForMode(mode: AuthMode) {
 }
 
 function subtitleForMode(mode: AuthMode) {
-  if (mode === "signup") return "Sign up, confirm your email, then your projects stay with you.";
+  if (mode === "signup") return "Sign up, confirm your email, then your collections stay with you.";
   if (mode === "forgot") return "We will send a secure reset link to your inbox.";
   if (mode === "reset") return "Enter your new password to finish recovering your account.";
   if (mode === "magic") return "No password needed. Supabase will email you a one-time link.";

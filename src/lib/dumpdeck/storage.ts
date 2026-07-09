@@ -4,6 +4,9 @@ import type { Photo, RemovedPhoto, UploadItem } from "./types";
 
 export const DUMPDECK_PHOTOS_BUCKET = "dumpdeck-photos";
 const SIGNED_URL_TTL_SECONDS = 60 * 60 * 24;
+const STORAGE_UPLOAD_CONCURRENCY = 4;
+const STORAGE_MAX_IMAGE_SIDE = 2048;
+const STORAGE_JPEG_QUALITY = 0.9;
 
 type StoredPhotoRow = {
   id: string;
@@ -47,10 +50,24 @@ export async function persistProjectUploads(
   const userId = userData.user.id;
   const stored: UploadItem[] = [];
 
-  for (let index = 0; index < items.length; index++) {
-    const item = items[index];
-    const originalBlob = await blobFromUrl(item.originalFileUrl ?? item.url);
-    const previewBlob = await blobFromUrl(item.previewUrl ?? item.previewFileUrl ?? item.url);
+  const startedAt = performance.now();
+  const results = await mapWithConcurrency(items, STORAGE_UPLOAD_CONCURRENCY, async (item) => {
+    const itemStartedAt = performance.now();
+    const originalSourceUrl = item.convertedFromHeic
+      ? item.previewUrl ?? item.previewFileUrl ?? item.url
+      : item.originalFileUrl ?? item.url;
+    const originalBlobRaw = await blobFromUrl(originalSourceUrl);
+    const previewBlobRaw = await blobFromUrl(item.previewUrl ?? item.previewFileUrl ?? item.url);
+    const originalBlob = await optimizeImageBlob(originalBlobRaw, {
+      maxSide: STORAGE_MAX_IMAGE_SIDE,
+      quality: STORAGE_JPEG_QUALITY,
+      label: `${item.name}:original`,
+    });
+    const previewBlob = await optimizeImageBlob(previewBlobRaw, {
+      maxSide: 1600,
+      quality: STORAGE_JPEG_QUALITY,
+      label: `${item.name}:preview`,
+    });
     const originalExt = extensionForMime(
       item.originalMimeType ?? originalBlob.type ?? item.mimeType,
       item.name,
@@ -90,13 +107,26 @@ export async function persistProjectUploads(
       previewBlob,
       uploadedAt,
     });
-    stored.push(next);
-  }
+    console.debug("[perf] storage upload item complete", {
+      projectId,
+      id: item.id,
+      name: item.name,
+      convertedFromHeic: item.convertedFromHeic,
+      originalBytes: originalBlobRaw.size,
+      storedOriginalBytes: originalBlob.size,
+      previewBytes: previewBlob.size,
+      storageUploadMs: Math.round(performance.now() - itemStartedAt),
+    });
+    return next;
+  });
+  stored.push(...results);
 
   console.debug("[dumpdeck] uploaded photos to Supabase Storage", {
     projectId,
     bucket: DUMPDECK_PHOTOS_BUCKET,
     count: stored.length,
+    storageUploadTotalMs: Math.round(performance.now() - startedAt),
+    storageUploadConcurrency: STORAGE_UPLOAD_CONCURRENCY,
     paths: stored.map((item) => ({
       id: item.id,
       originalStoragePath: item.originalStoragePath,
@@ -120,77 +150,121 @@ export async function persistFinalDraftPhotos(
 
   const userId = userData.user.id;
   const stored = new Map<string, Photo>();
+  const startedAt = performance.now();
 
-  for (const photo of byId.values()) {
-    if (photo.sourceMetadata?.previewStoragePath || photo.previewStoragePath) {
-      stored.set(photo.id, photo);
-      continue;
-    }
+  const results = await mapWithConcurrency(
+    Array.from(byId.values()),
+    STORAGE_UPLOAD_CONCURRENCY,
+    async (photo) => {
+      const itemStartedAt = performance.now();
+      if (photo.sourceMetadata?.previewStoragePath || photo.previewStoragePath) {
+        console.debug("[perf] storage upload skipped existing photo", {
+          projectId,
+          id: photo.id,
+          name: photo.name,
+        });
+        return photo;
+      }
 
-    const sourceUrl = photo.originalFileUrl ?? photo.sourceMetadata?.originalFileUrl ?? photo.url;
-    const previewUrl =
-      photo.previewUrl ?? photo.previewFileUrl ?? photo.sourceMetadata?.previewFileUrl ?? photo.url;
-    const originalBlob = await blobFromUrl(sourceUrl);
-    const previewBlob = await blobFromUrl(previewUrl);
-    const originalMimeType =
-      photo.sourceMetadata?.originalMimeType ?? originalBlob.type ?? photo.sourceMetadata?.mimeType;
-    const previewMimeType =
-      photo.sourceMetadata?.mimeType ?? previewBlob.type ?? originalMimeType ?? "image/jpeg";
-    const originalExt = extensionForMime(originalMimeType, photo.name);
-    const previewExt = extensionForMime(previewMimeType, "preview.jpg");
-    const basePath = `${userId}/${projectId}/${photo.id}`;
-    const originalPath = `${basePath}/original.${originalExt}`;
-    const previewPath = `${basePath}/preview.${previewExt}`;
+      const convertedFromHeic =
+        photo.sourceMetadata?.convertedFromHeic || /\.(heic|heif)$/i.test(photo.name);
+      const sourceUrl = photo.originalFileUrl ?? photo.sourceMetadata?.originalFileUrl ?? photo.url;
+      const previewUrl =
+        photo.previewUrl ??
+        photo.previewFileUrl ??
+        photo.sourceMetadata?.previewFileUrl ??
+        photo.url;
+      const originalSourceUrl = convertedFromHeic ? previewUrl : sourceUrl;
+      const originalBlobRaw = await blobFromUrl(originalSourceUrl);
+      const previewBlobRaw = await blobFromUrl(previewUrl);
+      const originalBlob = await optimizeImageBlob(originalBlobRaw, {
+        maxSide: STORAGE_MAX_IMAGE_SIDE,
+        quality: STORAGE_JPEG_QUALITY,
+        label: `${photo.name}:draft-original`,
+      });
+      const previewBlob = await optimizeImageBlob(previewBlobRaw, {
+        maxSide: 1600,
+        quality: STORAGE_JPEG_QUALITY,
+        label: `${photo.name}:draft-preview`,
+      });
+      const originalMimeType =
+        convertedFromHeic
+          ? originalBlob.type || "image/jpeg"
+          : photo.sourceMetadata?.originalMimeType ??
+            originalBlob.type ??
+            photo.sourceMetadata?.mimeType;
+      const previewMimeType =
+        photo.sourceMetadata?.mimeType ?? previewBlob.type ?? originalMimeType ?? "image/jpeg";
+      const originalExt = extensionForMime(originalMimeType, photo.name);
+      const previewExt = extensionForMime(previewMimeType, "preview.jpg");
+      const basePath = `${userId}/${projectId}/${photo.id}`;
+      const originalPath = `${basePath}/original.${originalExt}`;
+      const previewPath = `${basePath}/preview.${previewExt}`;
 
-    await uploadObject(originalPath, originalBlob, originalMimeType);
-    await uploadObject(previewPath, previewBlob, previewMimeType);
+      await uploadObject(originalPath, originalBlob, originalMimeType);
+      await uploadObject(previewPath, previewBlob, previewMimeType);
 
-    const signed = await signedUrlsForPaths([originalPath, previewPath]);
-    const originalSignedUrl = signed.get(originalPath) ?? sourceUrl;
-    const previewSignedUrl = signed.get(previewPath) ?? previewUrl;
-    const uploadedAt = new Date().toISOString();
-    const next: Photo = {
-      ...photo,
-      url: previewSignedUrl,
-      originalFileUrl: originalSignedUrl,
-      previewFileUrl: previewSignedUrl,
-      previewUrl: previewSignedUrl,
-      storageBucket: DUMPDECK_PHOTOS_BUCKET,
-      originalStoragePath: originalPath,
-      previewStoragePath: previewPath,
-      fileName: photo.name,
-      uploadedAt,
-      sourceMetadata: {
-        ...photo.sourceMetadata,
+      const signed = await signedUrlsForPaths([originalPath, previewPath]);
+      const originalSignedUrl = signed.get(originalPath) ?? sourceUrl;
+      const previewSignedUrl = signed.get(previewPath) ?? previewUrl;
+      const uploadedAt = new Date().toISOString();
+      const next: Photo = {
+        ...photo,
+        url: previewSignedUrl,
+        originalFileUrl: originalSignedUrl,
+        previewFileUrl: previewSignedUrl,
+        previewUrl: previewSignedUrl,
         storageBucket: DUMPDECK_PHOTOS_BUCKET,
         originalStoragePath: originalPath,
         previewStoragePath: previewPath,
         fileName: photo.name,
         uploadedAt,
-        originalMimeType,
-        mimeType: previewMimeType,
-        originalFileUrl: originalSignedUrl,
-        previewFileUrl: previewSignedUrl,
-      },
-    };
+        sourceMetadata: {
+          ...photo.sourceMetadata,
+          storageBucket: DUMPDECK_PHOTOS_BUCKET,
+          originalStoragePath: originalPath,
+          previewStoragePath: previewPath,
+          fileName: photo.name,
+          uploadedAt,
+          originalMimeType,
+          mimeType: previewMimeType,
+          originalFileUrl: originalSignedUrl,
+          previewFileUrl: previewSignedUrl,
+        },
+      };
 
-    await upsertStoredPhoto({
-      item: next,
-      userId,
-      projectId,
-      originalPath,
-      previewPath,
-      originalBlob,
-      previewBlob,
-      uploadedAt,
-    });
-    stored.set(photo.id, next);
-  }
+      await upsertStoredPhoto({
+        item: next,
+        userId,
+        projectId,
+        originalPath,
+        previewPath,
+        originalBlob,
+        previewBlob,
+        uploadedAt,
+      });
+      console.debug("[perf] final draft storage item complete", {
+        projectId,
+        id: photo.id,
+        name: photo.name,
+        convertedFromHeic,
+        sourceBytes: originalBlobRaw.size,
+        storedOriginalBytes: originalBlob.size,
+        previewBytes: previewBlob.size,
+        storageUploadMs: Math.round(performance.now() - itemStartedAt),
+      });
+      return next;
+    },
+  );
+
+  for (const photo of results) stored.set(photo.id, photo);
 
   console.debug("[dumpdeck] saved final draft photos to Supabase Storage", {
     projectId,
     bucket: DUMPDECK_PHOTOS_BUCKET,
     count: stored.size,
+    storageUploadTotalMs: Math.round(performance.now() - startedAt),
+    storageUploadConcurrency: STORAGE_UPLOAD_CONCURRENCY,
     paths: Array.from(stored.values()).map((photo) => ({
       id: photo.id,
       originalStoragePath: photo.originalStoragePath,
@@ -203,6 +277,7 @@ export async function persistFinalDraftPhotos(
 
 export async function hydrateStoredDrafts(drafts: SavedFinalDraft[]): Promise<SavedFinalDraft[]> {
   if (isLocalDevAuth || !drafts.length) return drafts;
+  const startedAt = performance.now();
   const projectIds = Array.from(
     new Set(drafts.map((draft) => draft.projectId).filter((id): id is string => Boolean(id))),
   );
@@ -254,12 +329,14 @@ export async function hydrateStoredDrafts(drafts: SavedFinalDraft[]): Promise<Sa
       signedUrlsLoaded:
         draft.draftPayload?.finalOrder.filter((photo) => photo.previewUrl || photo.url).length ?? 0,
     })),
+    signedUrlGenerationMs: Math.round(performance.now() - startedAt),
   });
   return hydrated;
 }
 
 export async function listProjectPhotoSummaries(): Promise<Map<string, ProjectPhotoSummary>> {
   if (isLocalDevAuth) return new Map();
+  const startedAt = performance.now();
   const { data: userData, error: userError } = await supabase.auth.getUser();
   if (userError || !userData.user) return new Map();
 
@@ -296,6 +373,12 @@ export async function listProjectPhotoSummaries(): Promise<Map<string, ProjectPh
       firstPhotoUrl: existing?.firstPhotoUrl ?? url,
     });
   }
+  console.debug("[perf] project photo summaries loaded", {
+    projects: summaries.size,
+    rows: rows.length,
+    signedUrlsGenerated: signed.size,
+    signedUrlGenerationMs: Math.round(performance.now() - startedAt),
+  });
   return summaries;
 }
 
@@ -416,6 +499,7 @@ async function upsertStoredPhoto({
   previewBlob: Blob;
   uploadedAt: string;
 }) {
+  const startedAt = performance.now();
   const row = {
     id: item.id,
     user_id: userId,
@@ -455,6 +539,11 @@ async function upsertStoredPhoto({
     .from("saved_project_photos")
     .upsert(row, { onConflict: "project_id,id" });
   if (error) throw error;
+  console.debug("[perf] saved_project_photos upsert complete", {
+    projectId,
+    photoId: item.id,
+    upsertMs: Math.round(performance.now() - startedAt),
+  });
 }
 
 function sourceMimeType(item: PersistablePhoto) {
@@ -543,6 +632,79 @@ async function signedUrlsForPaths(paths: string[]) {
     if (item.path && item.signedUrl) signed.set(item.path, item.signedUrl);
   }
   return signed;
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>,
+) {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  async function run() {
+    while (cursor < items.length) {
+      const index = cursor++;
+      results[index] = await worker(items[index], index);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, () => run()));
+  return results;
+}
+
+async function optimizeImageBlob(
+  blob: Blob,
+  {
+    maxSide,
+    quality,
+    label,
+  }: {
+    maxSide: number;
+    quality: number;
+    label: string;
+  },
+) {
+  if (!/^image\/(jpeg|jpg|png|webp)$/i.test(blob.type)) return blob;
+  if (typeof document === "undefined") return blob;
+  const url = URL.createObjectURL(blob);
+  const startedAt = performance.now();
+  try {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error("Could not decode image for storage optimization."));
+      image.src = url;
+    });
+    const largestSide = Math.max(img.naturalWidth, img.naturalHeight);
+    if (largestSide <= maxSide && blob.size < 1_500_000) return blob;
+    const scale = Math.min(1, maxSide / largestSide);
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+    canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return blob;
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    const optimized = await new Promise<Blob | null>((resolve) =>
+      canvas.toBlob(resolve, "image/jpeg", quality),
+    );
+    if (!optimized) return blob;
+    console.debug("[perf] storage image optimized", {
+      label,
+      originalType: blob.type,
+      originalBytes: blob.size,
+      optimizedBytes: optimized.size,
+      width: canvas.width,
+      height: canvas.height,
+      maxSide,
+      quality,
+      optimizeMs: Math.round(performance.now() - startedAt),
+    });
+    return optimized;
+  } catch (err) {
+    console.warn("[dumpdeck] storage image optimization skipped", { label, error: err });
+    return blob;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
 }
 
 async function blobFromUrl(url: string): Promise<Blob> {

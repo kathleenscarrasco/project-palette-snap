@@ -74,7 +74,7 @@ function AuthCallbackPage() {
             status: "success",
             message: isPasswordReset
               ? "Email confirmed! Taking you to reset your password…"
-              : "Email confirmed! Taking you to your projects…",
+              : "Email confirmed! Taking you to your collections…",
             destination,
           });
         }
