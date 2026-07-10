@@ -773,7 +773,52 @@ export function aiOrder(
     ordered.push(chosen);
   }
   if (finale) ordered.push(finale);
-  return ordered;
+  return spreadPeoplePhotos(ordered);
+}
+
+function spreadPeoplePhotos(photos: Photo[]) {
+  if (photos.length < 5) return photos;
+  const isPeoplePhoto = (photo: Photo) =>
+    peopleWeight(photo) > 0.1 || categoryKey(photo) === "people" || categoryKey(photo) === "group";
+  const peopleTotal = photos.filter(isPeoplePhoto).length;
+  if (peopleTotal <= 1 || peopleTotal === photos.length) return photos;
+
+  const lockedFirst = photos[0];
+  const lockedLast = photos.length > 6 ? photos[photos.length - 1] : null;
+  const middle = photos.slice(1, lockedLast ? -1 : undefined);
+  const peopleQueue = middle.filter(isPeoplePhoto);
+  const nonPeopleQueue = middle.filter((photo) => !isPeoplePhoto(photo));
+  const output = [lockedFirst];
+  let peopleUsed = isPeoplePhoto(lockedFirst) ? 1 : 0;
+  const reservedLastPeople = lockedLast && isPeoplePhoto(lockedLast) ? 1 : 0;
+  const totalSlots = photos.length;
+  const lastSlotIndex = lockedLast ? totalSlots - 1 : totalSlots;
+
+  for (let slot = 1; slot < lastSlotIndex; slot++) {
+    const recent = output.slice(-2);
+    const recentPeople = recent.filter(isPeoplePhoto).length;
+    const targetPeopleThroughSlot = Math.floor(((slot + 1) * peopleTotal) / totalSlots + 0.2);
+    const remainingMiddleSlots = lastSlotIndex - slot;
+    const peopleStillNeeded = peopleTotal - reservedLastPeople - peopleUsed;
+    const mustUsePeopleSoon = peopleStillNeeded >= remainingMiddleSlots - nonPeopleQueue.length + 1;
+    const wantsPeople =
+      peopleQueue.length > 0 &&
+      (peopleUsed < targetPeopleThroughSlot || mustUsePeopleSoon) &&
+      (recentPeople === 0 || mustUsePeopleSoon || nonPeopleQueue.length === 0);
+
+    if (wantsPeople) {
+      output.push(peopleQueue.shift()!);
+      peopleUsed += 1;
+    } else if (nonPeopleQueue.length > 0) {
+      output.push(nonPeopleQueue.shift()!);
+    } else if (peopleQueue.length > 0) {
+      output.push(peopleQueue.shift()!);
+      peopleUsed += 1;
+    }
+  }
+
+  if (lockedLast) output.push(lockedLast);
+  return output;
 }
 
 function seededJitter(id: string, slot: number) {

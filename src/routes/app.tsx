@@ -1765,9 +1765,9 @@ function AnalyzeStage() {
     phase === "preparing"
       ? "Preparing your collection…"
       : scanState.complete
-        ? `${scanState.totalCount} photo${scanState.totalCount === 1 ? "" : "s"} scanned`
+        ? `Scanned ${scanState.totalCount} of ${scanState.totalCount} photo${scanState.totalCount === 1 ? "" : "s"}`
         : scanState.totalCount > 0
-          ? `Scanning ${scanState.scannedCount} of ${scanState.totalCount} photos`
+          ? `Scanned ${scanState.scannedCount}/${scanState.totalCount} photos`
           : failedRows.length
             ? `${failedRows.length} photo${failedRows.length === 1 ? "" : "s"} couldn't be scanned`
             : retryingCount > 0
