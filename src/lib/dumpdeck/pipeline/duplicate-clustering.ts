@@ -50,12 +50,19 @@ export function assignDuplicateClusters(
       const embeddingSimilarity = a && b && a.length === b.length ? cosineSimilarity(a, b) : 0;
       const visuallyNearIdentical =
         metadata.pixel >= 0.9 && metadata.composition >= 0.88 && metadata.crop >= 0.92;
+      const sameBurstMoment =
+        timeDistance(items[i].photo, items[j].photo) <= 1000 * 60 * 10 &&
+        metadata.pixel >= 0.82 &&
+        metadata.composition >= 0.75 &&
+        metadata.people >= 0.7 &&
+        metadata.scene >= 0.62;
       if (
         isExactDuplicate(items[i].photo, items[j].photo) ||
         (visuallyNearIdentical &&
           embeddingSimilarity >= threshold &&
           metadata.score >= NEAR_DUPLICATE_SCORE_THRESHOLD.strict) ||
-        (visuallyNearIdentical && metadata.score >= NEAR_DUPLICATE_SCORE_THRESHOLD[sensitivity])
+        (visuallyNearIdentical && metadata.score >= NEAR_DUPLICATE_SCORE_THRESHOLD[sensitivity]) ||
+        sameBurstMoment
       ) {
         union(parent, i, j);
       }
@@ -274,9 +281,23 @@ function duplicateReason(photos: Photo[]) {
   if (sim.crop >= 0.92) reasons.push("same crop/aspect");
   if (sim.people >= 0.75) reasons.push("same face count/layout");
   if (sim.objects >= 0.55) reasons.push("same main objects");
+  if (timeSpanMinutes(photos) <= 10) reasons.push("captured within the same burst");
   return reasons.length
     ? `Grouped by ${reasons.join(", ")}.`
     : "Grouped by conservative duplicate confidence.";
+}
+
+function timeDistance(a: Photo, b: Photo) {
+  const aTime = a.lastModified ?? 0;
+  const bTime = b.lastModified ?? 0;
+  if (!aTime || !bTime) return Number.POSITIVE_INFINITY;
+  return Math.abs(aTime - bTime);
+}
+
+function timeSpanMinutes(photos: Photo[]) {
+  const times = photos.map((photo) => photo.lastModified).filter(Boolean) as number[];
+  if (times.length < 2) return Number.POSITIVE_INFINITY;
+  return (Math.max(...times) - Math.min(...times)) / 60000;
 }
 
 function groupConfidence(photos: Photo[]) {
