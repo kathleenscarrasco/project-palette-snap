@@ -1547,6 +1547,7 @@ type CanonicalScanState = {
   usableCount: number;
   skippedCount: number;
   reviewNeededCount: number;
+  deepReviewedCount: number;
   scannedCount: number;
   pendingCount: number;
   complete: boolean;
@@ -1561,6 +1562,7 @@ function buildCanonicalScanState(rows: AnalysisRow[]): CanonicalScanState {
       row.status === "failed" ||
       (rowHasQuickScanResult(row) && !rowIsUsable(row) && row.status !== "skipped"),
   ).length;
+  const deepReviewedCount = rows.filter((row) => row.geminiCandidate).length;
   const scannedCount = Math.min(totalCount, usableCount + skippedCount + reviewNeededCount);
   const pendingCount = Math.max(0, totalCount - scannedCount);
   return {
@@ -1568,6 +1570,7 @@ function buildCanonicalScanState(rows: AnalysisRow[]): CanonicalScanState {
     usableCount,
     skippedCount,
     reviewNeededCount,
+    deepReviewedCount,
     scannedCount,
     pendingCount,
     complete: totalCount > 0 && scannedCount === totalCount,
@@ -1576,7 +1579,7 @@ function buildCanonicalScanState(rows: AnalysisRow[]): CanonicalScanState {
 
 function scanTooltipSummary(scanState: CanonicalScanState) {
   const skippedOrReviewCount = scanState.skippedCount + scanState.reviewNeededCount;
-  return `${scanState.scannedCount} of ${scanState.totalCount} photo${scanState.totalCount === 1 ? "" : "s"} scanned · ${scanState.usableCount} usable photo${scanState.usableCount === 1 ? "" : "s"} found · ${skippedOrReviewCount} photo${skippedOrReviewCount === 1 ? " needs" : "s need"} review or ${skippedOrReviewCount === 1 ? "was" : "were"} skipped${scanState.pendingCount > 0 ? ` · ${scanState.pendingCount} pending` : ""}`;
+  return `${scanState.scannedCount} of ${scanState.totalCount} photo${scanState.totalCount === 1 ? "" : "s"} scanned · ${scanState.usableCount} usable photo${scanState.usableCount === 1 ? "" : "s"} found · ${scanState.deepReviewedCount} received a closer AI review · ${skippedOrReviewCount} photo${skippedOrReviewCount === 1 ? " needs" : "s need"} review or ${skippedOrReviewCount === 1 ? "was" : "were"} skipped${scanState.pendingCount > 0 ? ` · ${scanState.pendingCount} pending` : ""}`;
 }
 
 function rowHasQuickScanResult(row: AnalysisRow) {
@@ -3298,6 +3301,7 @@ function FocusedGroupReview({
   const [index, setIndex] = useState(0);
   const [zoomed, setZoomed] = useState(false);
   const [undoStack, setUndoStack] = useState<ReviewUndo[]>([]);
+  const [confirmRemoveAll, setConfirmRemoveAll] = useState(false);
   const photos = group?.photos ?? [];
   const current = photos[index];
   const favoriteIds = useMemo(() => new Set(favoritePhotoIds), [favoritePhotoIds]);
@@ -3308,18 +3312,25 @@ function FocusedGroupReview({
     setIndex(0);
     setZoomed(false);
     setUndoStack([]);
+    setConfirmRemoveAll(false);
   }, [group]);
 
   useEffect(() => {
     if (!group) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape") {
+        if (confirmRemoveAll) {
+          setConfirmRemoveAll(false);
+          return;
+        }
+        onClose();
+      }
       if (event.key === "ArrowRight") setIndex((value) => Math.min(photos.length - 1, value + 1));
       if (event.key === "ArrowLeft") setIndex((value) => Math.max(0, value - 1));
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [group, onClose, photos.length]);
+  }, [confirmRemoveAll, group, onClose, photos.length]);
 
   useEffect(() => {
     if (index >= photos.length) setIndex(Math.max(0, photos.length - 1));
@@ -3357,10 +3368,20 @@ function FocusedGroupReview({
   }
 
   function removeAll() {
-    if (!window.confirm(`Remove all ${photos.length} photos from ${group.title}?`)) return;
+    setConfirmRemoveAll(true);
+  }
+
+  function confirmBulkRemove() {
     const removed = photos.filter((photo) => !removedIds.has(photo.id));
     removed.forEach(onRemove);
     if (removed.length) remember({ type: "bulkRemove", photos: removed });
+    setConfirmRemoveAll(false);
+    toast.success("Removed from group", {
+      action: {
+        label: "Undo",
+        onClick: () => removed.forEach(onKeep),
+      },
+    });
   }
 
   function keepFavoritesOnly() {
@@ -3551,6 +3572,53 @@ function FocusedGroupReview({
               </button>
             ))}
           </div>
+
+          <AnimatePresence>
+            {confirmRemoveAll && (
+              <motion.div
+                className="fixed inset-0 z-[60] grid place-items-center bg-ink/50 p-5"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                onMouseDown={() => setConfirmRemoveAll(false)}
+              >
+                <motion.div
+                  className="w-full max-w-sm rounded-3xl bg-cream p-5 shadow-2xl"
+                  initial={{ scale: 0.96, opacity: 0 }}
+                  animate={{ scale: 1, opacity: 1 }}
+                  exit={{ scale: 0.96, opacity: 0 }}
+                  onMouseDown={(event) => event.stopPropagation()}
+                  role="alertdialog"
+                  aria-modal="true"
+                  aria-labelledby="remove-group-title"
+                >
+                  <h4 id="remove-group-title" className="font-display text-2xl">
+                    Remove all photos from this group?
+                  </h4>
+                  <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
+                    This will remove {photos.length} photo{photos.length === 1 ? "" : "s"} from “
+                    {group.title}.” You can undo this before saving your final collection.
+                  </p>
+                  <div className="mt-5 grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setConfirmRemoveAll(false)}
+                      className="h-11 rounded-2xl bg-white text-sm font-bold text-ink"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      onClick={confirmBulkRemove}
+                      className="h-11 rounded-2xl bg-coral text-sm font-bold text-white"
+                    >
+                      Remove all
+                    </button>
+                  </div>
+                </motion.div>
+              </motion.div>
+            )}
+          </AnimatePresence>
         </motion.div>
       </motion.div>
     </AnimatePresence>
@@ -3800,15 +3868,64 @@ function CurateStage() {
     [state.removed, dispatch],
   );
 
+  function onDragEnd(_: unknown, info: PanInfo) {
+    setDragX(0);
+    const threshold = 110;
+    if (info.offset.x < -threshold) {
+      if (focus) removeCurrent(focus.id);
+    } else if (info.offset.x > threshold) {
+      keepCurrent();
+    }
+  }
+
+  const completeWith = useCallback(
+    (nextPhotos: Photo[]) => {
+      dispatch({ type: "setKept", photos: nextPhotos });
+      dispatch({
+        type: "setFinalOrder",
+        photos: orderWithPinned(nextPhotos, state.pinnedCoverId),
+      });
+      dispatch({ type: "setStage", stage: "final" });
+    },
+    [dispatch, state.pinnedCoverId],
+  );
+
+  const continueToFinal = useCallback(() => {
+    dispatch({ type: "setKept", photos: remaining });
+    dispatch({ type: "setFinalOrder", photos: orderWithPinned(remaining, state.pinnedCoverId) });
+    dispatch({ type: "setStage", stage: "final" });
+  }, [dispatch, remaining, state.pinnedCoverId]);
+
+  const keepCurrent = useCallback(() => {
+    toast.success("Kept");
+    if (focusIdx >= remaining.length - 1 && remaining.length <= MAX_KEEP) {
+      completeWith(remaining);
+      return;
+    }
+    advance();
+  }, [advance, completeWith, focusIdx, remaining]);
+
+  const removeCurrent = useCallback(
+    (id: string) => {
+      const nextPhotos = remaining.filter((photo) => photo.id !== id);
+      remove(id);
+      toast.success("Removed");
+      if (focusIdx >= remaining.length - 1 && nextPhotos.length <= MAX_KEEP) {
+        window.setTimeout(() => completeWith(nextPhotos), 0);
+      }
+    },
+    [completeWith, focusIdx, remaining, remove],
+  );
+
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (showRemoved) return;
       if (e.key === "ArrowLeft") {
         e.preventDefault();
-        if (focus) remove(focus.id);
+        if (focus) removeCurrent(focus.id);
       } else if (e.key === "ArrowRight") {
         e.preventDefault();
-        advance();
+        keepCurrent();
       } else if (e.key === "ArrowUp") {
         e.preventDefault();
         goBack();
@@ -3820,23 +3937,7 @@ function CurateStage() {
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [focus, advance, goBack, remove, restore, state.removed, showRemoved]);
-
-  function onDragEnd(_: unknown, info: PanInfo) {
-    setDragX(0);
-    const threshold = 110;
-    if (info.offset.x < -threshold) {
-      if (focus) remove(focus.id);
-    } else if (info.offset.x > threshold) {
-      advance();
-    }
-  }
-
-  function continueToFinal() {
-    dispatch({ type: "setKept", photos: remaining });
-    dispatch({ type: "setFinalOrder", photos: orderWithPinned(remaining, state.pinnedCoverId) });
-    dispatch({ type: "setStage", stage: "final" });
-  }
+  }, [focus, goBack, keepCurrent, removeCurrent, restore, state.removed, showRemoved]);
 
   return (
     <section>
@@ -3944,14 +4045,13 @@ function CurateStage() {
               <ArrowLeft className="h-4 w-4" />
             </Button>
             <Button
-              onClick={() => remove(focus.id)}
+              onClick={() => removeCurrent(focus.id)}
               className="h-12 rounded-2xl bg-coral font-semibold text-white shadow-lg hover:bg-coral/90"
             >
               <Trash2 className="mr-1 h-4 w-4" /> Remove
             </Button>
             <Button
-              onClick={advance}
-              disabled={focusIdx >= remaining.length - 1}
+              onClick={keepCurrent}
               className="col-span-2 h-12 rounded-2xl bg-ink font-semibold text-cream"
             >
               Keep <ArrowRight className="ml-2 h-4 w-4" />
@@ -4463,8 +4563,7 @@ function ExportStage() {
       );
     } catch (err) {
       console.error("[dumpdeck] draft save failed", err);
-      const message = err instanceof Error ? err.message : "Unknown save error";
-      toast.error(`Couldn't save draft: ${message}`);
+      toast.error("We couldn’t save your collection right now. Please try again.");
     } finally {
       setSaving(false);
     }
@@ -4585,7 +4684,7 @@ function ExportStage() {
       </div>
 
       <p className="mt-6 text-center text-xs text-muted-foreground">
-        Collections save to Supabase when signed in. Local-only saves are only used in dev mode.
+        Collections save privately when you are signed in.
       </p>
       <DebugPanel />
     </section>

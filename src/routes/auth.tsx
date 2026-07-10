@@ -40,8 +40,11 @@ function AuthPage() {
   const [password, setPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [busy, setBusy] = useState(false);
+  const [resendCooldown, setResendCooldown] = useState(0);
+  const [checkEmailIntent, setCheckEmailIntent] = useState<CheckEmailIntent>("signup");
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const checkEmailCopy = copyForCheckEmail(checkEmailIntent, email);
 
   useEffect(() => {
     if (!isAuthed) return;
@@ -53,6 +56,15 @@ function AuthPage() {
     }
     void navigate({ to: "/projects", replace: true });
   }, [isAuthed, mode, navigate]);
+
+  useEffect(() => {
+    if (resendCooldown <= 0) return;
+    const timer = window.setTimeout(
+      () => setResendCooldown((value) => Math.max(0, value - 1)),
+      1000,
+    );
+    return () => window.clearTimeout(timer);
+  }, [resendCooldown]);
 
   if (isLocalDevAuth) {
     return (
@@ -95,6 +107,7 @@ function AuthPage() {
           redirectTo: authRedirectUrl("reset"),
         });
         if (error) throw error;
+        setCheckEmailIntent("reset");
         setMode("check-email");
         setNotice("We sent a password reset link to your email.");
         return;
@@ -106,6 +119,7 @@ function AuthPage() {
           options: { emailRedirectTo: authRedirectUrl("verified") },
         });
         if (error) throw error;
+        setCheckEmailIntent("magic");
         setMode("check-email");
         setNotice("We sent a magic sign-in link to your email.");
         return;
@@ -120,8 +134,9 @@ function AuthPage() {
         if (error) throw error;
         console.log("[auth] signUp result:", data.user?.id, "session:", !!data.session);
         if (!data.session) {
+          setCheckEmailIntent("signup");
           setMode("check-email");
-          setNotice("Check your email to confirm your FotoFairy account.");
+          setNotice(`We sent a confirmation link to ${email}.`);
           return;
         }
         toast.success("Welcome!");
@@ -137,6 +152,42 @@ function AuthPage() {
       console.error("[auth] error:", err);
       setError(msg);
       toast.error(msg);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function resendEmail() {
+    if (!email || busy || resendCooldown > 0) return;
+    setBusy(true);
+    setError(null);
+    try {
+      if (checkEmailIntent === "reset") {
+        const { error } = await supabase.auth.resetPasswordForEmail(email, {
+          redirectTo: authRedirectUrl("reset"),
+        });
+        if (error) throw error;
+      } else if (checkEmailIntent === "magic") {
+        const { error } = await supabase.auth.signInWithOtp({
+          email,
+          options: { emailRedirectTo: authRedirectUrl("verified") },
+        });
+        if (error) throw error;
+      } else {
+        const { error } = await supabase.auth.resend({
+          type: "signup",
+          email,
+          options: { emailRedirectTo: authRedirectUrl("verified") },
+        });
+        if (error) throw error;
+      }
+      setResendCooldown(30);
+      setNotice("Email sent. Check your inbox and spam folder.");
+      toast.success("Email sent");
+    } catch (err) {
+      console.error("[auth] resend email failed:", err);
+      setError("We couldn’t resend the email right now. Please try again in a moment.");
+      toast.error("We couldn’t resend the email right now.");
     } finally {
       setBusy(false);
     }
@@ -167,10 +218,48 @@ function AuthPage() {
           {mode === "check-email" ? (
             <div className="mt-6 rounded-3xl bg-white/70 p-5 text-center">
               <Mail className="mx-auto h-8 w-8 text-coral" />
-              <p className="mt-3 text-sm text-muted-foreground">
-                Open the link from Supabase to finish. Mailgun SMTP can power these emails once it
-                is configured in the Supabase dashboard.
+              <h2 className="mt-3 text-lg font-bold text-ink">{checkEmailCopy.title}</h2>
+              <p className="mt-2 text-sm text-muted-foreground">{checkEmailCopy.body}</p>
+              <p className="mt-2 text-xs text-muted-foreground">
+                Didn’t get it? Check your spam folder or resend the email.
               </p>
+              {error && (
+                <div className="mt-3 rounded-xl bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                  {error}
+                </div>
+              )}
+              <div className="mt-5 grid gap-2">
+                <button
+                  type="button"
+                  onClick={resendEmail}
+                  disabled={busy || resendCooldown > 0 || !email}
+                  className="h-11 rounded-xl bg-ink text-sm font-semibold text-cream disabled:opacity-60"
+                >
+                  {resendCooldown > 0 ? `Resend in ${resendCooldown}s` : "Resend email"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    switchMode(
+                      checkEmailIntent === "reset"
+                        ? "forgot"
+                        : checkEmailIntent === "magic"
+                          ? "magic"
+                          : "signup",
+                    )
+                  }
+                  className="h-10 rounded-xl bg-cream text-xs font-semibold text-ink"
+                >
+                  Use a different email
+                </button>
+                <button
+                  type="button"
+                  onClick={() => switchMode("signin")}
+                  className="text-xs font-semibold text-muted-foreground underline"
+                >
+                  Back to sign in
+                </button>
+              </div>
             </div>
           ) : (
             <form onSubmit={onSubmit} className="mt-6 space-y-3">
@@ -259,6 +348,7 @@ function AuthPage() {
 }
 
 type AuthMode = "signin" | "signup" | "forgot" | "reset" | "magic" | "check-email" | "verified";
+type CheckEmailIntent = "signup" | "reset" | "magic";
 
 function initialMode(): AuthMode {
   if (typeof window === "undefined") return "signin";
@@ -291,7 +381,7 @@ function subtitleForMode(mode: AuthMode) {
   if (mode === "signup") return "Sign up, confirm your email, then your collections stay with you.";
   if (mode === "forgot") return "We will send a secure reset link to your inbox.";
   if (mode === "reset") return "Enter your new password to finish recovering your account.";
-  if (mode === "magic") return "No password needed. Supabase will email you a one-time link.";
+  if (mode === "magic") return "No password needed. We will email you a one-time link.";
   if (mode === "check-email") return "The next step is waiting in your inbox.";
   if (mode === "verified") return "You are good to go.";
   return "Sign in to keep curating.";
@@ -303,4 +393,24 @@ function ctaForMode(mode: AuthMode) {
   if (mode === "reset") return "Update password";
   if (mode === "magic") return "Send magic link";
   return "Sign in";
+}
+
+function copyForCheckEmail(intent: CheckEmailIntent, email: string) {
+  const inbox = email || "your email";
+  if (intent === "reset") {
+    return {
+      title: "Check your email",
+      body: `We sent a password reset link to ${inbox}. Open it to choose a new password.`,
+    };
+  }
+  if (intent === "magic") {
+    return {
+      title: "Check your email",
+      body: `We sent a sign-in link to ${inbox}. Open it to finish signing in.`,
+    };
+  }
+  return {
+    title: "Check your email",
+    body: `We sent a confirmation link to ${inbox}. Open it to finish creating your FotoFairy account.`,
+  };
 }

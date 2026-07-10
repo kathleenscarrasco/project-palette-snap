@@ -79,9 +79,10 @@ function projectPersistenceErrorMessage(err: unknown, fallback = "Could not save
   if (
     /saved_projects|schema cache|relation .* does not exist|table .* does not exist/i.test(message)
   ) {
-    return "Collection storage is not set up yet. Apply the Supabase persistence migration, then try again.";
+    console.error("[saved_projects] production persistence setup error:", err);
+    return "We couldn’t save your collection right now. Please try again in a moment.";
   }
-  return message || fallback;
+  return message || "We couldn’t save your collection right now. Please try again in a moment.";
 }
 
 function statusForProject(

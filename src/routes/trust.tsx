@@ -55,10 +55,9 @@ function TrustPage() {
 
         <Section title="Access & authentication">
           <p>
-            FotoFairy currently requires a Supabase Auth account for private collections. Email
-            confirmation, magic links, and password reset links are handled through Supabase Auth.
-            Auth emails should point back to FotoFairy&apos;s <code>/auth/callback</code> route, not
-            to localhost in production.
+            FotoFairy currently requires an account for private saved collections. Email
+            confirmation, magic links, and password reset links are handled by FotoFairy&apos;s
+            secure sign-in flow.
           </p>
         </Section>
 
@@ -70,17 +69,16 @@ function TrustPage() {
             back without losing a completed draft.
           </p>
           <p>
-            Photo files are stored in a private Supabase Storage bucket. Database rows store storage
-            paths and metadata; display URLs are generated as fresh signed URLs when you reopen a
-            collection.
+            Photo files for saved collections are stored in private cloud storage. FotoFairy creates
+            fresh, short-lived display links when you reopen a collection.
           </p>
         </Section>
 
         <Section title="AI processing">
           <p>
             FotoFairy uses local/browser analysis first where possible. When deeper analysis is
-            needed, images or optimized previews may be sent to the server-side Gemini pipeline. API
-            keys stay on the server and should never be exposed to the browser.
+            needed, optimized previews may be reviewed through secure server-side AI. Private keys
+            stay on the server and are not exposed to the browser.
           </p>
         </Section>
 
@@ -95,9 +93,9 @@ function TrustPage() {
         <Section title="Retention & deletion">
           <p>
             Saved collection rows remain until you delete them. Deleting a collection should remove
-            the associated database records and request cleanup of associated private Storage
-            objects. Older drafts with missing photo files may show a specific fallback message
-            rather than silently restarting the flow.
+            the associated collection records and request cleanup of associated private photo files.
+            Older drafts with missing photo files may show a specific fallback message rather than
+            silently restarting the flow.
           </p>
         </Section>
 

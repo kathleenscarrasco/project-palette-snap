@@ -35,3 +35,18 @@ Supabase Auth owns signup, login, magic links, and password reset. Mailgun shoul
 be configured only as Supabase's custom SMTP sender in the Supabase dashboard.
 See [docs/mailgun-supabase-auth.md](docs/mailgun-supabase-auth.md) for the setup
 checklist. Never commit Mailgun API keys or SMTP passwords.
+
+## Production readiness
+
+Before sharing a staging or production build, review
+[docs/production-readiness.md](docs/production-readiness.md). With a confirmed
+test user, run:
+
+```bash
+FOTOFAIRY_READINESS_EMAIL="tester@example.com" \
+FOTOFAIRY_READINESS_PASSWORD="test-password" \
+npm run check:supabase
+```
+
+The check verifies the signed-in user path for project tables and private photo
+Storage without using service-role keys.

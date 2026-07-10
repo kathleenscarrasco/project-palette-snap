@@ -19,6 +19,11 @@ export function PhotoCard({
   const score = analysis?.rankingScore ?? photo.overall;
   const scene = analysis?.scene ?? photo.photoType;
   const quality = analysis?.technicalQuality.overall ?? photo.scores.quality;
+  const deepScanned = Boolean(
+    analysis?.modelTrace.scene ||
+    analysis?.modelTrace.objects?.length ||
+    analysis?.modelTrace.faces,
+  );
 
   return (
     <button
@@ -59,6 +64,14 @@ export function PhotoCard({
           {analysis && analysis.peopleCount > 0 && (
             <span className="rounded-full bg-white/85 px-1.5 py-0.5 text-[9px] font-bold text-ink">
               {analysis.peopleCount} people
+            </span>
+          )}
+          {deepScanned && (
+            <span
+              title="FotoFairy used additional AI analysis for this photo because it needed a closer look."
+              className="rounded-full bg-mint/90 px-1.5 py-0.5 text-[9px] font-bold text-ink"
+            >
+              Closer review
             </span>
           )}
         </div>
