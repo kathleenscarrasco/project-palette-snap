@@ -54,8 +54,8 @@ export async function persistProjectUploads(
   const results = await mapWithConcurrency(items, STORAGE_UPLOAD_CONCURRENCY, async (item) => {
     const itemStartedAt = performance.now();
     const originalSourceUrl = item.convertedFromHeic
-      ? item.previewUrl ?? item.previewFileUrl ?? item.url
-      : item.originalFileUrl ?? item.url;
+      ? (item.previewUrl ?? item.previewFileUrl ?? item.url)
+      : (item.originalFileUrl ?? item.url);
     const originalBlobRaw = await blobFromUrl(originalSourceUrl);
     const previewBlobRaw = await blobFromUrl(item.previewUrl ?? item.previewFileUrl ?? item.url);
     const originalBlob = await optimizeImageBlob(originalBlobRaw, {
@@ -187,12 +187,11 @@ export async function persistFinalDraftPhotos(
         quality: STORAGE_JPEG_QUALITY,
         label: `${photo.name}:draft-preview`,
       });
-      const originalMimeType =
-        convertedFromHeic
-          ? originalBlob.type || "image/jpeg"
-          : photo.sourceMetadata?.originalMimeType ??
-            originalBlob.type ??
-            photo.sourceMetadata?.mimeType;
+      const originalMimeType = convertedFromHeic
+        ? originalBlob.type || "image/jpeg"
+        : (photo.sourceMetadata?.originalMimeType ??
+          originalBlob.type ??
+          photo.sourceMetadata?.mimeType);
       const previewMimeType =
         photo.sourceMetadata?.mimeType ?? previewBlob.type ?? originalMimeType ?? "image/jpeg";
       const originalExt = extensionForMime(originalMimeType, photo.name);
@@ -569,7 +568,9 @@ function sourceConversionQuality(item: PersistablePhoto) {
 }
 
 function sourceConversionDecoder(item: PersistablePhoto) {
-  return "conversionDecoder" in item ? item.conversionDecoder : item.sourceMetadata?.conversionDecoder;
+  return "conversionDecoder" in item
+    ? item.conversionDecoder
+    : item.sourceMetadata?.conversionDecoder;
 }
 
 function sourceOriginalByteSize(item: PersistablePhoto) {

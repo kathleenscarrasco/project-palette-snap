@@ -1,12 +1,5 @@
-import {
-  createContext,
-  useContext,
-  useEffect,
-  useMemo,
-  useReducer,
-  type ReactNode,
-} from "react";
-import type { DuplicateDecisionDraft } from "./drafts";
+import { createContext, useContext, useEffect, useMemo, useReducer, type ReactNode } from "react";
+import type { CollectionTitleMetadata, DuplicateDecisionDraft } from "./drafts";
 import type { Photo, RemovedPhoto, Settings, Stage } from "./types";
 
 type State = {
@@ -19,6 +12,8 @@ type State = {
   removed: RemovedPhoto[];
   duplicateDecisions: DuplicateDecisionDraft[];
   pinnedCoverId: string | null;
+  favoritePhotoIds: string[];
+  collectionTitleMetadata: CollectionTitleMetadata | null;
 };
 
 type Action =
@@ -33,6 +28,8 @@ type Action =
   | { type: "addRemoved"; entries: RemovedPhoto[] }
   | { type: "setDuplicateDecisions"; decisions: DuplicateDecisionDraft[] }
   | { type: "setPinnedCover"; id: string | null }
+  | { type: "setPhotoFavorite"; id: string; favorite: boolean }
+  | { type: "setCollectionTitleMetadata"; metadata: CollectionTitleMetadata | null }
   | { type: "restorePhoto"; id: string }
   | { type: "clearRemoved" }
   | { type: "hydrate"; state: State }
@@ -48,12 +45,20 @@ const initial: State = {
   removed: [],
   duplicateDecisions: [],
   pinnedCoverId: null,
+  favoritePhotoIds: [],
+  collectionTitleMetadata: null,
 };
 
 function reducer(state: State, action: Action): State {
   switch (action.type) {
     case "hydrate":
-      return { ...initial, ...action.state, pinnedCoverId: action.state.pinnedCoverId ?? null };
+      return {
+        ...initial,
+        ...action.state,
+        pinnedCoverId: action.state.pinnedCoverId ?? null,
+        favoritePhotoIds: action.state.favoritePhotoIds ?? [],
+        collectionTitleMetadata: action.state.collectionTitleMetadata ?? null,
+      };
     case "setStage":
       return { ...state, stage: action.stage };
     case "setSettings":
@@ -68,6 +73,7 @@ function reducer(state: State, action: Action): State {
         kept: state.kept.filter((p) => p.id !== action.id),
         finalOrder: state.finalOrder.filter((p) => p.id !== action.id),
         pinnedCoverId: state.pinnedCoverId === action.id ? null : state.pinnedCoverId,
+        favoritePhotoIds: state.favoritePhotoIds.filter((id) => id !== action.id),
       };
     case "setShortlist":
       return { ...state, shortlist: action.photos };
@@ -99,6 +105,14 @@ function reducer(state: State, action: Action): State {
       return { ...state, duplicateDecisions: action.decisions };
     case "setPinnedCover":
       return { ...state, pinnedCoverId: action.id };
+    case "setPhotoFavorite": {
+      const ids = new Set(state.favoritePhotoIds);
+      if (action.favorite) ids.add(action.id);
+      else ids.delete(action.id);
+      return { ...state, favoritePhotoIds: Array.from(ids) };
+    }
+    case "setCollectionTitleMetadata":
+      return { ...state, collectionTitleMetadata: action.metadata };
     case "restorePhoto": {
       const entry = state.removed.find((r) => r.photo.id === action.id);
       if (!entry) return state;
@@ -164,7 +178,7 @@ export function DumpDeckProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     persist(state);
-  }, [state.settings, state.stage]);
+  }, [state]);
 
   const value = useMemo(() => ({ state, dispatch }), [state]);
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

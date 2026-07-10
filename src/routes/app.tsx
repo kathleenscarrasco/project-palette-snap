@@ -48,6 +48,7 @@ import {
   missingDraftFields,
   saveFinalDraft,
   savedDraftDebugSummary,
+  type CollectionTitleMetadata,
   type DuplicateDecisionDraft,
   type FinalDraftPayload,
 } from "@/lib/dumpdeck/drafts";
@@ -348,6 +349,8 @@ function Shell() {
             removed,
             duplicateDecisions: draft.duplicateDecisions ?? [],
             pinnedCoverId: draft.pinnedCoverPhotoId ?? null,
+            favoritePhotoIds: draft.favoritePhotoIds ?? [],
+            collectionTitleMetadata: draft.collectionTitleMetadata ?? null,
           },
         });
         if (resolvedDraftId) sessionStorage.setItem("dumpdeck:activeDraftId", resolvedDraftId);
@@ -394,6 +397,8 @@ function Shell() {
       removed: state.removed.map((entry) => [entry.photo.id, entry.reason, entry.source]),
       duplicateDecisions: state.duplicateDecisions,
       pinnedCoverId: state.pinnedCoverId,
+      favoritePhotoIds: state.favoritePhotoIds,
+      collectionTitleMetadata: state.collectionTitleMetadata,
     });
     if (signature === lastAutosaveSignatureRef.current) return;
     lastAutosaveSignatureRef.current = signature;
@@ -413,6 +418,8 @@ function Shell() {
         settings: state.settings,
         duplicateDecisions: state.duplicateDecisions,
         pinnedCoverPhotoId: state.pinnedCoverId,
+        favoritePhotoIds: state.favoritePhotoIds,
+        collectionTitleMetadata: state.collectionTitleMetadata,
       })
         .then((result) => {
           if (cancelled || result.skipped) return;
@@ -433,7 +440,9 @@ function Shell() {
     };
   }, [
     draftHydrationChecked,
+    state.collectionTitleMetadata,
     state.duplicateDecisions,
+    state.favoritePhotoIds,
     state.finalOrder,
     state.kept,
     state.photos,
@@ -1533,9 +1542,41 @@ function isUnsupportedSkipReason(reason?: string) {
   return /unsupported|corrupt|couldn't|failed|invalid/i.test(reason ?? "");
 }
 
-function scanTooltipSummary(total: number, usable: number, unusable: number, pending: number) {
-  const scanned = Math.min(total, usable + unusable);
-  return `${scanned} of ${total} photo${total === 1 ? "" : "s"} scanned · ${usable} usable photo${usable === 1 ? "" : "s"} found · ${unusable} photo${unusable === 1 ? "" : "s"} need${unusable === 1 ? "s" : ""} review or ${unusable === 1 ? "was" : "were"} skipped${pending > 0 ? ` · ${pending} pending` : ""}`;
+type CanonicalScanState = {
+  totalCount: number;
+  usableCount: number;
+  skippedCount: number;
+  reviewNeededCount: number;
+  scannedCount: number;
+  pendingCount: number;
+  complete: boolean;
+};
+
+function buildCanonicalScanState(rows: AnalysisRow[]): CanonicalScanState {
+  const totalCount = rows.length;
+  const usableCount = rows.filter(rowIsUsable).length;
+  const skippedCount = rows.filter((row) => row.status === "skipped").length;
+  const reviewNeededCount = rows.filter(
+    (row) =>
+      row.status === "failed" ||
+      (rowHasQuickScanResult(row) && !rowIsUsable(row) && row.status !== "skipped"),
+  ).length;
+  const scannedCount = Math.min(totalCount, usableCount + skippedCount + reviewNeededCount);
+  const pendingCount = Math.max(0, totalCount - scannedCount);
+  return {
+    totalCount,
+    usableCount,
+    skippedCount,
+    reviewNeededCount,
+    scannedCount,
+    pendingCount,
+    complete: totalCount > 0 && scannedCount === totalCount,
+  };
+}
+
+function scanTooltipSummary(scanState: CanonicalScanState) {
+  const skippedOrReviewCount = scanState.skippedCount + scanState.reviewNeededCount;
+  return `${scanState.scannedCount} of ${scanState.totalCount} photo${scanState.totalCount === 1 ? "" : "s"} scanned · ${scanState.usableCount} usable photo${scanState.usableCount === 1 ? "" : "s"} found · ${skippedOrReviewCount} photo${skippedOrReviewCount === 1 ? " needs" : "s need"} review or ${skippedOrReviewCount === 1 ? "was" : "were"} skipped${scanState.pendingCount > 0 ? ` · ${scanState.pendingCount} pending` : ""}`;
 }
 
 function rowHasQuickScanResult(row: AnalysisRow) {
@@ -1702,54 +1743,37 @@ function AnalyzeStage() {
   }
 
   const failedRows = rows.filter((row) => row.status === "failed");
+  const scanState = useMemo(() => buildCanonicalScanState(rows), [rows]);
   const unusableRows = rows.filter((row) => rowHasQuickScanResult(row) && !rowIsUsable(row));
   const backgroundRefiningCount = rows.filter(
     (row) => row.geminiCandidate && ["queued", "analyzing", "retrying"].includes(row.status),
   ).length;
-  const scannedCount = rows.filter(rowHasQuickScanResult).length;
-  const pendingCount = Math.max(0, rows.length - scannedCount);
   const retryingCount = rows.filter((row) => row.status === "retrying").length;
-  const usableCount = rows.filter(rowIsUsable).length;
-  const accountedCount = scannedCount;
-  const mainProgress = rows.length
-    ? Math.min(1, accountedCount / Math.max(1, rows.length))
+  const mainProgress = scanState.totalCount
+    ? Math.min(1, scanState.scannedCount / Math.max(1, scanState.totalCount))
     : Math.min(1, progress);
-  const hasActiveQuickScan =
-    rows.length > 0 &&
-    (pendingCount > 0 ||
-      phase === "loading" ||
-      phase === "local-scanning" ||
-      rows.some((row) => row.status === "uploaded" || row.status === "local_scanning"));
+  const hasActiveQuickScan = scanState.totalCount > 0 && !scanState.complete;
   const hasActiveRefinement = rows.some(
     (row) => row.status === "queued" || row.status === "analyzing" || row.status === "retrying",
   );
   const hasActiveAnalysis = hasActiveQuickScan || hasActiveRefinement;
-  const quickScanComplete = rows.length > 0 && pendingCount === 0;
+  const quickScanComplete = scanState.complete;
   const canStartSorting =
-    quickScanComplete && phase !== "loading" && phase !== "preparing" && usableCount >= 4;
+    quickScanComplete && phase !== "loading" && phase !== "preparing" && scanState.usableCount >= 4;
 
   const progressLabel =
     phase === "preparing"
       ? "Preparing your collection…"
-      : quickScanComplete
-        ? `${scannedCount} photo${scannedCount === 1 ? "" : "s"} scanned`
-        : phase === "local-scanning"
-          ? `Scanning ${scannedCount} of ${rows.length} photos`
-          : phase === "refining" && retryingCount > 0
-            ? "Taking a little longer on the best candidates…"
-            : phase === "refining"
-              ? "Picking out the hidden gems…"
-              : canStartSorting
-                ? "Ready to sort!"
-                : hasActiveQuickScan
-                  ? `Scanning ${scannedCount} of ${rows.length} photos`
-                  : failedRows.length
-                    ? `${failedRows.length} photo${failedRows.length === 1 ? "" : "s"} couldn't be scanned`
-                    : "Preparing analysis…";
-  const scanHelpText =
-    rows.length > 0
-      ? scanTooltipSummary(rows.length, usableCount, unusableRows.length, pendingCount)
-      : "";
+      : scanState.complete
+        ? `${scanState.totalCount} photo${scanState.totalCount === 1 ? "" : "s"} scanned`
+        : scanState.totalCount > 0
+          ? `Scanning ${scanState.scannedCount} of ${scanState.totalCount} photos`
+          : failedRows.length
+            ? `${failedRows.length} photo${failedRows.length === 1 ? "" : "s"} couldn't be scanned`
+            : retryingCount > 0
+              ? "Taking a little longer on the best candidates…"
+              : "Preparing analysis…";
+  const scanHelpText = scanState.totalCount > 0 ? scanTooltipSummary(scanState) : "";
   const taglinePhotos = useMemo(
     () => rows.map((row) => row.photo).filter((photo): photo is Photo => !!photo),
     [rows],
@@ -2744,7 +2768,7 @@ function AnalyzeStage() {
             ? "Preparing your collection…"
             : canStartSorting
               ? unusableRows.length
-                ? `Start Sorting with ${usableCount} ready photos`
+                ? `Start Sorting with ${scanState.usableCount} ready photos`
                 : "Start Sorting"
               : hasActiveQuickScan
                 ? "Start Sorting unlocks after quick scan"
@@ -2755,7 +2779,7 @@ function AnalyzeStage() {
             Do not refresh FotoFairy until after you start sorting.
           </p>
         )}
-        {failedRows.length > 0 && usableCount >= 4 && !hasActiveQuickScan && (
+        {failedRows.length > 0 && scanState.usableCount >= 4 && !hasActiveQuickScan && (
           <p className="text-xs text-muted-foreground">
             Failed photos will be skipped unless you retry them first.
           </p>
@@ -3131,17 +3155,29 @@ function SimilarStage() {
 }
 
 /* ───────────── Results ───────────── */
+type ReviewGroup = {
+  id: string;
+  title: string;
+  description?: string;
+  photos: Photo[];
+};
+
 function ResultsStage() {
   const { state, dispatch } = useDumpDeck();
   const [showRemoved, setShowRemoved] = useState(false);
+  const [reviewGroup, setReviewGroup] = useState<ReviewGroup | null>(null);
   const removed = state.photos.length - state.shortlist.length;
+  const removedIds = useMemo(
+    () => new Set(state.removed.map((entry) => entry.photo.id)),
+    [state.removed],
+  );
 
   function restore(id: string) {
     dispatch({ type: "restorePhoto", id });
     toast.success("Restored to your shortlist.");
   }
 
-  function removeFromEventReview(photo: Photo) {
+  function removeFromEventReview(photo: Photo, reason = "removed by user during event review.") {
     dispatch({
       type: "addRemoved",
       entries: [
@@ -3154,6 +3190,14 @@ function ResultsStage() {
     });
     dispatch({ type: "removePhoto", id: photo.id });
     toast("Removed from this collection");
+  }
+
+  function keepFromFocusedReview(photo: Photo) {
+    if (removedIds.has(photo.id)) dispatch({ type: "restorePhoto", id: photo.id });
+  }
+
+  function setFavorite(photo: Photo, favorite: boolean) {
+    dispatch({ type: "setPhotoFavorite", id: photo.id, favorite });
   }
 
   return (
@@ -3185,7 +3229,11 @@ function ResultsStage() {
         </button>
       </div>
 
-      <OrganizationBrowser photos={state.shortlist} onRemovePhoto={removeFromEventReview} />
+      <OrganizationBrowser
+        photos={state.shortlist}
+        onOpenGroup={setReviewGroup}
+        onRemovePhoto={removeFromEventReview}
+      />
 
       <div className="mt-5 grid grid-cols-2 gap-3">
         {state.shortlist.map((p) => (
@@ -3208,15 +3256,314 @@ function ResultsStage() {
         removed={state.removed}
         onRestore={restore}
       />
+      <FocusedGroupReview
+        group={reviewGroup}
+        favoritePhotoIds={state.favoritePhotoIds}
+        removedIds={removedIds}
+        onClose={() => setReviewGroup(null)}
+        onKeep={keepFromFocusedReview}
+        onRemove={(photo) =>
+          removeFromEventReview(photo, "Removed during focused shortlist review.")
+        }
+        onFavorite={setFavorite}
+      />
     </section>
+  );
+}
+
+type ReviewUndo =
+  | { type: "remove"; photos: Photo[] }
+  | { type: "keep"; photos: Photo[] }
+  | { type: "favorite"; photoId: string; previous: boolean }
+  | { type: "bulkRemove"; photos: Photo[] }
+  | { type: "keepFavoritesOnly"; photos: Photo[] };
+
+function FocusedGroupReview({
+  group,
+  favoritePhotoIds,
+  removedIds,
+  onClose,
+  onKeep,
+  onRemove,
+  onFavorite,
+}: {
+  group: ReviewGroup | null;
+  favoritePhotoIds: string[];
+  removedIds: Set<string>;
+  onClose: () => void;
+  onKeep: (photo: Photo) => void;
+  onRemove: (photo: Photo) => void;
+  onFavorite: (photo: Photo, favorite: boolean) => void;
+}) {
+  const [index, setIndex] = useState(0);
+  const [zoomed, setZoomed] = useState(false);
+  const [undoStack, setUndoStack] = useState<ReviewUndo[]>([]);
+  const photos = group?.photos ?? [];
+  const current = photos[index];
+  const favoriteIds = useMemo(() => new Set(favoritePhotoIds), [favoritePhotoIds]);
+  const activeCount = photos.filter((photo) => !removedIds.has(photo.id)).length;
+
+  useEffect(() => {
+    if (!group) return;
+    setIndex(0);
+    setZoomed(false);
+    setUndoStack([]);
+  }, [group]);
+
+  useEffect(() => {
+    if (!group) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+      if (event.key === "ArrowRight") setIndex((value) => Math.min(photos.length - 1, value + 1));
+      if (event.key === "ArrowLeft") setIndex((value) => Math.max(0, value - 1));
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [group, onClose, photos.length]);
+
+  useEffect(() => {
+    if (index >= photos.length) setIndex(Math.max(0, photos.length - 1));
+  }, [index, photos.length]);
+
+  if (!group || !current) return null;
+
+  const isFavorite = favoriteIds.has(current.id);
+  const isRemoved = removedIds.has(current.id);
+  const goPrev = () => setIndex((value) => Math.max(0, value - 1));
+  const goNext = () => setIndex((value) => Math.min(photos.length - 1, value + 1));
+  const remember = (undo: ReviewUndo) => setUndoStack((stack) => [...stack.slice(-9), undo]);
+
+  function keep(photo: Photo) {
+    const wasRemoved = removedIds.has(photo.id);
+    onKeep(photo);
+    if (wasRemoved) remember({ type: "keep", photos: [photo] });
+  }
+
+  function remove(photo: Photo) {
+    if (removedIds.has(photo.id)) return;
+    onRemove(photo);
+    remember({ type: "remove", photos: [photo] });
+  }
+
+  function favorite(photo: Photo, next: boolean) {
+    onFavorite(photo, next);
+    remember({ type: "favorite", photoId: photo.id, previous: favoriteIds.has(photo.id) });
+  }
+
+  function keepAll() {
+    const restored = photos.filter((photo) => removedIds.has(photo.id));
+    restored.forEach(onKeep);
+    if (restored.length) remember({ type: "keep", photos: restored });
+  }
+
+  function removeAll() {
+    if (!window.confirm(`Remove all ${photos.length} photos from ${group.title}?`)) return;
+    const removed = photos.filter((photo) => !removedIds.has(photo.id));
+    removed.forEach(onRemove);
+    if (removed.length) remember({ type: "bulkRemove", photos: removed });
+  }
+
+  function keepFavoritesOnly() {
+    const removed = photos.filter(
+      (photo) => !favoriteIds.has(photo.id) && !removedIds.has(photo.id),
+    );
+    removed.forEach(onRemove);
+    if (removed.length) remember({ type: "keepFavoritesOnly", photos: removed });
+  }
+
+  function undoLastAction() {
+    const last = undoStack.at(-1);
+    if (!last) return;
+    setUndoStack((stack) => stack.slice(0, -1));
+    if (last.type === "favorite") {
+      const photo = photos.find((candidate) => candidate.id === last.photoId);
+      if (photo) onFavorite(photo, last.previous);
+      return;
+    }
+    if (last.type === "keep") last.photos.forEach(onRemove);
+    else last.photos.forEach(onKeep);
+  }
+
+  function onDragEnd(_: MouseEvent | TouchEvent | PointerEvent, info: PanInfo) {
+    if (info.offset.x < -60) goNext();
+    if (info.offset.x > 60) goPrev();
+  }
+
+  return (
+    <AnimatePresence>
+      <motion.div
+        className="fixed inset-0 z-50 bg-ink/65 p-3 backdrop-blur-sm"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        onMouseDown={onClose}
+        role="dialog"
+        aria-modal="true"
+        aria-label={`${group.title} review`}
+      >
+        <motion.div
+          className="mx-auto flex h-full max-w-3xl flex-col rounded-3xl bg-cream p-4 shadow-2xl"
+          initial={{ y: 24, opacity: 0 }}
+          animate={{ y: 0, opacity: 1 }}
+          exit={{ y: 24, opacity: 0 }}
+          onMouseDown={(event) => event.stopPropagation()}
+        >
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <p className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">
+                Focused review
+              </p>
+              <h3 className="truncate font-display text-2xl">{group.title}</h3>
+              <p className="text-sm text-muted-foreground">
+                {index + 1} of {photos.length} · {activeCount} kept
+              </p>
+            </div>
+            <button type="button" onClick={onClose} className="chip bg-white">
+              <X className="h-4 w-4" /> Done
+            </button>
+          </div>
+
+          <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+            <button type="button" onClick={keepAll} className="chip justify-center bg-mint/60">
+              Keep all
+            </button>
+            <button type="button" onClick={removeAll} className="chip justify-center bg-coral/15">
+              Remove all
+            </button>
+            <button
+              type="button"
+              onClick={keepFavoritesOnly}
+              className="chip justify-center bg-white"
+            >
+              Keep favorites only
+            </button>
+            <button
+              type="button"
+              onClick={undoLastAction}
+              disabled={undoStack.length === 0}
+              className="chip justify-center bg-white disabled:opacity-50"
+            >
+              <Undo2 className="h-3.5 w-3.5" /> Undo
+            </button>
+          </div>
+
+          <div className="relative mt-4 min-h-0 flex-1">
+            <motion.div
+              key={current.id}
+              drag="x"
+              dragConstraints={{ left: 0, right: 0 }}
+              onDragEnd={onDragEnd}
+              className="relative grid h-full place-items-center overflow-hidden rounded-3xl bg-ink/5"
+            >
+              <img
+                src={current.previewUrl ?? current.url}
+                alt={current.name}
+                decoding="async"
+                className={`max-h-full max-w-full cursor-zoom-in rounded-2xl object-contain transition ${
+                  zoomed ? "scale-125 cursor-zoom-out" : ""
+                } ${isRemoved ? "opacity-45 grayscale" : ""}`}
+                onClick={() => setZoomed((value) => !value)}
+              />
+              {isRemoved && (
+                <div className="absolute left-3 top-3 rounded-full bg-white/90 px-3 py-1 text-xs font-bold text-ink">
+                  Removed
+                </div>
+              )}
+              {isFavorite && (
+                <div className="absolute right-3 top-3 rounded-full bg-white/90 px-3 py-1 text-xs font-bold text-ink">
+                  Favorite
+                </div>
+              )}
+            </motion.div>
+
+            <button
+              type="button"
+              onClick={goPrev}
+              disabled={index === 0}
+              className="absolute left-2 top-1/2 grid h-10 w-10 -translate-y-1/2 place-items-center rounded-full bg-white/90 shadow disabled:opacity-35"
+              aria-label="Previous photo"
+            >
+              <ArrowLeft className="h-4 w-4" />
+            </button>
+            <button
+              type="button"
+              onClick={goNext}
+              disabled={index === photos.length - 1}
+              className="absolute right-2 top-1/2 grid h-10 w-10 -translate-y-1/2 place-items-center rounded-full bg-white/90 shadow disabled:opacity-35"
+              aria-label="Next photo"
+            >
+              <ArrowRight className="h-4 w-4" />
+            </button>
+          </div>
+
+          <div className="mt-4 grid grid-cols-3 gap-2">
+            <button
+              type="button"
+              onClick={() => keep(current)}
+              className={`h-11 rounded-2xl text-sm font-bold ${
+                !isRemoved ? "bg-mint text-ink" : "bg-white text-ink"
+              }`}
+            >
+              Keep
+            </button>
+            <button
+              type="button"
+              onClick={() => remove(current)}
+              className={`h-11 rounded-2xl text-sm font-bold ${
+                isRemoved ? "bg-coral text-white" : "bg-white text-ink"
+              }`}
+            >
+              Remove
+            </button>
+            <button
+              type="button"
+              onClick={() => favorite(current, !isFavorite)}
+              className={`h-11 rounded-2xl text-sm font-bold ${
+                isFavorite ? "bg-yellow-200 text-ink" : "bg-white text-ink"
+              }`}
+            >
+              <Heart className="mr-1 inline h-4 w-4" />
+              Favorite
+            </button>
+          </div>
+
+          <div className="mt-3 flex gap-2 overflow-x-auto pb-1 no-scrollbar">
+            {photos.map((photo, photoIndex) => (
+              <button
+                type="button"
+                key={photo.id}
+                onClick={() => setIndex(photoIndex)}
+                className={`relative h-14 w-14 shrink-0 overflow-hidden rounded-xl border-2 bg-muted ${
+                  photoIndex === index ? "border-coral" : "border-transparent"
+                } ${removedIds.has(photo.id) ? "opacity-45" : ""}`}
+                aria-label={`Open photo ${photoIndex + 1}`}
+              >
+                <img
+                  src={photo.previewUrl ?? photo.url}
+                  alt=""
+                  decoding="async"
+                  loading="lazy"
+                  className="h-full w-full object-cover"
+                />
+                {favoriteIds.has(photo.id) && (
+                  <Heart className="absolute right-1 top-1 h-3 w-3 fill-yellow-200 text-ink" />
+                )}
+              </button>
+            ))}
+          </div>
+        </motion.div>
+      </motion.div>
+    </AnimatePresence>
   );
 }
 
 function OrganizationBrowser({
   photos,
+  onOpenGroup,
   onRemovePhoto,
 }: {
   photos: Photo[];
+  onOpenGroup: (group: ReviewGroup) => void;
   onRemovePhoto: (photo: Photo) => void;
 }) {
   const collections = useMemo(() => {
@@ -3281,7 +3628,18 @@ function OrganizationBrowser({
       <div className="mt-3 space-y-3">
         {collections.map((collection) => (
           <div key={collection.id} className="rounded-2xl bg-cream/80 p-2">
-            <div className="flex gap-3">
+            <button
+              type="button"
+              onClick={() =>
+                onOpenGroup({
+                  id: collection.id,
+                  title: collection.title,
+                  description: collection.summary,
+                  photos: collection.photos,
+                })
+              }
+              className="flex w-full gap-3 rounded-xl text-left transition hover:bg-white/50 focus:outline-none focus:ring-2 focus:ring-coral/40"
+            >
               {collection.cover && (
                 <div className="h-16 w-16 shrink-0 overflow-hidden rounded-xl bg-muted">
                   <img
@@ -3304,24 +3662,56 @@ function OrganizationBrowser({
                   {collection.summary}
                 </p>
               </div>
-            </div>
+            </button>
 
             <div className="mt-2 space-y-2">
-              {Array.from(collection.events.values()).map((event) => (
-                <div key={event.id} className="rounded-xl bg-white/70 p-2">
-                  <div className="flex items-center justify-between gap-2">
+              {Array.from(collection.events.values()).map((eventGroup) => (
+                <div key={eventGroup.id} className="rounded-xl bg-white/70 p-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onOpenGroup({
+                        id: eventGroup.id,
+                        title: eventGroup.title,
+                        description: eventGroup.description,
+                        photos: eventGroup.photos,
+                      })
+                    }
+                    className="flex w-full items-center justify-between gap-2 rounded-lg text-left transition hover:bg-cream/60 focus:outline-none focus:ring-2 focus:ring-coral/40"
+                  >
                     <div className="min-w-0">
-                      <div className="truncate text-xs font-semibold">{event.title}</div>
+                      <div className="truncate text-xs font-semibold">{eventGroup.title}</div>
                       <div className="line-clamp-1 text-[11px] text-muted-foreground">
-                        {event.description}
+                        {eventGroup.description}
                       </div>
                     </div>
-                    <span className="chip bg-ink/5 text-ink/70">{event.photos.length}</span>
-                  </div>
+                    <span className="chip bg-ink/5 text-ink/70">{eventGroup.photos.length}</span>
+                  </button>
                   <div className="mt-2 flex gap-1 overflow-x-auto pb-1 no-scrollbar">
-                    {event.photos.map((photo) => (
+                    {eventGroup.photos.map((photo) => (
                       <div
+                        role="button"
+                        tabIndex={0}
                         key={photo.id}
+                        onClick={() =>
+                          onOpenGroup({
+                            id: eventGroup.id,
+                            title: eventGroup.title,
+                            description: eventGroup.description,
+                            photos: eventGroup.photos,
+                          })
+                        }
+                        onKeyDown={(keyboardEvent) => {
+                          if (keyboardEvent.key === "Enter" || keyboardEvent.key === " ") {
+                            keyboardEvent.preventDefault();
+                            onOpenGroup({
+                              id: eventGroup.id,
+                              title: eventGroup.title,
+                              description: eventGroup.description,
+                              photos: eventGroup.photos,
+                            });
+                          }
+                        }}
                         className="group relative h-14 w-14 shrink-0 overflow-hidden rounded-lg bg-muted"
                       >
                         <img
@@ -3333,7 +3723,10 @@ function OrganizationBrowser({
                         />
                         <button
                           type="button"
-                          onClick={() => onRemovePhoto(photo)}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            onRemovePhoto(photo);
+                          }}
                           className="absolute right-1 top-1 grid h-5 w-5 place-items-center rounded-full bg-black/65 text-white opacity-100 shadow transition sm:opacity-0 sm:group-hover:opacity-100"
                           aria-label={`Remove ${photo.name} from event`}
                         >
@@ -3950,11 +4343,56 @@ function FinalStage() {
 }
 
 /* ───────────── Export ───────────── */
+function inferAiGeneratedCollectionTitle(photos: Photo[]) {
+  const titles = new Map<string, number>();
+  for (const photo of photos) {
+    const title = photo.collectionGroup?.title?.trim();
+    if (!title || /camera roll|photo moment|miscellaneous/i.test(title)) continue;
+    titles.set(title, (titles.get(title) ?? 0) + 1);
+  }
+  const [best] = Array.from(titles.entries()).sort((a, b) => b[1] - a[1])[0] ?? [];
+  return best ?? "FotoFairy Collection";
+}
+
+function normalizeCollectionTitleForSave(
+  aiGeneratedTitle: string,
+  userCaption: string,
+): CollectionTitleMetadata {
+  const aiTitle = aiGeneratedTitle.trim().slice(0, 100) || "FotoFairy Collection";
+  const caption = userCaption.trim().slice(0, 100);
+  return {
+    aiGeneratedTitle: aiTitle,
+    userCaption: caption || undefined,
+    displayTitle: caption || aiTitle,
+  };
+}
+
 function ExportStage() {
   const { state, dispatch } = useDumpDeck();
   const { user } = useAuth();
   const [downloading, setDownloading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const aiGeneratedTitle = useMemo(
+    () =>
+      state.collectionTitleMetadata?.aiGeneratedTitle ??
+      inferAiGeneratedCollectionTitle(state.finalOrder),
+    [state.collectionTitleMetadata?.aiGeneratedTitle, state.finalOrder],
+  );
+  const [collectionCaption, setCollectionCaption] = useState(
+    () =>
+      state.collectionTitleMetadata?.userCaption ??
+      state.collectionTitleMetadata?.displayTitle ??
+      aiGeneratedTitle,
+  );
+  const collectionTitleMetadata = useMemo(
+    () => normalizeCollectionTitleForSave(aiGeneratedTitle, collectionCaption),
+    [aiGeneratedTitle, collectionCaption],
+  );
+
+  useEffect(() => {
+    if (state.collectionTitleMetadata) return;
+    dispatch({ type: "setCollectionTitleMetadata", metadata: collectionTitleMetadata });
+  }, [collectionTitleMetadata, dispatch, state.collectionTitleMetadata]);
 
   function removeSlide(id: string) {
     const photo = state.finalOrder.find((p) => p.id === id);
@@ -4006,6 +4444,8 @@ function ExportStage() {
         settings: state.settings,
         duplicateDecisions: state.duplicateDecisions,
         pinnedCoverPhotoId: state.pinnedCoverId,
+        favoritePhotoIds: state.favoritePhotoIds,
+        collectionTitleMetadata,
       });
       console.debug("[dumpdeck] draft save response", {
         userId: user?.id,
@@ -4090,6 +4530,31 @@ function ExportStage() {
       )}
 
       <CaptionIdeas />
+
+      <div className="mt-6 rounded-3xl bg-white/70 p-4 shadow-sm">
+        <label htmlFor="collection-caption" className="text-sm font-bold text-ink">
+          Collection caption
+        </label>
+        <p className="mt-1 text-xs text-muted-foreground">
+          This will appear as the saved collection title.
+        </p>
+        <input
+          id="collection-caption"
+          value={collectionCaption}
+          maxLength={100}
+          onChange={(event) => {
+            const next = event.target.value.slice(0, 100);
+            setCollectionCaption(next);
+            dispatch({
+              type: "setCollectionTitleMetadata",
+              metadata: normalizeCollectionTitleForSave(aiGeneratedTitle, next),
+            });
+          }}
+          placeholder={aiGeneratedTitle}
+          className="mt-3 h-12 w-full rounded-2xl border border-ink/10 bg-cream px-4 text-sm font-semibold text-ink outline-none transition focus:border-coral"
+        />
+        <p className="mt-2 text-[11px] text-muted-foreground">AI label: {aiGeneratedTitle}</p>
+      </div>
 
       <div className="mt-6 space-y-2">
         <Button

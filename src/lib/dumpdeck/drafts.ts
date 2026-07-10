@@ -17,6 +17,12 @@ export type DuplicateDecisionDraft = {
   reason: string;
 };
 
+export type CollectionTitleMetadata = {
+  aiGeneratedTitle?: string;
+  userCaption?: string;
+  displayTitle?: string;
+};
+
 export type SaveDraftInput = {
   draftId?: string | null;
   projectId?: string | null;
@@ -26,6 +32,8 @@ export type SaveDraftInput = {
   settings: Settings;
   duplicateDecisions: DuplicateDecisionDraft[];
   pinnedCoverPhotoId?: string | null;
+  favoritePhotoIds?: string[];
+  collectionTitleMetadata?: CollectionTitleMetadata | null;
   saveAsNew?: boolean;
 };
 
@@ -41,6 +49,8 @@ export type AutosaveDraftInput = {
   settings: Settings;
   duplicateDecisions: DuplicateDecisionDraft[];
   pinnedCoverPhotoId?: string | null;
+  favoritePhotoIds?: string[];
+  collectionTitleMetadata?: CollectionTitleMetadata | null;
 };
 
 export type AutosaveDraftResult = SaveDraftResult & {
@@ -123,7 +133,10 @@ export function missingDraftFields(draft: SavedFinalDraft | null | undefined) {
   if (payload && (!Array.isArray(payload.finalOrder) || payload.finalOrder.length === 0)) {
     missing.push("draft_payload.finalOrder");
   }
-  if (payload && (!Array.isArray(payload.orderedPhotoIds) || payload.orderedPhotoIds.length === 0)) {
+  if (
+    payload &&
+    (!Array.isArray(payload.orderedPhotoIds) || payload.orderedPhotoIds.length === 0)
+  ) {
     missing.push("draft_payload.orderedPhotoIds");
   }
   const photosMissingDisplay = (payload?.finalOrder ?? []).filter((photo) => {
@@ -162,7 +175,10 @@ export async function saveFinalDraft(input: SaveDraftInput): Promise<SaveDraftRe
     throw new Error("Choose or create a collection before saving.");
   }
 
-  const draftPhotos = uniquePhotos([...input.finalOrder, ...input.removed.map((entry) => entry.photo)]);
+  const draftPhotos = uniquePhotos([
+    ...input.finalOrder,
+    ...input.removed.map((entry) => entry.photo),
+  ]);
   const storageStartedAt = performance.now();
   const storagePhotos = await persistFinalDraftPhotos(input.projectId, draftPhotos);
   const storageMs = Math.round(performance.now() - storageStartedAt);
@@ -184,6 +200,10 @@ export async function saveFinalDraft(input: SaveDraftInput): Promise<SaveDraftRe
     selected_preferences: {
       ...storageBackedInput.settings,
       pinnedCoverPhotoId: storageBackedInput.pinnedCoverPhotoId ?? null,
+      favoritePhotoIds: storageBackedInput.favoritePhotoIds ?? [],
+      collectionTitleMetadata: normalizeCollectionTitleMetadata(
+        storageBackedInput.collectionTitleMetadata,
+      ),
     },
     scores_reasons: payload.scoresReasons,
     draft_payload: payload,
@@ -321,6 +341,10 @@ export async function autosaveWorkspaceDraft(
       ...storageBackedInput.settings,
       pinnedCoverPhotoId: storageBackedInput.pinnedCoverPhotoId ?? null,
       autosaveStage: storageBackedInput.stage,
+      favoritePhotoIds: storageBackedInput.favoritePhotoIds ?? [],
+      collectionTitleMetadata: normalizeCollectionTitleMetadata(
+        storageBackedInput.collectionTitleMetadata,
+      ),
     },
     scores_reasons: payload.scoresReasons,
     draft_payload: payload,
@@ -395,6 +419,7 @@ function makeCompactAutosavePayload(input: AutosaveDraftInput): FinalDraftPayloa
     allPhotos.find((candidate) => candidate.id === photo.id) ?? stripLargeInlinePhotoUrls(photo);
   const now = new Date().toISOString();
   const finalOrder = input.finalOrder.map(replacePhoto);
+  const collectionTitleMetadata = normalizeCollectionTitleMetadata(input.collectionTitleMetadata);
   const removed = input.removed.map((entry) => ({
     ...entry,
     photo: replacePhoto(entry.photo),
@@ -413,6 +438,8 @@ function makeCompactAutosavePayload(input: AutosaveDraftInput): FinalDraftPayloa
     pinnedCoverPhotoId: input.pinnedCoverPhotoId ?? null,
     rejectedPhotoIds: removed.map((entry) => entry.photo.id),
     duplicateDecisions: input.duplicateDecisions,
+    favoritePhotoIds: input.favoritePhotoIds ?? [],
+    collectionTitleMetadata,
     selectedPreferences: input.settings,
     captionIdeas: finalOrder.length ? generateCaptions(finalOrder, input.settings.vibes, 0) : [],
     scoresReasons: allPhotos.map((photo) => ({
@@ -430,7 +457,10 @@ function makeCompactAutosavePayload(input: AutosaveDraftInput): FinalDraftPayloa
   };
 }
 
-function replaceDraftPhotos(input: SaveDraftInput, replacements: Map<string, Photo>): SaveDraftInput {
+function replaceDraftPhotos(
+  input: SaveDraftInput,
+  replacements: Map<string, Photo>,
+): SaveDraftInput {
   const replacePhoto = (photo: Photo) => replacements.get(photo.id) ?? photo;
   return {
     ...input,
@@ -449,6 +479,21 @@ function uniquePhotos(photos: Photo[]) {
   return Array.from(byId.values());
 }
 
+function normalizeCollectionTitleMetadata(
+  metadata?: CollectionTitleMetadata | null,
+): CollectionTitleMetadata | null {
+  const aiGeneratedTitle = metadata?.aiGeneratedTitle?.trim().slice(0, 100) ?? "";
+  const userCaption = metadata?.userCaption?.trim().slice(0, 100) ?? "";
+  const displayTitle =
+    userCaption || metadata?.displayTitle?.trim().slice(0, 100) || aiGeneratedTitle;
+  if (!aiGeneratedTitle && !displayTitle) return null;
+  return {
+    aiGeneratedTitle: aiGeneratedTitle || displayTitle,
+    userCaption: userCaption || undefined,
+    displayTitle,
+  };
+}
+
 async function updateProjectSummary(
   projectId: string | null | undefined,
   userId: string,
@@ -457,12 +502,16 @@ async function updateProjectSummary(
 ) {
   const id = asUuid(projectId);
   if (!id) return;
+  const displayTitle = payload.collectionTitleMetadata?.displayTitle?.trim();
   const { error } = await supabase
     .from("saved_projects")
     .update({
+      ...(displayTitle ? { title: displayTitle } : {}),
       selected_preferences: {
         ...payload.selectedPreferences,
         pinnedCoverPhotoId: payload.pinnedCoverPhotoId ?? null,
+        favoritePhotoIds: payload.favoritePhotoIds ?? [],
+        collectionTitleMetadata: payload.collectionTitleMetadata ?? null,
       },
       duplicate_decisions: payload.duplicateDecisions,
       final_order_photo_ids: payload.orderedPhotoIds,
@@ -619,6 +668,8 @@ function buildDraftPayload(input: SaveDraftInput) {
     pinnedCoverPhotoId: input.pinnedCoverPhotoId ?? null,
     rejectedPhotoIds: input.removed.map((entry) => entry.photo.id),
     duplicateDecisions: input.duplicateDecisions,
+    favoritePhotoIds: input.favoritePhotoIds ?? [],
+    collectionTitleMetadata: normalizeCollectionTitleMetadata(input.collectionTitleMetadata),
     selectedPreferences: input.settings,
     captionIdeas: generateCaptions(input.finalOrder, input.settings.vibes, 0),
     scoresReasons: [

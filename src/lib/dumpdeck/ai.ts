@@ -805,14 +805,23 @@ function categoryKey(photo: Photo) {
   const scene = sceneKey(photo).toLowerCase();
   if (peopleWeight(photo) >= 0.65 || photo.photoType === "group") return "group";
   if (peopleWeight(photo) > 0.1 || photo.photoType === "selfie") return "people";
-  if (photo.photoType === "food" || objects.some((label) => /food|drink|coffee|pizza|plate/.test(label))) {
+  if (
+    photo.photoType === "food" ||
+    objects.some((label) => /food|drink|coffee|pizza|plate/.test(label))
+  ) {
     return "food";
   }
-  if (photo.photoType === "outfit" || objects.some((label) => /clothing|dress|shoe|bag/.test(label))) {
+  if (
+    photo.photoType === "outfit" ||
+    objects.some((label) => /clothing|dress|shoe|bag/.test(label))
+  ) {
     return "outfit";
   }
   if (/city|building|architecture|street/.test(scene)) return "architecture";
-  if (/beach|ocean|mountain|forest|landscape|sunset|nature/.test(scene) || photo.photoType === "landscape") {
+  if (
+    /beach|ocean|mountain|forest|landscape|sunset|nature/.test(scene) ||
+    photo.photoType === "landscape"
+  ) {
     return "scenery";
   }
   if (photo.photoType === "detail") return "detail";

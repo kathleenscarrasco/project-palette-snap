@@ -84,7 +84,10 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
           "AI-powered photo collection curator. Upload, narrow down, swipe, and order the perfect Instagram carousel.",
       },
       { name: "author", content: "FotoFairy" },
-      { property: "og:title", content: "FotoFairy — Turn hundreds of photos into the ones you keep" },
+      {
+        property: "og:title",
+        content: "FotoFairy — Turn hundreds of photos into the ones you keep",
+      },
       {
         property: "og:description",
         content:
@@ -92,7 +95,10 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
-      { name: "twitter:title", content: "FotoFairy — Turn hundreds of photos into the ones you keep" },
+      {
+        name: "twitter:title",
+        content: "FotoFairy — Turn hundreds of photos into the ones you keep",
+      },
       {
         name: "twitter:description",
         content:

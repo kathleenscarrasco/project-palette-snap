@@ -290,7 +290,8 @@ export function UploadGrid({
         try {
           const item = await readImage(file);
           ready += 1;
-          if (firstPreviewMs === null) firstPreviewMs = Math.round(performance.now() - batchStartedAt);
+          if (firstPreviewMs === null)
+            firstPreviewMs = Math.round(performance.now() - batchStartedAt);
           onAdd([item]);
           console.debug("[perf] upload file selection item ready", {
             name: file.name,
