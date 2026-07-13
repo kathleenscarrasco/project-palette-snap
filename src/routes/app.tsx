@@ -5461,14 +5461,23 @@ function canNativeShareFiles(files: File[]) {
   }
 }
 
+function isMobileInstagramTarget() {
+  return /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+}
+
 function ExportStage() {
   const { state, dispatch } = useDumpDeck();
   const { user } = useAuth();
   const [downloading, setDownloading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [savedDraftId, setSavedDraftId] = useState(() => activeDraftId());
-  const [instagramOpen, setInstagramOpen] = useState(false);
-  const instagramEnabled = instagramExportEnabled();
+  const [instagramPostReadyOpen, setInstagramPostReadyOpen] = useState(false);
+  const [instagramPosting, setInstagramPosting] = useState(false);
+  const [instagramPostStatus, setInstagramPostStatus] = useState({
+    saved: Boolean(activeDraftId()),
+    downloaded: false,
+    captionCopied: false,
+  });
   const aiGeneratedTitle = useMemo(
     () =>
       state.collectionTitleMetadata?.aiGeneratedTitle ??
@@ -5507,13 +5516,38 @@ function ExportStage() {
     toast("Removed from collection");
   }
 
-  async function download() {
+  useEffect(() => {
+    function welcomeBackFromInstagram() {
+      try {
+        if (sessionStorage.getItem("fotofairy:instagramReturnToast") !== "1") return;
+        sessionStorage.removeItem("fotofairy:instagramReturnToast");
+        toast("Hope your post gets all the likes ❤️", { duration: 6500 });
+      } catch {
+        // Session storage can be unavailable in strict browser modes.
+      }
+    }
+    window.addEventListener("focus", welcomeBackFromInstagram);
+    document.addEventListener("visibilitychange", welcomeBackFromInstagram);
+    welcomeBackFromInstagram();
+    return () => {
+      window.removeEventListener("focus", welcomeBackFromInstagram);
+      document.removeEventListener("visibilitychange", welcomeBackFromInstagram);
+    };
+  }, []);
+
+  async function download(options: { showToast?: boolean } = {}) {
+    const { showToast = true } = options;
     setDownloading(true);
     try {
       const zip = new JSZip();
       for (let i = 0; i < state.finalOrder.length; i++) {
         const p = state.finalOrder[i];
-        const blob = await fetch(p.url).then((r) => r.blob());
+        const source = sourceForPhoto(p);
+        if (!source) throw new Error(`Missing image source for slide ${i + 1}.`);
+        const blob = await fetch(source).then((r) => {
+          if (!r.ok) throw new Error(`Could not download slide ${i + 1}.`);
+          return r.blob();
+        });
         const ext = (p.name.split(".").pop() ?? "jpg").replace(/[^a-z0-9]/gi, "") || "jpg";
         zip.file(`slide-${String(i + 1).padStart(2, "0")}.${ext}`, blob);
       }
@@ -5524,9 +5558,11 @@ function ExportStage() {
       a.download = `fotofairy-${Date.now()}.zip`;
       a.click();
       URL.revokeObjectURL(url);
-      toast.success("Downloaded! Time to post.");
+      if (showToast) toast.success("Downloaded! Time to post.");
+      return true;
     } catch {
       toast.error("Download failed.");
+      return false;
     } finally {
       setDownloading(false);
     }
@@ -5562,23 +5598,70 @@ function ExportStage() {
       toast.success(
         result.storage === "supabase" ? "Collection saved" : "Saved locally only for this browser.",
       );
+      return result.id;
     } catch (err) {
       console.error("[dumpdeck] draft save failed", err);
       toast.error("We couldn’t save your collection right now. Please try again.");
+      return null;
     } finally {
       setSaving(false);
     }
   }
 
-  const aspect = FORMAT_ASPECT[state.settings.formats[0] ?? "portrait"];
-  const missingDurableSources = state.finalOrder.filter((photo) => !hasDurableExportSource(photo));
-  const canOpenInstagramExport =
-    instagramEnabled &&
-    state.finalOrder.length > 0 &&
-    state.finalOrder.length <= INSTAGRAM_CAROUSEL_LIMIT &&
-    missingDurableSources.length === 0 &&
-    Boolean(savedDraftId);
+  async function prepareInstagramPost() {
+    if (instagramPosting || state.finalOrder.length === 0) return;
+    setInstagramPosting(true);
+    setInstagramPostStatus({
+      saved: Boolean(savedDraftId),
+      downloaded: false,
+      captionCopied: false,
+    });
+    try {
+      let draftId = savedDraftId;
+      if (!draftId) {
+        draftId = await save();
+        if (!draftId) return;
+      }
+      setInstagramPostStatus((current) => ({ ...current, saved: true }));
 
+      const didDownload = await download({ showToast: false });
+      if (!didDownload) return;
+      setInstagramPostStatus((current) => ({ ...current, downloaded: true }));
+
+      try {
+        await copyTextToClipboard(collectionTitleMetadata.displayTitle ?? collectionCaption);
+        setInstagramPostStatus((current) => ({ ...current, captionCopied: true }));
+        toast.success("Caption copied");
+      } catch {
+        toast.error("Couldn’t copy caption");
+      }
+
+      setInstagramPostReadyOpen(true);
+    } finally {
+      setInstagramPosting(false);
+    }
+  }
+
+  function openInstagram() {
+    try {
+      sessionStorage.setItem("fotofairy:instagramReturnToast", "1");
+    } catch {
+      // Best-effort welcome-back toast only.
+    }
+
+    const webUrl = "https://www.instagram.com/";
+    if (isMobileInstagramTarget()) {
+      window.location.href = "instagram://";
+      window.setTimeout(() => {
+        if (document.visibilityState === "visible") window.location.href = webUrl;
+      }, 1100);
+      return;
+    }
+
+    window.open(webUrl, "_blank", "noopener,noreferrer");
+  }
+
+  const aspect = FORMAT_ASPECT[state.settings.formats[0] ?? "portrait"];
   return (
     <section>
       <Heading
@@ -5674,43 +5757,10 @@ function ExportStage() {
         >
           <Save className="mr-2 h-4 w-4" /> {saving ? "Saving…" : "Save collection"}
         </Button>
-        {instagramEnabled && savedDraftId && (
-          <Button
-            onClick={() => {
-              if (state.finalOrder.length > INSTAGRAM_CAROUSEL_LIMIT) {
-                toast.error(
-                  `Instagram export supports up to ${INSTAGRAM_CAROUSEL_LIMIT} photos. Remove a few before sharing.`,
-                );
-                return;
-              }
-              if (missingDurableSources.length > 0) {
-                toast.error("Save and reopen this collection so every photo has a durable source.");
-                return;
-              }
-              setInstagramOpen(true);
-            }}
-            disabled={!canOpenInstagramExport}
-            className="h-14 w-full rounded-2xl bg-coral text-base font-semibold text-white shadow-lg hover:bg-coral/90"
-          >
-            <Instagram className="mr-2 h-4 w-4" />
-            Share to Instagram
-          </Button>
-        )}
-        {instagramEnabled && !savedDraftId && (
-          <p className="rounded-2xl bg-mint/20 px-3 py-2 text-center text-xs text-muted-foreground">
-            Save this collection first, then FotoFairy can prepare it for Instagram.
-          </p>
-        )}
-        {instagramEnabled && state.finalOrder.length > INSTAGRAM_CAROUSEL_LIMIT && (
-          <p className="rounded-2xl bg-coral/10 px-3 py-2 text-center text-xs text-coral">
-            Instagram export supports up to {INSTAGRAM_CAROUSEL_LIMIT} photos. FotoFairy will not
-            silently omit extras.
-          </p>
-        )}
         <div className="grid grid-cols-2 gap-2">
           <Button
             variant="outline"
-            onClick={download}
+            onClick={() => void download()}
             disabled={downloading || state.finalOrder.length === 0}
             className="h-12 rounded-2xl border-ink/15 bg-white/70 font-semibold"
           >
@@ -5745,31 +5795,128 @@ function ExportStage() {
             Saved Collections
           </Link>
         </div>
+        <Button
+          onClick={prepareInstagramPost}
+          disabled={instagramPosting || saving || downloading || state.finalOrder.length === 0}
+          className="h-14 w-full rounded-2xl bg-ink text-base font-semibold text-cream shadow-lg hover:bg-coral"
+        >
+          {instagramPosting ? "Getting Instagram ready…" : "📸 Post on Instagram"}
+        </Button>
       </div>
 
       <p className="mt-6 text-center text-xs text-muted-foreground">
         Collections save privately when you are signed in.
       </p>
-      {instagramEnabled && (
-        <InstagramExportModal
-          open={instagramOpen}
-          onClose={() => setInstagramOpen(false)}
-          photos={state.finalOrder}
-          titleMetadata={collectionTitleMetadata}
-          pinnedCoverId={state.pinnedCoverId}
-          onMetadataChange={(metadata) =>
-            dispatch({
-              type: "setCollectionTitleMetadata",
-              metadata: {
-                ...state.collectionTitleMetadata,
-                ...metadata,
-              },
-            })
-          }
-        />
-      )}
+      <InstagramPostReadyModal
+        open={instagramPostReadyOpen}
+        status={instagramPostStatus}
+        onClose={() => setInstagramPostReadyOpen(false)}
+        onOpenInstagram={() => {
+          setInstagramPostReadyOpen(false);
+          openInstagram();
+        }}
+      />
       <DebugPanel />
     </section>
+  );
+}
+
+function InstagramPostReadyModal({
+  open,
+  status,
+  onClose,
+  onOpenInstagram,
+}: {
+  open: boolean;
+  status: { saved: boolean; downloaded: boolean; captionCopied: boolean };
+  onClose: () => void;
+  onOpenInstagram: () => void;
+}) {
+  useEffect(() => {
+    if (!open) return;
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") onClose();
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose, open]);
+
+  return (
+    <AnimatePresence>
+      {open && (
+        <motion.div
+          className="fixed inset-0 z-50 grid place-items-center bg-ink/45 p-4 backdrop-blur-sm"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          onMouseDown={onClose}
+        >
+          <motion.div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="instagram-post-ready-title"
+            className="w-full max-w-sm rounded-3xl bg-cream p-6 shadow-2xl"
+            initial={{ y: 24, opacity: 0, scale: 0.98 }}
+            animate={{ y: 0, opacity: 1, scale: 1 }}
+            exit={{ y: 24, opacity: 0, scale: 0.98 }}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <div className="text-3xl" aria-hidden>
+                  📸
+                </div>
+                <h2 id="instagram-post-ready-title" className="font-display mt-2 text-3xl">
+                  Ready to post!
+                </h2>
+              </div>
+              <button
+                type="button"
+                onClick={onClose}
+                className="grid h-9 w-9 place-items-center rounded-full bg-white text-ink shadow-sm"
+                aria-label="Close Instagram posting instructions"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="mt-5 space-y-2 text-sm font-semibold text-ink">
+              <div className="flex items-center gap-2">
+                <Check className="h-4 w-4 text-coral" />
+                Collection saved
+              </div>
+              <div className="flex items-center gap-2">
+                <Check className="h-4 w-4 text-coral" />
+                Photos downloaded
+              </div>
+              <div className="flex items-center gap-2">
+                <Check className="h-4 w-4 text-coral" />
+                Caption copied
+              </div>
+            </div>
+
+            {(!status.saved || !status.downloaded || !status.captionCopied) && (
+              <p className="mt-3 rounded-2xl bg-coral/10 px-3 py-2 text-xs text-coral">
+                One step may need your attention. You can still open Instagram, then come back to
+                FotoFairy if you need to copy or download again.
+              </p>
+            )}
+
+            <p className="mt-4 text-sm leading-relaxed text-muted-foreground">
+              Instagram doesn’t allow websites to publish posts automatically, but everything is
+              ready for you.
+            </p>
+
+            <Button
+              onClick={onOpenInstagram}
+              className="mt-5 h-14 w-full rounded-2xl bg-ink text-base font-semibold text-cream shadow-lg hover:bg-coral"
+            >
+              Open Instagram →
+            </Button>
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
   );
 }
 
