@@ -50,3 +50,15 @@ npm run check:supabase
 
 The check verifies the signed-in user path for project tables and private photo
 Storage without using service-role keys.
+
+## Instagram export
+
+FotoFairy supports a browser-side Instagram sharing flow that converts the final
+collection into numbered JPEG files, copies the caption, and uses native file
+sharing when the browser supports it. Configure `VITE_INSTAGRAM_SHARE_ENABLED`
+for that universal share/export surface.
+
+Direct Instagram API publishing is intentionally disabled until a Meta developer
+app, OAuth redirect, eligible Creator/Business test account, App Review, privacy
+policy, and data-deletion flow are ready. See
+[docs/instagram-v2-publishing.md](docs/instagram-v2-publishing.md).
