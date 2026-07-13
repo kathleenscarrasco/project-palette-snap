@@ -48,9 +48,9 @@ type TitleCandidate = {
   confidence: number;
 };
 
-const EVENT_CONFIDENCE_THRESHOLD = 0.6;
-const EVENT_STRONG_CONFIDENCE_THRESHOLD = 0.74;
-const COLLECTION_CONFIDENCE_THRESHOLD = 0.66;
+const EVENT_CONFIDENCE_THRESHOLD = 0.54;
+const EVENT_STRONG_CONFIDENCE_THRESHOLD = 0.68;
+const COLLECTION_CONFIDENCE_THRESHOLD = 0.62;
 const GENERIC_TITLES = new Set([
   "photo moment",
   "memory",
@@ -59,6 +59,7 @@ const GENERIC_TITLES = new Set([
   "miscellaneous",
   "similar moment",
   "recent memories",
+  "camera roll highlights",
 ]);
 
 export function organizePhotos(photos: Photo[]): OrganizationResult {
@@ -69,12 +70,16 @@ export function organizePhotos(photos: Photo[]): OrganizationResult {
   const collectionByPhoto = new Map<string, CollectionAnalysis>();
 
   events.forEach((event) => {
-    event.photos.forEach((photo) => eventByPhoto.set(photo.id, eventSummary(event)));
+    if (event.photos.length > 1) {
+      event.photos.forEach((photo) => eventByPhoto.set(photo.id, eventSummary(event)));
+    }
   });
   collections.forEach((collection) => {
-    collection.photos.forEach((photo) =>
-      collectionByPhoto.set(photo.id, collectionSummary(collection)),
-    );
+    if (collection.photos.length > 1) {
+      collection.photos.forEach((photo) =>
+        collectionByPhoto.set(photo.id, collectionSummary(collection)),
+      );
+    }
   });
 
   console.debug("[dumpdeck] semantic organization", {
@@ -157,7 +162,7 @@ function buildCollections(
   metadata: Map<string, SemanticMetadata>,
 ): CollectionGroup[] {
   const groups: EventGroup[][] = [];
-  for (const event of events) {
+  for (const event of events.filter((candidate) => candidate.photos.length > 1)) {
     let bestMatch: { group: EventGroup[]; score: number } | null = null;
     for (const group of groups) {
       const score = collectionAffinity(group, event, metadata);
@@ -202,28 +207,105 @@ function splitWeakGroups(groups: Photo[][], metadata: Map<string, SemanticMetada
     }
     const confidence = groupConfidence(group, metadata, eventPairSignal);
     const cohesion = groupCohesion(group, metadata);
+    const span = timeSpanMs(group);
     const suspiciousLargeGroup =
-      group.length > 10 && (confidence < 0.78 || cohesion.visualP25 < 0.78);
+      group.length > 10 &&
+      (!Number.isFinite(span) || span > 1000 * 60 * 90) &&
+      cohesion.visualP25 < 0.72;
     const weakGroup =
-      confidence < EVENT_CONFIDENCE_THRESHOLD ||
-      cohesion.visualP25 < 0.62 ||
-      cohesion.signalP25 < 0.56 ||
-      cohesion.locationConsistency < 0.55 ||
-      cohesion.subjectConsistency < 0.42;
+      confidence < 0.5 ||
+      (cohesion.visualP25 < 0.54 && cohesion.signalP25 < 0.5) ||
+      suspiciousLargeGroup;
     if (weakGroup || suspiciousLargeGroup) {
+      const recovered = recoverSubgroups(group, metadata);
       console.debug("[dumpdeck] split weak organization group", {
         memberIds: group.map((photo) => photo.id),
         memberNames: group.map((photo) => photo.name),
         confidence,
         cohesion,
-        splitDecision: "standalone",
+        recoveredGroupSizes: recovered.map((candidate) => candidate.length),
+        splitDecision: recovered.some((candidate) => candidate.length > 1)
+          ? "subclusters"
+          : "standalone",
       });
-      group.forEach((photo) => out.push([photo]));
+      out.push(...recovered);
       continue;
     }
     out.push(group);
   }
   return out;
+}
+
+function recoverSubgroups(
+  photos: Photo[],
+  metadata: Map<string, SemanticMetadata>,
+  depth = 0,
+): Photo[][] {
+  if (photos.length <= 2 || depth > 1) return photos.map((photo) => [photo]);
+
+  const parent = photos.map((_, index) => index);
+  for (let i = 0; i < photos.length; i++) {
+    for (let j = i + 1; j < photos.length; j++) {
+      const signal = sameMomentSignal(photos[i], photos[j], metadata);
+      if (signal.score >= sameMomentThreshold(photos[i], photos[j])) {
+        union(parent, i, j);
+      }
+    }
+  }
+
+  const components = new Map<number, Photo[]>();
+  photos.forEach((photo, index) => {
+    const root = find(parent, index);
+    components.set(root, [...(components.get(root) ?? []), photo]);
+  });
+
+  const recovered: Photo[][] = [];
+  for (const component of components.values()) {
+    if (component.length <= 1) {
+      recovered.push(component);
+      continue;
+    }
+    const cohesion = groupCohesion(component, metadata);
+    const span = timeSpanMs(component);
+    const largeNeedsTimeSupport =
+      component.length >= 9 &&
+      (!Number.isFinite(span) || span > 1000 * 60 * 90) &&
+      cohesion.visualP25 < 0.74;
+    const valid =
+      cohesion.signalMean >= 0.54 &&
+      (cohesion.visualP25 >= 0.54 || cohesion.signalP25 >= 0.5) &&
+      !largeNeedsTimeSupport;
+    if (valid) {
+      recovered.push(component);
+    } else {
+      recovered.push(...recoverSubgroups(component, metadata, depth + 1));
+    }
+  }
+
+  return recovered.length ? recovered : photos.map((photo) => [photo]);
+}
+
+function sameMomentSignal(a: Photo, b: Photo, metadata: Map<string, SemanticMetadata>) {
+  const aMeta = metadata.get(a.id) ?? buildSemanticMetadata(a);
+  const bMeta = metadata.get(b.id) ?? buildSemanticMetadata(b);
+  const visual = visualSimilarity(a, b);
+  const time = timeSignal(a, b).score;
+  const scene = locationSimilarity(aMeta, bMeta);
+  const subject = subjectSimilarity(aMeta, bMeta);
+  const people = peopleSimilarity(aMeta, bMeta);
+  const location = sameLocationFamily(aMeta.locationType, bMeta.locationType) ? 0.55 : scene;
+  const score =
+    visual * 0.4 + time * 0.25 + scene * 0.15 + subject * 0.1 + people * 0.05 + location * 0.05;
+  return { score: clamp(score), visual, time, scene, subject, people, location };
+}
+
+function sameMomentThreshold(a: Photo, b: Photo) {
+  const distance = timeDistance(a, b);
+  if (distance <= 1000 * 60 * 2) return 0.58;
+  if (distance <= 1000 * 60 * 10) return 0.62;
+  if (distance <= 1000 * 60 * 30) return 0.68;
+  if (distance <= 1000 * 60 * 90) return 0.74;
+  return 0.82;
 }
 
 function groupCohesion(photos: Photo[], metadata: Map<string, SemanticMetadata>) {
@@ -320,9 +402,13 @@ function eventPairSignal(a: Photo, b: Photo, metadata: Map<string, SemanticMetad
   ].filter(Boolean).length;
   const hasVisualAnchor = visual >= 0.82 || a.duplicateClusterId === b.duplicateClusterId;
   const hasTimeVisualSupport =
-    time.score >= 0.88 && visual >= 0.72 && (subjects >= 0.55 || location >= 0.8);
+    time.score >= 0.88 && visual >= 0.68 && (subjects >= 0.35 || location >= 0.55 || color >= 0.65);
 
-  if (strongSignalCount < 2 || (!hasVisualAnchor && !hasTimeVisualSupport)) {
+  if (strongSignalCount < 2 && !hasTimeVisualSupport) {
+    return { score: Math.min(clamp(score), 0.44), reasons: reasons.slice(0, 5) };
+  }
+
+  if (!hasVisualAnchor && !hasTimeVisualSupport) {
     return { score: Math.min(clamp(score), 0.44), reasons: reasons.slice(0, 5) };
   }
 
@@ -433,7 +519,7 @@ function eventTitle(photos: Photo[], metadata: Map<string, SemanticMetadata>): T
   if (topSubject && topSubject[0] !== "unknown") {
     return { title: titleCase(topSubject[0]), confidence: 0.56 };
   }
-  return { title: "Camera Roll Highlights", confidence: 0.42 };
+  return { title: "Similar Photos", confidence: 0.42 };
 }
 
 function collectionTitle(
@@ -465,7 +551,7 @@ function collectionTitle(
   if (photos.some((photo) => (metadata.get(photo.id)?.faceCount ?? 0) > 0)) {
     return { title: "People & Places", confidence: 0.62 };
   }
-  return { title: "Camera Roll Highlights", confidence: 0.5 };
+  return { title: "Similar Photos", confidence: 0.5 };
 }
 
 function validateTitle(
@@ -515,7 +601,7 @@ function validateTitle(
   if (candidate.confidence < 0.5 || GENERIC_TITLES.has(title.toLowerCase())) {
     title = broaderGroundedTitle(photos, metadata);
   }
-  return title || "Camera Roll Highlights";
+  return title || "Similar Photos";
 }
 
 function broaderGroundedTitle(photos: Photo[], metadata: Map<string, SemanticMetadata>) {
@@ -530,7 +616,7 @@ function broaderGroundedTitle(photos: Photo[], metadata: Map<string, SemanticMet
   if (topSubject && topSubject[0] !== "unknown") return titleCase(topSubject[0]);
   return photos.some((photo) => (metadata.get(photo.id)?.faceCount ?? 0) > 0)
     ? "People Photos"
-    : "Camera Roll Highlights";
+    : "Similar Photos";
 }
 
 function eventDescription(
@@ -1132,6 +1218,17 @@ function percentile(values: number[], percentileValue: number) {
 
 function rankingScore(photo: Photo) {
   return photo.ranking?.overallScore ?? photo.overall;
+}
+
+function find(parent: number[], index: number): number {
+  if (parent[index] !== index) parent[index] = find(parent, parent[index]);
+  return parent[index];
+}
+
+function union(parent: number[], a: number, b: number) {
+  const rootA = find(parent, a);
+  const rootB = find(parent, b);
+  if (rootA !== rootB) parent[rootB] = rootA;
 }
 
 function clamp(value: number) {

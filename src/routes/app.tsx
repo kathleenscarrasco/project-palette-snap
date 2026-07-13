@@ -1557,13 +1557,9 @@ function buildCanonicalScanState(rows: AnalysisRow[]): CanonicalScanState {
   const totalCount = rows.length;
   const usableCount = rows.filter(rowIsUsable).length;
   const skippedCount = rows.filter((row) => row.status === "skipped").length;
-  const reviewNeededCount = rows.filter(
-    (row) =>
-      row.status === "failed" ||
-      (rowHasQuickScanResult(row) && !rowIsUsable(row) && row.status !== "skipped"),
-  ).length;
+  const scannedCount = Math.min(totalCount, rows.filter(rowHasQuickScanResult).length);
+  const reviewNeededCount = Math.max(0, scannedCount - usableCount - skippedCount);
   const deepReviewedCount = rows.filter((row) => row.geminiCandidate).length;
-  const scannedCount = Math.min(totalCount, usableCount + skippedCount + reviewNeededCount);
   const pendingCount = Math.max(0, totalCount - scannedCount);
   return {
     totalCount,
@@ -1765,7 +1761,7 @@ function AnalyzeStage() {
     quickScanComplete && phase !== "loading" && phase !== "preparing" && scanState.usableCount >= 4;
 
   const progressLabel = scanState.complete
-    ? `${scanState.totalCount} photo${scanState.totalCount === 1 ? "" : "s"} scanned`
+    ? `Scanned ${scanState.scannedCount} of ${scanState.totalCount} photo${scanState.totalCount === 1 ? "" : "s"}`
     : scanState.totalCount > 0
       ? `Scanning ${scanState.scannedCount} of ${scanState.totalCount} photo${scanState.totalCount === 1 ? "" : "s"}`
       : failedRows.length
@@ -3638,7 +3634,7 @@ function OrganizationBrowser({
   onOpenGroup: (group: ReviewGroup) => void;
   onRemovePhoto: (photo: Photo) => void;
 }) {
-  const collections = useMemo(() => {
+  const organization = useMemo(() => {
     const byCollection = new Map<
       string,
       {
@@ -3650,17 +3646,23 @@ function OrganizationBrowser({
         photos: Photo[];
       }
     >();
+    const standalonePhotos: Photo[] = [];
 
     photos.forEach((photo) => {
       const collection = photo.collectionGroup;
       const event = photo.eventGroup;
-      const collectionId = collection?.groupId || "collection_unfiled";
+      if (!collection || !event) {
+        standalonePhotos.push(photo);
+        return;
+      }
+
+      const collectionId = collection.groupId;
       if (!byCollection.has(collectionId)) {
         byCollection.set(collectionId, {
           id: collectionId,
-          title: collection?.title || "Camera Roll",
-          summary: collection?.summary || "Photos that have not been grouped into a collection.",
-          cover: photos.find((candidate) => candidate.id === collection?.coverPhoto) ?? photo,
+          title: collection.title || "Similar Photos",
+          summary: collection.summary || "Photos grouped from the same moment.",
+          cover: photos.find((candidate) => candidate.id === collection.coverPhoto) ?? photo,
           events: new Map(),
           photos: [],
         });
@@ -3668,19 +3670,19 @@ function OrganizationBrowser({
       const collectionGroup = byCollection.get(collectionId)!;
       collectionGroup.photos.push(photo);
 
-      const eventId = event?.groupId || `event_${photo.id}`;
+      const eventId = event.groupId;
       if (!collectionGroup.events.has(eventId)) {
         collectionGroup.events.set(eventId, {
           id: eventId,
-          title: event?.title || "Ungrouped photo",
-          description: event?.description || "Single photo from the camera roll.",
+          title: event.title || "Same Moment",
+          description: event.description || "Photos grouped from the same moment.",
           photos: [],
         });
       }
       collectionGroup.events.get(eventId)!.photos.push(photo);
     });
 
-    return Array.from(byCollection.values());
+    return { collections: Array.from(byCollection.values()), standalonePhotos };
   }, [photos]);
 
   if (photos.length === 0) return null;
@@ -3698,7 +3700,7 @@ function OrganizationBrowser({
       </div>
 
       <div className="mt-3 space-y-3">
-        {collections.map((collection) => (
+        {organization.collections.map((collection) => (
           <div key={collection.id} className="rounded-2xl bg-cream/80 p-2">
             <button
               type="button"
@@ -3812,6 +3814,80 @@ function OrganizationBrowser({
             </div>
           </div>
         ))}
+        {organization.standalonePhotos.length > 0 && (
+          <div className="rounded-2xl bg-white/70 p-2">
+            <button
+              type="button"
+              onClick={() =>
+                onOpenGroup({
+                  id: "other_photos",
+                  title: "Other Photos",
+                  description: "Photos that did not confidently belong to a specific group.",
+                  photos: organization.standalonePhotos,
+                })
+              }
+              className="flex w-full items-center justify-between gap-2 rounded-xl text-left transition hover:bg-cream/60 focus:outline-none focus:ring-2 focus:ring-coral/40"
+            >
+              <div className="min-w-0">
+                <div className="truncate text-sm font-semibold">Other Photos</div>
+                <div className="line-clamp-1 text-xs text-muted-foreground">
+                  Photos that did not confidently belong to a specific group.
+                </div>
+              </div>
+              <span className="chip bg-ink/5 text-ink/70">
+                {organization.standalonePhotos.length}
+              </span>
+            </button>
+            <div className="mt-2 flex gap-1 overflow-x-auto pb-1 no-scrollbar">
+              {organization.standalonePhotos.map((photo) => (
+                <div
+                  role="button"
+                  tabIndex={0}
+                  key={photo.id}
+                  onClick={() =>
+                    onOpenGroup({
+                      id: "other_photos",
+                      title: "Other Photos",
+                      description: "Photos that did not confidently belong to a specific group.",
+                      photos: organization.standalonePhotos,
+                    })
+                  }
+                  onKeyDown={(keyboardEvent) => {
+                    if (keyboardEvent.key === "Enter" || keyboardEvent.key === " ") {
+                      keyboardEvent.preventDefault();
+                      onOpenGroup({
+                        id: "other_photos",
+                        title: "Other Photos",
+                        description: "Photos that did not confidently belong to a specific group.",
+                        photos: organization.standalonePhotos,
+                      });
+                    }
+                  }}
+                  className="group relative h-14 w-14 shrink-0 overflow-hidden rounded-lg bg-muted"
+                >
+                  <img
+                    src={photo.previewUrl ?? photo.url}
+                    alt=""
+                    decoding="async"
+                    loading="lazy"
+                    className="h-full w-full object-cover"
+                  />
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onRemovePhoto(photo);
+                    }}
+                    className="absolute right-1 top-1 grid h-5 w-5 place-items-center rounded-full bg-black/65 text-white opacity-100 shadow transition sm:opacity-0 sm:group-hover:opacity-100"
+                    aria-label={`Remove ${photo.name} from other photos`}
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

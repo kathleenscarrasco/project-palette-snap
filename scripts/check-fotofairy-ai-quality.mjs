@@ -14,8 +14,10 @@ const duplicate = await readFile("src/lib/dumpdeck/pipeline/duplicate-clustering
 const organization = await readFile("src/lib/dumpdeck/pipeline/organization.ts", "utf8");
 
 check(
-  "completed scans render canonical complete label",
-  app.includes("scanState.complete\n    ? `${scanState.totalCount} photo"),
+  "completed scans render canonical Scanned X of Y label",
+  app.includes(
+    "scanState.complete\n    ? `Scanned ${scanState.scannedCount} of ${scanState.totalCount} photo",
+  ),
   "prevents stale Scanned 0/N headings",
 );
 check(
@@ -32,9 +34,9 @@ check(
   duplicate.includes("strongPixelComposition") && duplicate.includes("strongContext"),
 );
 check(
-  "organization has conservative confidence thresholds",
-  organization.includes("const EVENT_CONFIDENCE_THRESHOLD = 0.6") &&
-    organization.includes("const COLLECTION_CONFIDENCE_THRESHOLD = 0.66"),
+  "organization uses middle-ground confidence thresholds",
+  organization.includes("const EVENT_CONFIDENCE_THRESHOLD = 0.54") &&
+    organization.includes("const COLLECTION_CONFIDENCE_THRESHOLD = 0.62"),
 );
 check(
   "organization avoids relationship labels",
@@ -43,8 +45,18 @@ check(
   ),
 );
 check(
-  "weak organization groups are split",
-  organization.includes("splitWeakGroups") && organization.includes("splitDecision"),
+  "weak organization groups recover same-moment subclusters",
+  organization.includes("splitWeakGroups") &&
+    organization.includes("recoverSubgroups") &&
+    organization.includes("sameMomentSignal"),
+);
+check(
+  "standalone photos render as compact Other Photos",
+  app.includes("Other Photos") && app.includes("standalonePhotos"),
+);
+check(
+  "generic Camera Roll Highlights fallback removed",
+  !organization.includes('"Camera Roll Highlights"') && !app.includes('"Camera Roll Highlights"'),
 );
 check(
   "generic grouping explanation removed",
