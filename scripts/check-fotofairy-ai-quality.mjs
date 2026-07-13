@@ -12,6 +12,7 @@ function check(name, ok, detail = "") {
 const app = await readFile("src/routes/app.tsx", "utf8");
 const duplicate = await readFile("src/lib/dumpdeck/pipeline/duplicate-clustering.ts", "utf8");
 const organization = await readFile("src/lib/dumpdeck/pipeline/organization.ts", "utf8");
+const taglines = await readFile("src/lib/dumpdeck/analyzing-taglines.ts", "utf8");
 
 check(
   "completed scans render canonical Scanned X of Y label",
@@ -43,6 +44,16 @@ check(
   !/Couple Photos|Friends at Dinner|subject\.add\("couple"\)|subject\.add\("friends"\)/.test(
     organization,
   ),
+);
+check(
+  "analyzing taglines avoid couple assumptions",
+  !/couples|couple-ish|rom-com|paired-up|soft-launch/i.test(taglines),
+);
+check(
+  "focused review fits full photos by default",
+  /alt=\{current\.name\}[\s\S]*object-contain/.test(app) &&
+    app.includes("Fit full photo") &&
+    app.includes("max-h-[min(62dvh,calc(100dvh-22rem))]"),
 );
 check(
   "weak organization groups recover same-moment subclusters",

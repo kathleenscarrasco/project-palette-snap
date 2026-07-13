@@ -3468,23 +3468,49 @@ function FocusedGroupReview({
             </button>
           </div>
 
-          <div className="relative mt-4 min-h-0 flex-1">
+          <div className="relative mt-4 flex min-h-[260px] flex-1">
             <motion.div
               key={current.id}
-              drag="x"
+              drag={zoomed ? false : "x"}
               dragConstraints={{ left: 0, right: 0 }}
               onDragEnd={onDragEnd}
-              className="relative grid h-full place-items-center overflow-hidden rounded-3xl bg-ink/5"
+              className={`relative grid w-full place-items-center rounded-3xl bg-ink/5 p-2 sm:p-3 ${
+                zoomed ? "overflow-auto" : "overflow-hidden"
+              }`}
             >
               <img
                 src={current.previewUrl ?? current.url}
                 alt={current.name}
+                width={current.width || undefined}
+                height={current.height || undefined}
                 decoding="async"
-                className={`max-h-full max-w-full cursor-zoom-in rounded-2xl object-contain transition ${
-                  zoomed ? "scale-125 cursor-zoom-out" : ""
+                className={`h-auto w-auto max-w-full select-none rounded-2xl object-contain transition ${
+                  zoomed
+                    ? "max-h-none cursor-zoom-out"
+                    : "max-h-[min(62dvh,calc(100dvh-22rem))] cursor-zoom-in"
                 } ${isRemoved ? "opacity-45 grayscale" : ""}`}
+                style={{
+                  aspectRatio:
+                    current.width && current.height
+                      ? `${current.width} / ${current.height}`
+                      : undefined,
+                  transform: zoomed ? "scale(1.35)" : "scale(1)",
+                  transformOrigin: "center",
+                }}
                 onClick={() => setZoomed((value) => !value)}
               />
+              {zoomed && (
+                <button
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setZoomed(false);
+                  }}
+                  className="absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-white/95 px-3 py-1 text-xs font-bold text-ink shadow"
+                >
+                  Fit full photo
+                </button>
+              )}
               {isRemoved && (
                 <div className="absolute left-3 top-3 rounded-full bg-white/90 px-3 py-1 text-xs font-bold text-ink">
                   Removed

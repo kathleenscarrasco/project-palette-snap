@@ -12,7 +12,6 @@ type Theme =
   | "beach"
   | "sunset"
   | "friends"
-  | "couples"
   | "family"
   | "fashion"
   | "food"
@@ -59,16 +58,6 @@ const TAGLINES: Record<Theme, string[]> = {
     "Sorting the laugh-before-the-photo moments.",
     "This batch has very good people energy.",
     "Looking for the keepers your friends will ask you to send.",
-  ],
-  couples: [
-    "Soft-launch energy detected.",
-    "Finding the sweet little two-person moments.",
-    "These paired-up photos have a nice little glow.",
-    "Sorting the photos that feel quietly cute.",
-    "Keeping an eye on the together moments.",
-    "A few of these have rom-com still energy.",
-    "Looking for the warmest couple-ish favorites.",
-    "This camera roll has some very sweet chapters.",
   ],
   family: [
     "Finding the photos your future self will thank you for.",
@@ -226,7 +215,6 @@ const THEME_ORDER: Theme[] = [
   "beach",
   "sunset",
   "friends",
-  "couples",
   "family",
   "fashion",
   "food",
@@ -315,7 +303,6 @@ function chooseThemes(
   if (profile.groupPhotos || profile.has([/friend|group|girls|guys|bestie|crew/])) {
     add("friends", 6 + profile.groupPhotos);
   }
-  if (profile.has([/couple|date|anniversary|wedding|soft launch/])) add("couples", 7);
   if (profile.has([/family|mom|dad|sister|brother|cousin|grandma|grandpa/])) add("family", 7);
   if (profile.outfitPhotos || profile.has([/outfit|fit check|dress|fashion|mirror/])) {
     add("fashion", 6 + profile.outfitPhotos);
