@@ -227,14 +227,15 @@ function ProjectsPage() {
 
   const load = useCallback(async () => {
     if (!user) return;
+    const startedAt = performance.now();
     setLoading(true);
     if (isLocalDevAuth) {
       const localProjects = loadLocalProjects();
       setProjects(localProjects);
-      setDrafts(await listFinalDrafts());
       setPhotoSummaries(new Map());
       setError(null);
       setLoading(false);
+      void listFinalDrafts().then(setDrafts).catch(console.warn);
       return;
     }
     const { data, error } = await supabase
@@ -247,11 +248,34 @@ function ProjectsPage() {
       setError(error.message);
       setDrafts([]);
     } else {
-      console.log("[saved_projects] loaded", data?.length ?? 0);
-      setProjects((data ?? []) as SavedProject[]);
-      setDrafts(await listFinalDrafts());
-      setPhotoSummaries(await listProjectPhotoSummaries());
+      const loadedProjects = (data ?? []) as SavedProject[];
+      console.log("[saved_projects] loaded", loadedProjects.length, {
+        projectRowsMs: Math.round(performance.now() - startedAt),
+      });
+      setProjects(loadedProjects);
       setError(null);
+      setLoading(false);
+
+      void (async () => {
+        const detailStartedAt = performance.now();
+        try {
+          const [nextDrafts, nextPhotoSummaries] = await Promise.all([
+            listFinalDrafts(),
+            listProjectPhotoSummaries(),
+          ]);
+          setDrafts(nextDrafts);
+          setPhotoSummaries(nextPhotoSummaries);
+          console.debug("[perf] saved collection details hydrated", {
+            projects: loadedProjects.length,
+            drafts: nextDrafts.length,
+            photoSummaryProjects: nextPhotoSummaries.size,
+            detailsMs: Math.round(performance.now() - detailStartedAt),
+          });
+        } catch (detailError) {
+          console.warn("[saved_projects] background detail load failed:", detailError);
+        }
+      })();
+      return;
     }
     setLoading(false);
   }, [user]);

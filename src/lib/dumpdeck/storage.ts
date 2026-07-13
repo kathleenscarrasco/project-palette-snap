@@ -359,25 +359,29 @@ export async function listProjectPhotoSummaries(): Promise<Map<string, ProjectPh
     original_storage_path?: string | null;
     preview_file_url?: string | null;
   }>;
-  const paths = rows
-    .map((row) => row.preview_storage_path ?? row.original_storage_path)
-    .filter((path): path is string => Boolean(path));
-  const signed = await signedUrlsForPaths(paths);
   const summaries = new Map<string, ProjectPhotoSummary>();
   for (const row of rows) {
     const existing = summaries.get(row.project_id);
     const path = row.preview_storage_path ?? row.original_storage_path ?? "";
-    const url = signed.get(path) ?? row.preview_file_url ?? null;
     summaries.set(row.project_id, {
       projectId: row.project_id,
       count: (existing?.count ?? 0) + 1,
-      firstPhotoUrl: existing?.firstPhotoUrl ?? url,
+      firstPhotoUrl: existing?.firstPhotoUrl ?? row.preview_file_url ?? (path || null),
     });
+  }
+  const coverPaths = Array.from(summaries.values())
+    .map((summary) => summary.firstPhotoUrl)
+    .filter((url): url is string => Boolean(url && !/^https?:|^blob:|^data:/i.test(url)));
+  const signed = await signedUrlsForPaths(coverPaths);
+  for (const summary of summaries.values()) {
+    if (summary.firstPhotoUrl && signed.has(summary.firstPhotoUrl)) {
+      summary.firstPhotoUrl = signed.get(summary.firstPhotoUrl) ?? summary.firstPhotoUrl;
+    }
   }
   console.debug("[perf] project photo summaries loaded", {
     projects: summaries.size,
     rows: rows.length,
-    signedUrlsGenerated: signed.size,
+    coverSignedUrlsGenerated: signed.size,
     signedUrlGenerationMs: Math.round(performance.now() - startedAt),
   });
   return summaries;
