@@ -1,6 +1,7 @@
 import { createFileRoute, Link, Outlet, useLocation, useNavigate } from "@tanstack/react-router";
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useState, type FormEvent, type MouseEvent } from "react";
 import {
+  Check,
   Copy,
   FolderOpen,
   Home,
@@ -83,6 +84,31 @@ function projectPersistenceErrorMessage(err: unknown, fallback = "Could not save
     return "We couldn’t save your collection right now. Please try again in a moment.";
   }
   return message || "We couldn’t save your collection right now. Please try again in a moment.";
+}
+
+function activeProjectId() {
+  try {
+    return sessionStorage.getItem("dumpdeck:activeProjectId");
+  } catch {
+    return null;
+  }
+}
+
+function nextCopyTitle(title: string, existingTitles: Iterable<string>) {
+  const cleanTitle = title.trim() || "Untitled FotoFairy Collection";
+  const names = new Set(Array.from(existingTitles).map((name) => name.trim().toLowerCase()));
+  const base = `${cleanTitle} (Copy)`;
+  if (!names.has(base.toLowerCase())) return base;
+  for (let index = 2; index < 1000; index += 1) {
+    const candidate = `${cleanTitle} (Copy ${index})`;
+    if (!names.has(candidate.toLowerCase())) return candidate;
+  }
+  return `${base} ${Date.now()}`;
+}
+
+function isEditableTarget(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) return false;
+  return Boolean(target.closest("input, textarea, select, button, a, [contenteditable='true']"));
 }
 
 function statusForProject(
@@ -220,6 +246,22 @@ function ProjectsPage() {
   const [creatingProject, setCreatingProject] = useState(false);
   const [autoCreatingFirstProject, setAutoCreatingFirstProject] = useState(false);
   const [duplicatingProjectId, setDuplicatingProjectId] = useState<string | null>(null);
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const [lastSelectedIndex, setLastSelectedIndex] = useState<number | null>(null);
+  const [pendingBulkDelete, setPendingBulkDelete] = useState(false);
+  const [bulkAction, setBulkAction] = useState<{
+    type: "copying" | "deleting";
+    completed: number;
+    total: number;
+  } | null>(null);
+
+  const selectedProjects = useMemo(
+    () => projects.filter((project) => selectedIds.has(project.id)),
+    [projects, selectedIds],
+  );
+  const allSelected = projects.length > 0 && selectedIds.size === projects.length;
+  const bulkBusy = Boolean(bulkAction);
 
   useEffect(() => {
     if (!authLoading && !isAuthed) navigate({ to: "/auth" });
@@ -284,6 +326,19 @@ function ProjectsPage() {
     if (user) void load();
   }, [user, load]);
 
+  useEffect(() => {
+    setSelectedIds((current) => {
+      const projectIds = new Set(projects.map((project) => project.id));
+      const next = new Set(Array.from(current).filter((id) => projectIds.has(id)));
+      if (next.size === current.size) return current;
+      if (next.size === 0) {
+        setSelectionMode(false);
+        setLastSelectedIndex(null);
+      }
+      return next;
+    });
+  }, [projects]);
+
   function openProject(id: string) {
     sessionStorage.setItem("dumpdeck:activeProjectId", id);
     sessionStorage.removeItem("dumpdeck:activeDraftId");
@@ -319,6 +374,69 @@ function ProjectsPage() {
     }
     openProject(project.id);
   }
+
+  function cancelSelection() {
+    setSelectionMode(false);
+    setSelectedIds(new Set());
+    setLastSelectedIndex(null);
+  }
+
+  function selectAllProjects() {
+    setSelectionMode(true);
+    setSelectedIds(new Set(projects.map((project) => project.id)));
+    setLastSelectedIndex(projects.length ? projects.length - 1 : null);
+  }
+
+  function toggleProjectSelection(
+    project: SavedProject,
+    index: number,
+    event?: MouseEvent<HTMLElement>,
+  ) {
+    setSelectionMode(true);
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (event?.shiftKey && lastSelectedIndex !== null) {
+        const start = Math.min(lastSelectedIndex, index);
+        const end = Math.max(lastSelectedIndex, index);
+        projects.slice(start, end + 1).forEach((rangeProject) => next.add(rangeProject.id));
+      } else if (next.has(project.id)) {
+        next.delete(project.id);
+      } else {
+        next.add(project.id);
+      }
+      return next;
+    });
+    setLastSelectedIndex(index);
+  }
+
+  useEffect(() => {
+    if (view !== "saved" || !selectionMode) return;
+    function onKeyDown(event: KeyboardEvent) {
+      if (isEditableTarget(event.target)) return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        cancelSelection();
+      }
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "a") {
+        event.preventDefault();
+        if (allSelected) {
+          setSelectedIds(new Set());
+        } else {
+          setSelectionMode(true);
+          setSelectedIds(new Set(projects.map((project) => project.id)));
+          setLastSelectedIndex(projects.length ? projects.length - 1 : null);
+        }
+      }
+      if (event.key === "Delete" || event.key === "Backspace") {
+        if (selectedIds.size > 0) {
+          event.preventDefault();
+          setPendingBulkDelete(true);
+        }
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [allSelected, selectedIds.size, selectionMode, view, projects]);
 
   async function startNewProject() {
     if (!user || creatingProject) return;
@@ -365,15 +483,42 @@ function ProjectsPage() {
     })();
   }, [autoCreatingFirstProject, error, loading, navigate, projects.length, user]);
 
-  async function duplicateProject(project: SavedProject) {
+  async function renameProject(projectId: string, title: string, description?: string | null) {
+    if (isLocalDevAuth) {
+      saveLocalProjects(
+        loadLocalProjects().map((project) =>
+          project.id === projectId
+            ? { ...project, title, description: description ?? project.description }
+            : project,
+        ),
+      );
+      return;
+    }
+    const update: { title: string; description?: string | null } = { title };
+    if (description !== undefined) update.description = description;
+    const { error } = await supabase
+      .from("saved_projects")
+      .update(update)
+      .eq("id", projectId)
+      .eq("user_id", user!.id);
+    if (error) throw error;
+  }
+
+  async function duplicateProject(
+    project: SavedProject,
+    options: { openAfter?: boolean; title?: string; silent?: boolean; reload?: boolean } = {},
+  ) {
     if (duplicatingProjectId) return;
     setDuplicatingProjectId(project.id);
     try {
       const status = statusForProject(project, drafts);
+      const copyTitle = options.title ?? `${project.title} copy`;
       if (status.draftId) {
         const result = await duplicateFinalDraft(status.draftId, project.title);
-        toast.success("Collection duplicated");
-        await load();
+        if (options.title) await renameProject(result.projectId, options.title);
+        if (!options.silent) toast.success("Collection duplicated");
+        if (options.reload !== false) await load();
+        if (options.openAfter === false) return result;
         sessionStorage.setItem("dumpdeck:activeProjectId", result.projectId);
         sessionStorage.setItem("dumpdeck:activeDraftId", result.draftId);
         sessionStorage.removeItem("dumpdeck:resumeDraft");
@@ -387,9 +532,9 @@ function ProjectsPage() {
           routeChosen: "/app",
         });
         void navigate({ to: "/app" });
-        return;
+        return result;
       }
-      const copy = await createProjectRecord(user!.id, `${project.title} copy`);
+      const copy = await createProjectRecord(user!.id, copyTitle);
       if (project.description) {
         if (isLocalDevAuth) {
           saveLocalProjects(
@@ -405,19 +550,32 @@ function ProjectsPage() {
             .eq("user_id", user!.id);
         }
       }
-      toast.success("Collection duplicated");
-      await load();
+      if (!options.silent) toast.success("Collection duplicated");
+      if (options.reload !== false) await load();
+      if (options.openAfter === false) return { projectId: copy.id, draftId: null };
       openProject(copy.id);
+      return { projectId: copy.id, draftId: null };
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Could not duplicate collection";
       console.error("[saved_projects] duplicate failed:", err);
+      if (options.silent) throw err;
       toast.error(msg);
     } finally {
       setDuplicatingProjectId(null);
     }
   }
 
-  async function remove(id: string) {
+  async function deleteProjectPersistence(id: string) {
+    if (isLocalDevAuth) {
+      saveLocalProjects(loadLocalProjects().filter((project) => project.id !== id));
+      return;
+    }
+    await deleteStoredProjectPhotos(id);
+    const { error } = await supabase.from("saved_projects").delete().eq("id", id);
+    if (error) throw error;
+  }
+
+  async function remove(id: string, options: { silent?: boolean } = {}) {
     const previousProjects = projects;
     const previousDrafts = drafts;
     const previousPhotoSummaries = photoSummaries;
@@ -429,23 +587,113 @@ function ProjectsPage() {
       next.delete(id);
       return next;
     });
-    toast.success("Collection deleted");
+    if (!options.silent) toast.success("Collection deleted");
 
     try {
-      if (isLocalDevAuth) {
-        saveLocalProjects(loadLocalProjects().filter((project) => project.id !== id));
-        return;
+      await deleteProjectPersistence(id);
+      if (activeProjectId() === id) {
+        sessionStorage.removeItem("dumpdeck:activeProjectId");
+        sessionStorage.removeItem("dumpdeck:activeDraftId");
+        sessionStorage.removeItem("dumpdeck:resumeDraft");
+        sessionStorage.removeItem("dumpdeck:resumeDraftStage");
       }
-      await deleteStoredProjectPhotos(id);
-      const { error } = await supabase.from("saved_projects").delete().eq("id", id);
-      if (error) throw error;
     } catch (err) {
       setProjects(previousProjects);
       setDrafts(previousDrafts);
       setPhotoSummaries(previousPhotoSummaries);
       const message = err instanceof Error ? err.message : "Could not delete collection";
-      toast.error(message);
+      if (!options.silent) toast.error(message);
       console.error("[saved_projects] delete failed:", err);
+      if (options.silent) throw err;
+    }
+  }
+
+  async function bulkCopySelected() {
+    if (!selectedProjects.length || bulkBusy) return;
+    const targets = [...selectedProjects];
+    setBulkAction({ type: "copying", completed: 0, total: targets.length });
+    const existingTitles = new Set(projects.map((project) => project.title));
+    const copiedIds: string[] = [];
+    try {
+      for (const project of targets) {
+        const title = nextCopyTitle(project.title, existingTitles);
+        existingTitles.add(title);
+        const result = await duplicateProject(project, {
+          openAfter: false,
+          title,
+          silent: true,
+          reload: false,
+        });
+        if (result?.projectId) copiedIds.push(result.projectId);
+        setBulkAction((current) =>
+          current ? { ...current, completed: current.completed + 1 } : current,
+        );
+      }
+      toast.success(`${targets.length} collection${targets.length === 1 ? "" : "s"} copied.`);
+      cancelSelection();
+      await load();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Could not copy selected collections";
+      toast.error(message);
+      console.error("[saved_projects] bulk copy failed:", {
+        error: err,
+        selectedIds: targets.map((project) => project.id),
+        copiedIds,
+      });
+      await load();
+    } finally {
+      setBulkAction(null);
+      setDuplicatingProjectId(null);
+    }
+  }
+
+  async function bulkDeleteSelected() {
+    if (!selectedProjects.length || bulkBusy) return;
+    const targets = [...selectedProjects];
+    const targetIds = new Set(targets.map((project) => project.id));
+    const previousProjects = projects;
+    const previousDrafts = drafts;
+    const previousPhotoSummaries = photoSummaries;
+
+    setPendingBulkDelete(false);
+    setBulkAction({ type: "deleting", completed: 0, total: targets.length });
+    setProjects((current) => current.filter((project) => !targetIds.has(project.id)));
+    setDrafts((current) =>
+      current.filter((draft) => !draft.projectId || !targetIds.has(draft.projectId)),
+    );
+    setPhotoSummaries((current) => {
+      const next = new Map(current);
+      targetIds.forEach((id) => next.delete(id));
+      return next;
+    });
+
+    try {
+      for (const project of targets) {
+        await deleteProjectPersistence(project.id);
+        setBulkAction((current) =>
+          current ? { ...current, completed: current.completed + 1 } : current,
+        );
+      }
+      if (activeProjectId() && targetIds.has(activeProjectId()!)) {
+        sessionStorage.removeItem("dumpdeck:activeProjectId");
+        sessionStorage.removeItem("dumpdeck:activeDraftId");
+        sessionStorage.removeItem("dumpdeck:resumeDraft");
+        sessionStorage.removeItem("dumpdeck:resumeDraftStage");
+      }
+      toast.success(`${targets.length} collection${targets.length === 1 ? "" : "s"} deleted.`);
+      cancelSelection();
+    } catch (err) {
+      setProjects(previousProjects);
+      setDrafts(previousDrafts);
+      setPhotoSummaries(previousPhotoSummaries);
+      const message = err instanceof Error ? err.message : "Could not delete selected collections";
+      toast.error(message);
+      console.error("[saved_projects] bulk delete failed:", {
+        error: err,
+        selectedIds: targets.map((project) => project.id),
+      });
+    } finally {
+      setBulkAction(null);
     }
   }
 
@@ -491,27 +739,66 @@ function ProjectsPage() {
           <div className="flex items-center justify-between gap-3">
             <div>
               <h1 className="font-display text-4xl tracking-tight">
-                {view === "home" ? "Keep the memories. Lose the clutter." : "Saved collections"}
+                {view === "home"
+                  ? "Keep the memories. Lose the clutter."
+                  : selectionMode
+                    ? `${selectedIds.size} Collection${selectedIds.size === 1 ? "" : "s"} Selected`
+                    : "Saved collections"}
               </h1>
               <p className="mt-1 text-sm text-muted-foreground">
                 {view === "home"
                   ? "Turn hundreds of photos into the ones you'll actually keep."
-                  : "Open, edit, duplicate, or delete your saved FotoFairy collections."}
+                  : selectionMode
+                    ? "Choose collections to copy or delete."
+                    : "Open, edit, duplicate, or delete your saved FotoFairy collections."}
               </p>
             </div>
             {view === "saved" && (
-              <button
-                onClick={startNewProject}
-                disabled={creatingProject}
-                className="inline-flex h-11 items-center gap-2 rounded-xl bg-ink px-4 font-semibold text-cream transition hover:bg-coral disabled:opacity-60"
-              >
-                {creatingProject ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
+              <div className="flex flex-wrap justify-end gap-2">
+                {selectionMode ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={allSelected ? () => setSelectedIds(new Set()) : selectAllProjects}
+                      disabled={bulkBusy || projects.length === 0}
+                      className="chip bg-white/80 text-ink disabled:opacity-60"
+                    >
+                      {allSelected ? "Deselect all" : "Select all"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={cancelSelection}
+                      disabled={bulkBusy}
+                      className="chip disabled:opacity-60"
+                    >
+                      Cancel
+                    </button>
+                  </>
                 ) : (
-                  <Plus className="h-4 w-4" />
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => setSelectionMode(true)}
+                      disabled={projects.length === 0}
+                      className="chip bg-white/80 text-ink disabled:opacity-60"
+                    >
+                      Select
+                    </button>
+                    <button
+                      onClick={startNewProject}
+                      disabled={creatingProject}
+                      className="inline-flex h-11 items-center gap-2 rounded-xl bg-ink px-4 font-semibold text-cream transition hover:bg-coral disabled:opacity-60"
+                    >
+                      {creatingProject ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <Plus className="h-4 w-4" />
+                      )}
+                      New collection
+                    </button>
+                  </>
                 )}
-                New collection
-              </button>
+              </div>
             )}
           </div>
         </section>
@@ -604,24 +891,51 @@ function ProjectsPage() {
             )}
 
             {!loading &&
-              projects.map((p) => (
+              projects.map((p, index) => (
                 <article
                   key={p.id}
-                  role="button"
+                  role={selectionMode ? "checkbox" : "button"}
+                  aria-checked={selectionMode ? selectedIds.has(p.id) : undefined}
                   tabIndex={0}
-                  onClick={() => continueProject(p)}
+                  onClick={(event) => {
+                    if (selectionMode || event.metaKey || event.ctrlKey || event.shiftKey) {
+                      toggleProjectSelection(p, index, event);
+                      return;
+                    }
+                    continueProject(p);
+                  }}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" || event.key === " ") {
                       event.preventDefault();
-                      continueProject(p);
+                      if (selectionMode) toggleProjectSelection(p, index);
+                      else continueProject(p);
                     }
                   }}
-                  className="glass-card flex cursor-pointer items-start gap-3 rounded-2xl p-4 text-left transition hover:-translate-y-0.5 hover:shadow-lg focus:outline-none focus:ring-2 focus:ring-coral"
+                  className={`glass-card relative flex cursor-pointer items-start gap-3 rounded-2xl p-4 text-left transition hover:-translate-y-0.5 hover:shadow-lg focus:outline-none focus:ring-2 focus:ring-coral ${
+                    selectedIds.has(p.id)
+                      ? "bg-mint/20 ring-2 ring-coral"
+                      : selectionMode
+                        ? "ring-1 ring-ink/10"
+                        : ""
+                  }`}
                 >
                   {(() => {
                     const status = statusForProject(p, drafts, photoSummaries.get(p.id));
+                    const selected = selectedIds.has(p.id);
                     return (
                       <>
+                        {selectionMode && (
+                          <span
+                            className={`absolute left-2 top-2 z-10 grid h-7 w-7 place-items-center rounded-full border-2 shadow-sm transition ${
+                              selected
+                                ? "border-coral bg-coral text-white"
+                                : "border-white bg-white/90 text-transparent"
+                            }`}
+                            aria-hidden
+                          >
+                            <Check className="h-4 w-4" />
+                          </span>
+                        )}
                         <div className="h-24 w-32 shrink-0 overflow-hidden rounded-xl bg-gradient-to-br from-coral/15 via-mint/20 to-lavender/25">
                           {status.coverUrl ? (
                             <img
@@ -655,42 +969,48 @@ function ProjectsPage() {
                             </span>
                           </div>
                         </div>
-                        <button
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            void duplicateProject(p);
-                          }}
-                          disabled={duplicatingProjectId === p.id}
-                          className="grid h-9 w-9 place-items-center rounded-lg hover:bg-ink/5 disabled:opacity-60"
-                          aria-label="Duplicate"
-                        >
-                          {duplicatingProjectId === p.id ? (
-                            <Loader2 className="h-4 w-4 animate-spin" />
-                          ) : (
-                            <Copy className="h-4 w-4" />
-                          )}
-                        </button>
-                        <button
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            setEditing(p);
-                            setShowForm(true);
-                          }}
-                          className="grid h-9 w-9 place-items-center rounded-lg hover:bg-ink/5"
-                          aria-label="Edit"
-                        >
-                          <Pencil className="h-4 w-4" />
-                        </button>
-                        <button
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            setPendingDelete(p);
-                          }}
-                          className="grid h-9 w-9 place-items-center rounded-lg text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
-                          aria-label="Delete"
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </button>
+                        {!selectionMode && (
+                          <button
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void duplicateProject(p);
+                            }}
+                            disabled={duplicatingProjectId === p.id}
+                            className="grid h-9 w-9 place-items-center rounded-lg hover:bg-ink/5 disabled:opacity-60"
+                            aria-label="Duplicate"
+                          >
+                            {duplicatingProjectId === p.id ? (
+                              <Loader2 className="h-4 w-4 animate-spin" />
+                            ) : (
+                              <Copy className="h-4 w-4" />
+                            )}
+                          </button>
+                        )}
+                        {!selectionMode && (
+                          <button
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setEditing(p);
+                              setShowForm(true);
+                            }}
+                            className="grid h-9 w-9 place-items-center rounded-lg hover:bg-ink/5"
+                            aria-label="Edit"
+                          >
+                            <Pencil className="h-4 w-4" />
+                          </button>
+                        )}
+                        {!selectionMode && (
+                          <button
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setPendingDelete(p);
+                            }}
+                            className="grid h-9 w-9 place-items-center rounded-lg text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                            aria-label="Delete"
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </button>
+                        )}
                       </>
                     );
                   })()}
@@ -725,7 +1045,149 @@ function ProjectsPage() {
           }}
         />
       )}
+
+      {selectionMode && (
+        <BulkActionBar
+          selectedCount={selectedIds.size}
+          bulkAction={bulkAction}
+          onCopy={bulkCopySelected}
+          onDelete={() => setPendingBulkDelete(true)}
+          onCancel={cancelSelection}
+        />
+      )}
+
+      {pendingBulkDelete && (
+        <BulkDeleteDialog
+          count={selectedProjects.length}
+          includesActiveProject={selectedIds.has(activeProjectId() ?? "")}
+          busy={bulkAction?.type === "deleting"}
+          onClose={() => setPendingBulkDelete(false)}
+          onConfirm={bulkDeleteSelected}
+        />
+      )}
     </main>
+  );
+}
+
+function BulkActionBar({
+  selectedCount,
+  bulkAction,
+  onCopy,
+  onDelete,
+  onCancel,
+}: {
+  selectedCount: number;
+  bulkAction: { type: "copying" | "deleting"; completed: number; total: number } | null;
+  onCopy: () => void | Promise<void>;
+  onDelete: () => void;
+  onCancel: () => void;
+}) {
+  const busy = Boolean(bulkAction);
+  return (
+    <div className="fixed inset-x-0 bottom-0 z-40 px-4 pb-[calc(1rem+env(safe-area-inset-bottom))]">
+      <div className="mx-auto max-w-2xl rounded-3xl bg-ink p-3 text-cream shadow-2xl ring-1 ring-white/10">
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <div className="text-sm font-bold">
+              {busy
+                ? `${bulkAction!.type === "copying" ? "Copying" : "Deleting"}…`
+                : `${selectedCount} selected`}
+            </div>
+            {busy && (
+              <div className="mt-0.5 text-xs text-cream/65">
+                {bulkAction!.completed} of {bulkAction!.total}
+              </div>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onCopy}
+              disabled={selectedCount === 0 || busy}
+              className="inline-flex h-11 items-center gap-2 rounded-2xl bg-white px-3 text-sm font-bold text-ink disabled:opacity-45"
+            >
+              <Copy className="h-4 w-4" />
+              Copy
+            </button>
+            <button
+              type="button"
+              onClick={onDelete}
+              disabled={selectedCount === 0 || busy}
+              className="inline-flex h-11 items-center gap-2 rounded-2xl bg-coral px-3 text-sm font-bold text-white disabled:opacity-45"
+            >
+              <Trash2 className="h-4 w-4" />
+              Delete
+            </button>
+            <button
+              type="button"
+              onClick={onCancel}
+              disabled={busy}
+              className="h-11 rounded-2xl bg-white/10 px-3 text-sm font-bold text-cream disabled:opacity-45"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BulkDeleteDialog({
+  count,
+  includesActiveProject,
+  busy,
+  onClose,
+  onConfirm,
+}: {
+  count: number;
+  includesActiveProject: boolean;
+  busy: boolean;
+  onClose: () => void;
+  onConfirm: () => void | Promise<void>;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-ink/40 p-4" onClick={onClose}>
+      <div
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="bulk-delete-title"
+        onClick={(event) => event.stopPropagation()}
+        className="w-full max-w-sm rounded-3xl bg-white p-6 shadow-2xl"
+      >
+        <h2 id="bulk-delete-title" className="font-display text-2xl">
+          Delete {count} collection{count === 1 ? "" : "s"}?
+        </h2>
+        <p className="mt-2 text-sm text-muted-foreground">
+          This will permanently delete the selected collection{count === 1 ? "" : "s"}.
+        </p>
+        {includesActiveProject && (
+          <p className="mt-3 rounded-2xl bg-coral/10 px-3 py-2 text-xs font-semibold text-coral">
+            One selected collection is currently active in this browser. Deleting it may close your
+            in-progress workspace.
+          </p>
+        )}
+        <div className="mt-5 flex gap-2">
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={busy}
+            className="h-11 flex-1 rounded-xl border border-ink/10 font-semibold hover:bg-ink/5 disabled:opacity-60"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={busy || count === 0}
+            className="flex h-11 flex-1 items-center justify-center gap-2 rounded-xl bg-destructive font-semibold text-destructive-foreground hover:bg-destructive/90 disabled:opacity-60"
+          >
+            {busy && <Loader2 className="h-4 w-4 animate-spin" />}
+            Delete
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
