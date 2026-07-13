@@ -1759,10 +1759,12 @@ function AnalyzeStage() {
   const quickScanComplete = scanState.complete;
   const canStartSorting =
     quickScanComplete && phase !== "loading" && phase !== "preparing" && scanState.usableCount >= 4;
+  const largeHeadingScannedCount =
+    phase === "ready" && scanState.totalCount > 0 ? scanState.totalCount : scanState.scannedCount;
 
   const progressLabel =
     scanState.totalCount > 0
-      ? `${scanState.scannedCount} of ${scanState.totalCount} photo${scanState.totalCount === 1 ? "" : "s"} scanned`
+      ? `${largeHeadingScannedCount} of ${scanState.totalCount} photo${scanState.totalCount === 1 ? "" : "s"} scanned`
       : failedRows.length
         ? `${failedRows.length} photo${failedRows.length === 1 ? "" : "s"} couldn't be scanned`
         : phase === "preparing"

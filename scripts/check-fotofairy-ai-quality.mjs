@@ -16,7 +16,9 @@ const taglines = await readFile("src/lib/dumpdeck/analyzing-taglines.ts", "utf8"
 
 check(
   "large scan heading uses only canonical quick-scan count",
-  app.includes("${scanState.scannedCount} of ${scanState.totalCount} photo") &&
+  app.includes("const largeHeadingScannedCount =") &&
+    app.includes('phase === "ready" && scanState.totalCount > 0 ? scanState.totalCount') &&
+    app.includes("${largeHeadingScannedCount} of ${scanState.totalCount} photo") &&
     app.includes("} scanned`") &&
     !app.includes("`Scanning ${scanState.scannedCount}") &&
     !app.includes("`Scanned ${scanState.totalCount}"),
