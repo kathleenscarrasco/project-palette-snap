@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import type { Session, User } from "@supabase/supabase-js";
-import { supabase } from "@/integrations/supabase/client";
+import { isLocalDevAuth, supabase } from "@/integrations/supabase/client";
 
 type AuthCtx = {
   session: Session | null;
@@ -12,11 +12,21 @@ type AuthCtx = {
 
 const Ctx = createContext<AuthCtx | undefined>(undefined);
 
+const localDevUser = {
+  id: "local-dev-user",
+  email: "local-dev@fotofairy.test",
+  app_metadata: {},
+  user_metadata: {},
+  aud: "authenticated",
+  created_at: new Date(0).toISOString(),
+} as User;
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<Session | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(!isLocalDevAuth);
 
   useEffect(() => {
+    if (isLocalDevAuth) return;
     const { data: sub } = supabase.auth.onAuthStateChange((event, s) => {
       console.log("[auth] state change:", event, s?.user?.email ?? null);
       setSession(s);
@@ -32,6 +42,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const signOut = async () => {
+    if (isLocalDevAuth) return;
     const { error } = await supabase.auth.signOut();
     if (error) console.error("[auth] signOut error:", error);
   };
@@ -40,9 +51,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     <Ctx.Provider
       value={{
         session,
-        user: session?.user ?? null,
+        user: isLocalDevAuth ? localDevUser : (session?.user ?? null),
         loading,
-        isAuthed: !!session,
+        isAuthed: isLocalDevAuth || !!session,
         signOut,
       }}
     >

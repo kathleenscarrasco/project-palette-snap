@@ -2,8 +2,7 @@ export function BrandMark({ className = "h-9 w-9" }: { className?: string }) {
   return (
     <img
       src="/favicon.svg"
-      alt=""
-      aria-hidden
+      alt="FotoFairy"
       className={`${className} rounded-xl shadow-sm`}
       decoding="async"
     />
@@ -17,9 +16,5 @@ export function BrandWordmark({
   size?: string;
   className?: string;
 }) {
-  return (
-    <span className={`font-display ${size} ${className}`}>
-      DumpDeck
-    </span>
-  );
+  return <span className={`font-display ${size} ${className}`}>FotoFairy</span>;
 }

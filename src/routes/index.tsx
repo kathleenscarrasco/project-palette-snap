@@ -1,188 +1,214 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
-import { motion } from "framer-motion";
-import { ArrowRight, Sparkles, Heart, Shuffle, Upload, Wand2, Hand, Film, LogOut, FolderOpen } from "lucide-react";
-import { useEffect } from "react";
+import { ArrowRight, Check, Lock, Sparkles, Wand2 } from "lucide-react";
+
 import { BrandMark, BrandWordmark } from "@/components/dumpdeck/brand";
 import { useAuth } from "@/hooks/use-auth";
 
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
-      { title: "dumpify — Turn 200 photos into the perfect photo dump" },
+      { title: "FotoFairy — Camera roll sorting for photo collections" },
       {
         name: "description",
         content:
-          "AI-powered photo dump curator. Upload many photos, narrow them down, swipe what stays, and let AI order your Instagram carousel.",
-      },
-      { property: "og:title", content: "dumpify — Curate your photo dump" },
-      {
-        property: "og:description",
-        content: "Turn 200 photos into the perfect 10-image Instagram carousel.",
+          "FotoFairy finds the strongest photos, groups similar moments, and helps you build a polished collection without sorting everything manually.",
       },
     ],
   }),
-  component: Landing,
+  component: LandingPage,
 });
 
-function Landing() {
+function LandingPage() {
   const navigate = useNavigate();
-  const { isAuthed, loading, user, signOut } = useAuth();
+  const { isAuthed } = useAuth();
 
-  useEffect(() => {
-    if (!loading && !isAuthed) navigate({ to: "/auth" });
-  }, [loading, isAuthed, navigate]);
-
-  if (loading || !isAuthed) {
-    return (
-      <main className="grid min-h-screen place-items-center text-sm text-muted-foreground">
-        Loading…
-      </main>
-    );
+  function startSorting() {
+    void navigate({ to: isAuthed ? "/projects" : "/auth" });
   }
 
   return (
-    <main className="relative min-h-screen overflow-hidden px-5 pb-16 pt-8">
-      <div className="absolute right-5 top-5 z-10 flex items-center gap-2">
-        <Link to="/projects" className="chip hover:bg-ink hover:text-white">
-          <FolderOpen className="h-3 w-3" /> Projects
+    <main className="min-h-screen overflow-hidden bg-background text-foreground">
+      <div className="pointer-events-none fixed -left-24 top-20 h-80 w-80 rounded-full bg-coral/25 blur-3xl" />
+      <div className="pointer-events-none fixed -right-28 top-72 h-96 w-96 rounded-full bg-mint/30 blur-3xl" />
+
+      <header className="relative z-10 mx-auto flex w-full max-w-6xl items-center justify-between px-5 py-5">
+        <Link to="/" className="flex items-center gap-2">
+          <BrandMark className="h-10 w-10" />
+          <BrandWordmark size="text-xl" />
         </Link>
-        <span className="chip max-w-[160px] truncate" title={user?.email ?? ""}>{user?.email}</span>
+        <nav className="hidden items-center gap-5 text-sm font-semibold text-muted-foreground sm:flex">
+          <a href="#how-it-works" className="hover:text-foreground">
+            How it works
+          </a>
+          <a href="#trust" className="hover:text-foreground">
+            Trust
+          </a>
+          <Link to="/auth" className="hover:text-foreground">
+            Sign in
+          </Link>
+        </nav>
         <button
-          onClick={async () => { await signOut(); navigate({ to: "/auth" }); }}
-          className="chip hover:bg-coral hover:text-white"
-          aria-label="Sign out"
+          type="button"
+          onClick={startSorting}
+          className="inline-flex h-11 items-center gap-2 rounded-2xl bg-ink px-4 text-sm font-bold text-cream shadow-lg transition hover:bg-coral"
         >
-          <LogOut className="h-3 w-3" /> Sign out
+          Start sorting <ArrowRight className="h-4 w-4" />
         </button>
-      </div>
-      {/* floating blobs */}
-      <div className="pointer-events-none absolute -left-20 top-20 h-72 w-72 rounded-full bg-coral/30 blur-3xl animate-blob" />
-      <div className="pointer-events-none absolute -right-16 top-60 h-80 w-80 rounded-full bg-lavender/40 blur-3xl animate-blob" style={{ animationDelay: "-5s" }} />
-      <div className="pointer-events-none absolute bottom-0 left-1/3 h-72 w-72 rounded-full bg-mint/40 blur-3xl animate-blob" style={{ animationDelay: "-9s" }} />
+      </header>
 
-      <div className="mx-auto max-w-md">
-        <header className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <BrandMark className="h-9 w-9" />
-            <BrandWordmark size="text-xl" />
+      <section className="relative z-10 mx-auto grid min-h-[calc(100vh-84px)] max-w-6xl items-center gap-10 px-5 pb-12 pt-8 lg:grid-cols-[1.05fr_0.95fr]">
+        <div>
+          <div className="inline-flex items-center gap-2 rounded-full bg-mint/50 px-3 py-1 text-xs font-bold text-ink">
+            <Sparkles className="h-3.5 w-3.5" />
+            Hybrid local + secure AI photo curation
           </div>
-          <span className="chip">beta · v0.1</span>
-        </header>
-
-        <section className="mt-10">
-          <motion.span
-            initial={{ y: 10, opacity: 0 }}
-            animate={{ y: 0, opacity: 1 }}
-            className="chip bg-coral/15 text-coral"
-          >
-            <Sparkles className="h-3 w-3" /> AI photo dump curator
-          </motion.span>
-
-          <motion.h1
-            initial={{ y: 20, opacity: 0 }}
-            animate={{ y: 0, opacity: 1 }}
-            transition={{ delay: 0.05 }}
-            className="font-display mt-4 text-5xl leading-[0.95] tracking-tight"
-          >
-            Turn <em className="italic text-coral">200 photos</em> into the perfect{" "}
-            <span className="relative inline-block">
-              photo dump
-              <svg viewBox="0 0 200 12" className="absolute -bottom-1 left-0 h-2 w-full text-mint" fill="currentColor">
-                <path d="M0 8 Q 50 0 100 6 T 200 4 L 200 12 L 0 12 Z" />
-              </svg>
-            </span>
-            .
-          </motion.h1>
-
-          <motion.p
-            initial={{ y: 20, opacity: 0 }}
-            animate={{ y: 0, opacity: 1 }}
-            transition={{ delay: 0.15 }}
-            className="mt-5 text-base text-muted-foreground"
-          >
-            Upload your camera roll. We score every shot, kill the dupes, and help you swipe down to the ten that pop.
-          </motion.p>
-
-          <motion.div
-            initial={{ y: 20, opacity: 0 }}
-            animate={{ y: 0, opacity: 1 }}
-            transition={{ delay: 0.25 }}
-            className="mt-7"
-          >
-            <Link
-              to="/app"
-              className="group inline-flex h-14 w-full items-center justify-center gap-2 rounded-2xl bg-ink px-6 text-base font-semibold text-cream shadow-xl transition hover:bg-coral"
+          <h1 className="mt-5 max-w-3xl font-display text-5xl leading-[0.95] tracking-tight sm:text-6xl lg:text-7xl">
+            Turn your camera roll into the perfect photo collection.
+          </h1>
+          <p className="mt-5 max-w-xl text-base leading-relaxed text-muted-foreground sm:text-lg">
+            FotoFairy finds the strongest photos, groups similar moments, and helps you build a
+            polished collection without sorting everything manually.
+          </p>
+          <div className="mt-7 flex flex-col gap-3 sm:flex-row">
+            <button
+              type="button"
+              onClick={startSorting}
+              className="inline-flex h-14 items-center justify-center gap-2 rounded-2xl bg-ink px-6 text-base font-bold text-cream shadow-xl transition hover:bg-coral"
             >
-              Start sorting
-              <ArrowRight className="h-5 w-5 transition group-hover:translate-x-0.5" />
+              Start sorting <Wand2 className="h-4 w-4" />
+            </button>
+            <a
+              href="#how-it-works"
+              className="inline-flex h-14 items-center justify-center rounded-2xl border border-ink/10 bg-white/70 px-6 text-base font-bold text-ink"
+            >
+              See how it works
+            </a>
+          </div>
+          {isAuthed && (
+            <Link
+              to="/projects"
+              className="mt-4 inline-flex text-sm font-semibold text-muted-foreground underline"
+            >
+              Go to my collections
             </Link>
-            <p className="mt-3 text-center text-xs text-muted-foreground">
-              Free · runs in your browser · no signup
-            </p>
-          </motion.div>
-        </section>
+          )}
+        </div>
 
-        <section className="mt-14">
-          <h2 className="font-display text-2xl">How it works</h2>
-          <ol className="mt-4 space-y-3">
-            <Step n={1} title="Upload" body="Drop in 50, 200, 500 photos." Icon={Upload} tint="bg-coral/15 text-coral" />
-            <Step n={2} title="AI narrows them down" body="Bye blur, dupes, and the awkward ones." Icon={Wand2} tint="bg-lavender/60 text-ink" />
-            <Step n={3} title="Swipe to keep or kill" body="Tinder-style. Be ruthless." Icon={Hand} tint="bg-mint/60 text-ink" />
-            <Step n={4} title="AI orders your post" body="Strongest first, funny last, balanced flow." Icon={Film} tint="bg-coral/15 text-coral" />
-          </ol>
-        </section>
+        <ProductPreview />
+      </section>
 
-        <section className="mt-12 grid grid-cols-3 gap-3">
-          <Stat icon={<Sparkles className="h-4 w-4" />} value="9" label="AI tags" />
-          <Stat icon={<Heart className="h-4 w-4" />} value="20" label="max slides" />
-          <Stat icon={<Shuffle className="h-4 w-4" />} value="∞" label="reorders" />
-        </section>
+      <section className="relative z-10 mx-auto max-w-6xl px-5 py-14">
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          {[
+            "Scan large camera-roll batches",
+            "Find duplicate and near-duplicate shots",
+            "Group related events and moments",
+            "Compare similar photos at full size",
+            "Build a balanced final shortlist",
+            "Save collections and come back later",
+          ].map((item) => (
+            <div key={item} className="rounded-3xl bg-white/75 p-5 shadow-sm">
+              <Check className="h-5 w-5 text-coral" />
+              <p className="mt-3 text-sm font-semibold text-ink">{item}</p>
+            </div>
+          ))}
+        </div>
+      </section>
 
-        <footer className="mt-16 text-center text-xs text-muted-foreground">
-          Made for the dump-deserving moments.
-        </footer>
-      </div>
+      <section id="how-it-works" className="relative z-10 mx-auto max-w-6xl px-5 py-14">
+        <div className="max-w-2xl">
+          <p className="text-xs font-bold uppercase tracking-wider text-coral">How it works</p>
+          <h2 className="mt-2 font-display text-4xl">From camera roll chaos to keeper set.</h2>
+        </div>
+        <div className="mt-8 grid gap-4 md:grid-cols-4">
+          {[
+            ["1", "Upload your camera roll", "Choose JPG, PNG, HEIC, or mixed photo batches."],
+            ["2", "Let FotoFairy organize it", "Quick checks group moments and flag look-alikes."],
+            [
+              "3",
+              "Compare similar photos",
+              "Review groups, favorites, and removals before the cut.",
+            ],
+            [
+              "4",
+              "Save your final collection",
+              "Keep the order, caption, cover, and draft for later.",
+            ],
+          ].map(([step, title, body]) => (
+            <div key={step} className="rounded-3xl bg-cream/80 p-5">
+              <div className="grid h-9 w-9 place-items-center rounded-full bg-coral text-sm font-bold text-white">
+                {step}
+              </div>
+              <h3 className="mt-4 text-base font-bold text-ink">{title}</h3>
+              <p className="mt-2 text-sm leading-relaxed text-muted-foreground">{body}</p>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section id="trust" className="relative z-10 mx-auto max-w-6xl px-5 py-14">
+        <div className="rounded-[2rem] bg-ink p-6 text-cream sm:p-8">
+          <div className="flex flex-col gap-5 md:flex-row md:items-center md:justify-between">
+            <div className="max-w-2xl">
+              <div className="inline-flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-mint">
+                <Lock className="h-4 w-4" />
+                Trust & privacy
+              </div>
+              <h2 className="mt-3 font-display text-4xl">
+                Private saved collections, clear AI use.
+              </h2>
+              <p className="mt-3 text-sm leading-relaxed text-cream/75">
+                FotoFairy combines fast on-device checks with secure AI analysis for photos that
+                need a closer look. Saved projects use private cloud storage, and AI requests go
+                through the server so keys are not exposed in your browser.
+              </p>
+            </div>
+            <Link
+              to="/trust"
+              className="inline-flex h-12 items-center justify-center rounded-2xl bg-cream px-5 text-sm font-bold text-ink"
+            >
+              Read more
+            </Link>
+          </div>
+        </div>
+      </section>
     </main>
   );
 }
 
-function Step({
-  n,
-  title,
-  body,
-  Icon,
-  tint,
-}: {
-  n: number;
-  title: string;
-  body: string;
-  Icon: React.ComponentType<{ className?: string }>;
-  tint: string;
-}) {
-  return (
-    <li className="glass-card flex items-start gap-3 rounded-2xl p-4">
-      <div className={`grid h-10 w-10 shrink-0 place-items-center rounded-xl ${tint}`}>
-        <Icon className="h-5 w-5" />
-      </div>
-      <div className="min-w-0">
-        <div className="flex items-center gap-2">
-          <span className="text-[10px] font-bold text-coral">STEP {n}</span>
-        </div>
-        <div className="font-semibold">{title}</div>
-        <div className="text-sm text-muted-foreground">{body}</div>
-      </div>
-    </li>
-  );
-}
+function ProductPreview() {
+  const tiles = [
+    ["Upload", "29 photos ready"],
+    ["Scanning", "18 closer reviews"],
+    ["Look-alikes", "Compare the best"],
+    ["Shortlist", "Tap groups to review"],
+    ["Final order", "Balanced for the scroll"],
+  ];
 
-function Stat({ icon, value, label }: { icon: React.ReactNode; value: string; label: string }) {
   return (
-    <div className="glass-card rounded-2xl p-3 text-center">
-      <div className="mx-auto mb-1 grid h-7 w-7 place-items-center rounded-full bg-coral/15 text-coral">
-        {icon}
+    <div className="relative mx-auto w-full max-w-md">
+      <div className="rounded-[2rem] bg-white/80 p-4 shadow-2xl backdrop-blur">
+        <div className="grid grid-cols-3 gap-2">
+          {Array.from({ length: 9 }).map((_, index) => (
+            <div
+              key={index}
+              className="aspect-square rounded-2xl bg-gradient-to-br from-coral/80 via-lavender/70 to-mint/70"
+              style={{ opacity: 0.65 + (index % 3) * 0.1 }}
+            />
+          ))}
+        </div>
+        <div className="mt-4 space-y-2">
+          {tiles.map(([title, body]) => (
+            <div
+              key={title}
+              className="flex items-center justify-between rounded-2xl bg-cream px-4 py-3"
+            >
+              <span className="text-sm font-bold text-ink">{title}</span>
+              <span className="text-xs font-semibold text-muted-foreground">{body}</span>
+            </div>
+          ))}
+        </div>
       </div>
-      <div className="font-display text-2xl leading-none">{value}</div>
-      <div className="mt-1 text-[10px] uppercase tracking-wider text-muted-foreground">{label}</div>
     </div>
   );
 }

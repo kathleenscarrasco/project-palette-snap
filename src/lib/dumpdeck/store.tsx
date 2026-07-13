@@ -1,4 +1,5 @@
-import { createContext, useContext, useEffect, useMemo, useReducer, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useMemo, useReducer, type ReactNode } from "react";
+import type { CollectionTitleMetadata, DuplicateDecisionDraft } from "./drafts";
 import type { Photo, RemovedPhoto, Settings, Stage } from "./types";
 
 type State = {
@@ -9,6 +10,10 @@ type State = {
   kept: Photo[];
   finalOrder: Photo[];
   removed: RemovedPhoto[];
+  duplicateDecisions: DuplicateDecisionDraft[];
+  pinnedCoverId: string | null;
+  favoritePhotoIds: string[];
+  collectionTitleMetadata: CollectionTitleMetadata | null;
 };
 
 type Action =
@@ -19,7 +24,12 @@ type Action =
   | { type: "setShortlist"; photos: Photo[] }
   | { type: "setKept"; photos: Photo[] }
   | { type: "setFinalOrder"; photos: Photo[] }
+  | { type: "updatePhotoSources"; photos: Photo[] }
   | { type: "addRemoved"; entries: RemovedPhoto[] }
+  | { type: "setDuplicateDecisions"; decisions: DuplicateDecisionDraft[] }
+  | { type: "setPinnedCover"; id: string | null }
+  | { type: "setPhotoFavorite"; id: string; favorite: boolean }
+  | { type: "setCollectionTitleMetadata"; metadata: CollectionTitleMetadata | null }
   | { type: "restorePhoto"; id: string }
   | { type: "clearRemoved" }
   | { type: "hydrate"; state: State }
@@ -33,32 +43,76 @@ const initial: State = {
   kept: [],
   finalOrder: [],
   removed: [],
+  duplicateDecisions: [],
+  pinnedCoverId: null,
+  favoritePhotoIds: [],
+  collectionTitleMetadata: null,
 };
 
 function reducer(state: State, action: Action): State {
   switch (action.type) {
-    case "hydrate": return action.state;
-    case "setStage": return { ...state, stage: action.stage };
-    case "setSettings": return { ...state, settings: action.settings };
-    case "setPhotos": return { ...state, photos: action.photos };
-    case "removePhoto": return {
-      ...state,
-      photos: state.photos.filter((p) => p.id !== action.id),
-      shortlist: state.shortlist.filter((p) => p.id !== action.id),
-      kept: state.kept.filter((p) => p.id !== action.id),
-      finalOrder: state.finalOrder.filter((p) => p.id !== action.id),
-    };
-    case "setShortlist": return { ...state, shortlist: action.photos };
-    case "setKept": return { ...state, kept: action.photos };
-    case "setFinalOrder": return { ...state, finalOrder: action.photos };
+    case "hydrate":
+      return {
+        ...initial,
+        ...action.state,
+        pinnedCoverId: action.state.pinnedCoverId ?? null,
+        favoritePhotoIds: action.state.favoritePhotoIds ?? [],
+        collectionTitleMetadata: action.state.collectionTitleMetadata ?? null,
+      };
+    case "setStage":
+      return { ...state, stage: action.stage };
+    case "setSettings":
+      return { ...state, settings: action.settings };
+    case "setPhotos":
+      return { ...state, photos: action.photos };
+    case "removePhoto":
+      return {
+        ...state,
+        photos: state.photos.filter((p) => p.id !== action.id),
+        shortlist: state.shortlist.filter((p) => p.id !== action.id),
+        kept: state.kept.filter((p) => p.id !== action.id),
+        finalOrder: state.finalOrder.filter((p) => p.id !== action.id),
+        pinnedCoverId: state.pinnedCoverId === action.id ? null : state.pinnedCoverId,
+        favoritePhotoIds: state.favoritePhotoIds.filter((id) => id !== action.id),
+      };
+    case "setShortlist":
+      return { ...state, shortlist: action.photos };
+    case "setKept":
+      return { ...state, kept: action.photos };
+    case "setFinalOrder":
+      return { ...state, finalOrder: action.photos };
+    case "updatePhotoSources": {
+      const replacements = new Map(action.photos.map((photo) => [photo.id, photo] as const));
+      const replacePhoto = (photo: Photo) => replacements.get(photo.id) ?? photo;
+      return {
+        ...state,
+        photos: state.photos.map(replacePhoto),
+        shortlist: state.shortlist.map(replacePhoto),
+        kept: state.kept.map(replacePhoto),
+        finalOrder: state.finalOrder.map(replacePhoto),
+        removed: state.removed.map((entry) => ({
+          ...entry,
+          photo: replacePhoto(entry.photo),
+        })),
+      };
+    }
     case "addRemoved": {
       const existing = new Set(state.removed.map((r) => r.photo.id));
-      const merged = [
-        ...state.removed,
-        ...action.entries.filter((e) => !existing.has(e.photo.id)),
-      ];
+      const merged = [...state.removed, ...action.entries.filter((e) => !existing.has(e.photo.id))];
       return { ...state, removed: merged };
     }
+    case "setDuplicateDecisions":
+      return { ...state, duplicateDecisions: action.decisions };
+    case "setPinnedCover":
+      return { ...state, pinnedCoverId: action.id };
+    case "setPhotoFavorite": {
+      const ids = new Set(state.favoritePhotoIds);
+      if (action.favorite) ids.add(action.id);
+      else ids.delete(action.id);
+      return { ...state, favoritePhotoIds: Array.from(ids) };
+    }
+    case "setCollectionTitleMetadata":
+      return { ...state, collectionTitleMetadata: action.metadata };
     case "restorePhoto": {
       const entry = state.removed.find((r) => r.photo.id === action.id);
       if (!entry) return state;
@@ -72,8 +126,10 @@ function reducer(state: State, action: Action): State {
         removed: state.removed.filter((r) => r.photo.id !== action.id),
       };
     }
-    case "clearRemoved": return { ...state, removed: [] };
-    case "reset": return { ...initial };
+    case "clearRemoved":
+      return { ...state, removed: [], duplicateDecisions: [] };
+    case "reset":
+      return { ...initial };
   }
 }
 
@@ -86,7 +142,9 @@ function persist(state: State) {
       settings: state.settings,
     };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(safe));
-  } catch {}
+  } catch {
+    // Local persistence is best-effort; private browsing can block localStorage.
+  }
 }
 
 function rehydrate(): State {
@@ -98,12 +156,14 @@ function rehydrate(): State {
     return {
       ...initial,
       settings: {
-        formats: Array.isArray(settings.formats) && settings.formats.length
-          ? settings.formats.slice(0, 3)
-          : initial.settings.formats,
-        vibes: Array.isArray(settings.vibes) && settings.vibes.length
-          ? settings.vibes.slice(0, 3)
-          : initial.settings.vibes,
+        formats:
+          Array.isArray(settings.formats) && settings.formats.length
+            ? settings.formats.slice(0, 3)
+            : initial.settings.formats,
+        vibes:
+          Array.isArray(settings.vibes) && settings.vibes.length
+            ? settings.vibes.slice(0, 3)
+            : initial.settings.vibes,
       },
     };
   } catch {
@@ -114,17 +174,11 @@ function rehydrate(): State {
 const Ctx = createContext<{ state: State; dispatch: React.Dispatch<Action> } | null>(null);
 
 export function DumpDeckProvider({ children }: { children: ReactNode }) {
-  const [state, dispatch] = useReducer(reducer, initial);
-  const [hydrated, setHydrated] = useState(false);
+  const [state, dispatch] = useReducer(reducer, initial, rehydrate);
 
   useEffect(() => {
-    dispatch({ type: "hydrate", state: rehydrate() });
-    setHydrated(true);
-  }, []);
-
-  useEffect(() => {
-    if (hydrated) persist(state);
-  }, [hydrated, state.settings, state.stage]);
+    persist(state);
+  }, [state]);
 
   const value = useMemo(() => ({ state, dispatch }), [state]);
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

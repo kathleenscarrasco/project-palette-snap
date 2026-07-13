@@ -1,16 +1,19 @@
-import { createFileRoute, Link } from "@tanstack/react-router";
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { AnimatePresence, motion, type PanInfo } from "framer-motion";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowLeft,
   ArrowRight,
   Check,
   Download,
   Eye,
+  HelpCircle,
   Heart,
+  Instagram,
   Laugh,
   Palette,
   Palmtree,
+  Pin,
   RotateCcw,
   Save,
   Shuffle,
@@ -27,48 +30,217 @@ import JSZip from "jszip";
 import { toast } from "sonner";
 import { Copy, RefreshCw, MessageCircle } from "lucide-react";
 import { generateCaptions, type CaptionIdea } from "@/lib/dumpdeck/captions";
+import { nextAnalyzingTagline, rememberTagline } from "@/lib/dumpdeck/analyzing-taglines";
 
 import { Button } from "@/components/ui/button";
 import { Toaster } from "@/components/ui/sonner";
 import { DumpDeckProvider, useDumpDeck } from "@/lib/dumpdeck/store";
+import { aiOrder, groupBestBadges } from "@/lib/dumpdeck/ai";
 import {
-  aiOrder,
-  analyzeImage,
-  buildAllSimilarGroups,
-  classifyPhoto,
-  groupBestBadges,
-  groupNearDuplicates,
-  scorePhoto,
-  shortlist,
-} from "@/lib/dumpdeck/ai";
-import { detectPeopleAndFaces, warmupDetection } from "@/lib/dumpdeck/detection";
-import type { Photo, PostFormat, RemovedPhoto, Settings, VibeFocus } from "@/lib/dumpdeck/types";
-import { UploadGrid, type UploadItem } from "@/components/dumpdeck/upload-grid";
+  assignDuplicateClusters,
+  buildDuplicateGroupsForPhotos,
+  type DuplicateClusterInput,
+} from "@/lib/dumpdeck/pipeline/duplicate-clustering";
+import { organizePhotos } from "@/lib/dumpdeck/pipeline/organization";
+import {
+  autosaveWorkspaceDraft,
+  getFinalDraftById,
+  listFinalDrafts,
+  missingDraftFields,
+  saveFinalDraft,
+  savedDraftDebugSummary,
+  type CollectionTitleMetadata,
+  type DuplicateDecisionDraft,
+  type FinalDraftPayload,
+} from "@/lib/dumpdeck/drafts";
+import {
+  removedByRanking,
+  rankPhotos,
+  rankingShortlist,
+} from "@/lib/dumpdeck/pipeline/ranking-engine";
+import {
+  saveDuplicateClusterAssignments,
+  savePhotoRankings,
+} from "@/lib/dumpdeck/pipeline/metadata-cache";
+import { persistProjectUploads } from "@/lib/dumpdeck/storage";
+import type {
+  Photo,
+  PostFormat,
+  RemovedPhoto,
+  Settings,
+  AnalysisStatus,
+  UploadItem,
+  VibeFocus,
+} from "@/lib/dumpdeck/types";
+import {
+  INPUT_ACCEPT,
+  UploadGrid,
+  friendlyDecodeError,
+  isHeicFile,
+  isSupportedPhotoFile,
+  readImage,
+} from "@/components/dumpdeck/upload-grid";
 import { PhotoCard } from "@/components/dumpdeck/photo-card";
 import { SortableGrid } from "@/components/dumpdeck/sortable-grid";
 import { ScoreBadge } from "@/components/dumpdeck/score-badge";
 import { TagBadge } from "@/components/dumpdeck/tag-badge";
 import { BrandMark, BrandWordmark } from "@/components/dumpdeck/brand";
-
+import { useAuth } from "@/hooks/use-auth";
+import { isLocalDevAuth } from "@/integrations/supabase/client";
 
 const MAX_KEEP = 20;
+const LOCAL_SCAN_CONCURRENCY = 5;
+const LOCAL_SCAN_BATCH_SIZE = 15;
+const LOCAL_SCAN_TIMEOUT_MS = 30_000;
+const LOCAL_SCAN_MAX_ATTEMPTS = 2;
+const MERGED_PREPARE_CONCURRENCY = 8;
+const MERGED_LOCAL_SCAN_CONCURRENCY = 5;
+const MERGED_STORAGE_CONCURRENCY = 4;
+
+function analysisOf(photo: Photo) {
+  return photo.unifiedAnalysis?.analysis;
+}
+
+function rankingScore(photo: Photo) {
+  return analysisOf(photo)?.rankingScore ?? photo.overall;
+}
+
+function orderWithPinned(photos: Photo[], pinnedCoverId?: string | null) {
+  if (!pinnedCoverId) return photos;
+  const pinned = photos.find((photo) => photo.id === pinnedCoverId);
+  if (!pinned) return photos;
+  return [pinned, ...photos.filter((photo) => photo.id !== pinnedCoverId)];
+}
+
+function reasoningFor(photo: Photo) {
+  return analysisOf(photo)?.reasoning ?? photo.reasons[0] ?? "";
+}
+
+function averagePhotoScore(photos: Photo[], scorer: (photo: Photo) => number) {
+  if (!photos.length) return 0;
+  return photos.reduce((sum, photo) => sum + scorer(photo), 0) / photos.length;
+}
+
+function vibeAlignmentScore(photo: Photo) {
+  return (
+    photo.ranking?.scoreBreakdown?.sceneTagMatch ??
+    photo.ranking?.scoreBreakdown?.objectTagMatch ??
+    photo.ranking?.signals?.tagMatch ??
+    photo.scores.postWorthy
+  );
+}
+
+function activeProjectId() {
+  try {
+    return sessionStorage.getItem("dumpdeck:activeProjectId");
+  } catch {
+    return null;
+  }
+}
+
+function activeDraftId() {
+  try {
+    return sessionStorage.getItem("dumpdeck:activeDraftId");
+  } catch {
+    return null;
+  }
+}
+
+function projectUploadCountKey(projectId: string) {
+  return `dumpdeck:project:${projectId}:uploadCount`;
+}
+
+function mergedUploadFlowEnabled() {
+  if (import.meta.env.VITE_MERGED_UPLOAD_FLOW === "true") return true;
+  if (typeof window === "undefined") return false;
+  return new URLSearchParams(window.location.search).get("mergedUploadFlow") === "1";
+}
+
+function instagramExportEnabled() {
+  if (import.meta.env.VITE_INSTAGRAM_EXPORT_ENABLED === "true") return true;
+  if (typeof window === "undefined") return false;
+  return new URLSearchParams(window.location.search).get("instagramExport") === "1";
+}
+
+function safeSessionItem(key: string) {
+  try {
+    return sessionStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function countPendingUploadItems() {
+  const raw = safeSessionItem("dumpdeck:pending");
+  if (!raw) return 0;
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.length : 0;
+  } catch {
+    return 0;
+  }
+}
 
 export const Route = createFileRoute("/app")({
   head: () => ({
     meta: [
-      { title: "dumpify — Build your dump" },
-      { name: "description", content: "Upload, analyze, curate, order, and export your photo dump." },
+      { title: "FotoFairy — Build your collection" },
+      {
+        name: "description",
+        content: "Upload, analyze, curate, order, and export your photo collection.",
+      },
     ],
   }),
+  errorComponent: AppError,
   component: () => (
     <DumpDeckProvider>
       <Shell />
-      <Toaster position="top-center" richColors />
+      <Toaster position="top-center" richColors duration={6500} />
     </DumpDeckProvider>
   ),
 });
 
-const STAGES = ["setup", "upload", "analyze", "similar", "results", "curate", "final", "export"] as const;
+function AppError({ error, reset }: { error?: Error; reset: () => void }) {
+  console.error("[dumpdeck] /app route failed before workspace render", {
+    message: error?.message,
+    stack: error?.stack,
+    projectId: safeSessionItem("dumpdeck:activeProjectId"),
+    draftId: safeSessionItem("dumpdeck:activeDraftId"),
+    pendingPhotoCount: countPendingUploadItems(),
+    hasPendingUploadState: Boolean(safeSessionItem("dumpdeck:pending")),
+    route: typeof window !== "undefined" ? window.location.pathname : "/app",
+  });
+  return (
+    <main className="grid min-h-screen place-items-center px-5 text-center">
+      <div className="max-w-sm">
+        <BrandMark className="mx-auto h-12 w-12" />
+        <h1 className="mt-4 font-display text-3xl">Sorting did not load</h1>
+        <p className="mt-2 text-sm text-muted-foreground">
+          The workspace hit a temporary issue before the upload flow could start.
+        </p>
+        <div className="mt-5 flex justify-center gap-2">
+          <button type="button" onClick={reset} className="chip bg-ink text-cream">
+            Try again
+          </button>
+          <Link to="/projects" className="chip">
+            Back home
+          </Link>
+        </div>
+      </div>
+    </main>
+  );
+}
+
+const STAGES = [
+  "setup",
+  "upload",
+  "analyze",
+  "similar",
+  "results",
+  "curate",
+  "final",
+  "export",
+] as const;
 
 const FORMAT_LABEL: Record<PostFormat, string> = {
   square: "Instagram square (1:1)",
@@ -85,10 +257,283 @@ const FORMAT_ASPECT: Record<PostFormat, string> = {
 };
 
 function Shell() {
-  const { state } = useDumpDeck();
+  const { state, dispatch } = useDumpDeck();
+  const { user, isAuthed, loading } = useAuth();
+  const navigate = useNavigate();
+  const useMergedUploadFlow = mergedUploadFlowEnabled();
+  const [draftHydrationChecked, setDraftHydrationChecked] = useState(false);
+  const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const hydrationCompleteRef = useRef(false);
+  const lastAutosaveSignatureRef = useRef("");
+
+  useEffect(() => {
+    if (loading) return;
+    if (!isAuthed) {
+      setDraftHydrationChecked(true);
+      hydrationCompleteRef.current = true;
+      return;
+    }
+
+    let cancelled = false;
+    async function loadDraftToResume() {
+      setDraftHydrationChecked(false);
+      const raw = sessionStorage.getItem("dumpdeck:resumeDraft");
+      const draftId = activeDraftId();
+      const resumeStage = sessionStorage.getItem("dumpdeck:resumeDraftStage");
+      try {
+        let draft: FinalDraftPayload | null = null;
+        let resolvedDraftId = draftId;
+        if (draftId) {
+          const saved = await getFinalDraftById(draftId);
+          console.debug("[dumpdeck] app restore fetched saved draft", {
+            action: "app_restore",
+            user_id: user?.id,
+            routeChosen: resumeStage ?? saved?.draftPayload?.workspaceStage ?? "saved-draft",
+            ...savedDraftDebugSummary(saved),
+          });
+          draft = saved?.draftPayload ?? null;
+        }
+        if (!draft && activeProjectId()) {
+          const [latest] = await listFinalDrafts(activeProjectId());
+          if (latest?.draftPayload) {
+            resolvedDraftId = latest.id;
+            sessionStorage.setItem("dumpdeck:activeDraftId", latest.id);
+            draft = latest.draftPayload;
+            console.debug("[dumpdeck] app restore fetched latest project autosave", {
+              action: "app_restore_latest_project_draft",
+              user_id: user?.id,
+              routeChosen: draft.workspaceStage ?? "autosaved-stage",
+              ...savedDraftDebugSummary(latest),
+            });
+          }
+        }
+        if (!draft && raw) {
+          draft = JSON.parse(raw) as FinalDraftPayload;
+          console.debug("[dumpdeck] app restore using session draft fallback", {
+            user_id: user?.id,
+            project_id: draft.projectId,
+            draft_id: draft.draftId,
+            final_selected_photo_count: draft.finalOrder?.length ?? 0,
+            final_order_photo_ids: draft.orderedPhotoIds ?? [],
+            pinned_cover_photo_id: draft.pinnedCoverPhotoId ?? null,
+            missing_data: missingDraftFields({
+              id: draft.draftId ?? "session-draft",
+              projectId: draft.projectId,
+              orderedPhotoIds: draft.orderedPhotoIds,
+              rejectedPhotoIds: draft.rejectedPhotoIds,
+              duplicateDecisions: draft.duplicateDecisions,
+              selectedPreferences: {
+                ...draft.selectedPreferences,
+                pinnedCoverPhotoId: draft.pinnedCoverPhotoId,
+              },
+              scoresReasons: draft.scoresReasons,
+              draftPayload: draft,
+              createdAt: draft.createdAt,
+              updatedAt: draft.updatedAt,
+              storage: "local",
+            }),
+          });
+        }
+        if (!draft) return;
+        const workspaceStage =
+          resumeStage === "final" || resumeStage === "export"
+            ? resumeStage
+            : (draft.workspaceStage ?? (draft.finalOrder?.length ? "export" : "upload"));
+        if (
+          (workspaceStage === "final" || workspaceStage === "export") &&
+          (!Array.isArray(draft.finalOrder) || draft.finalOrder.length === 0)
+        ) {
+          console.warn("[dumpdeck] app restore missing final order", {
+            draftId,
+            projectId: activeProjectId(),
+            hasSessionPayload: Boolean(raw),
+          });
+          toast.error(
+            "That draft is missing photo details. Start from the saved collection instead.",
+          );
+          return;
+        }
+        if (cancelled) return;
+        const finalOrder = orderWithPinned(draft.finalOrder ?? [], draft.pinnedCoverPhotoId);
+        const removed = Array.isArray(draft.removed) ? draft.removed : [];
+        const photos = mergeDraftPhotos(draft.uploadedPhotos, finalOrder, removed);
+        dispatch({
+          type: "hydrate",
+          state: {
+            stage: workspaceStage,
+            settings: draft.selectedPreferences ?? { formats: ["portrait"], vibes: ["random"] },
+            photos,
+            shortlist: draft.shortlist?.length
+              ? draft.shortlist
+              : finalOrder.length
+                ? finalOrder
+                : photos,
+            kept: draft.kept?.length ? draft.kept : finalOrder,
+            finalOrder,
+            removed,
+            duplicateDecisions: draft.duplicateDecisions ?? [],
+            pinnedCoverId: draft.pinnedCoverPhotoId ?? null,
+            favoritePhotoIds: draft.favoritePhotoIds ?? [],
+            collectionTitleMetadata: draft.collectionTitleMetadata ?? null,
+          },
+        });
+        if (resolvedDraftId) sessionStorage.setItem("dumpdeck:activeDraftId", resolvedDraftId);
+        toast.success("Progress restored");
+      } catch (err) {
+        console.error("[dumpdeck] failed to resume draft", err);
+        toast.error("Could not restore saved progress.");
+      } finally {
+        sessionStorage.removeItem("dumpdeck:resumeDraft");
+        sessionStorage.removeItem("dumpdeck:resumeDraftStage");
+        if (!cancelled) {
+          hydrationCompleteRef.current = true;
+          setDraftHydrationChecked(true);
+        }
+      }
+    }
+
+    void loadDraftToResume();
+    return () => {
+      cancelled = true;
+    };
+  }, [dispatch, isAuthed, loading, user?.id]);
+
+  useEffect(() => {
+    if (!draftHydrationChecked || !hydrationCompleteRef.current) return;
+    const projectId = activeProjectId();
+    if (!projectId) return;
+    if (state.stage === "setup" && state.photos.length === 0 && state.finalOrder.length === 0)
+      return;
+
+    const signature = JSON.stringify({
+      projectId,
+      draftId: activeDraftId(),
+      stage: state.stage,
+      settings: state.settings,
+      photos: state.photos.map((photo) => [
+        photo.id,
+        photo.previewStoragePath ?? photo.sourceMetadata?.previewStoragePath ?? "",
+        photo.originalStoragePath ?? photo.sourceMetadata?.originalStoragePath ?? "",
+      ]),
+      shortlist: state.shortlist.map((photo) => photo.id),
+      kept: state.kept.map((photo) => photo.id),
+      finalOrder: state.finalOrder.map((photo) => photo.id),
+      removed: state.removed.map((entry) => [entry.photo.id, entry.reason, entry.source]),
+      duplicateDecisions: state.duplicateDecisions,
+      pinnedCoverId: state.pinnedCoverId,
+      favoritePhotoIds: state.favoritePhotoIds,
+      collectionTitleMetadata: state.collectionTitleMetadata,
+    });
+    if (signature === lastAutosaveSignatureRef.current) return;
+    lastAutosaveSignatureRef.current = signature;
+
+    let cancelled = false;
+    const timeout = window.setTimeout(() => {
+      setSaveStatus("saving");
+      void autosaveWorkspaceDraft({
+        draftId: activeDraftId(),
+        projectId,
+        stage: state.stage,
+        allPhotos: state.photos,
+        shortlist: state.shortlist,
+        kept: state.kept,
+        finalOrder: state.finalOrder,
+        removed: state.removed,
+        settings: state.settings,
+        duplicateDecisions: state.duplicateDecisions,
+        pinnedCoverPhotoId: state.pinnedCoverId,
+        favoritePhotoIds: state.favoritePhotoIds,
+        collectionTitleMetadata: state.collectionTitleMetadata,
+      })
+        .then((result) => {
+          if (cancelled || result.skipped) return;
+          sessionStorage.setItem("dumpdeck:activeDraftId", result.id);
+          setSaveStatus("saved");
+        })
+        .catch((err) => {
+          if (cancelled) return;
+          console.error("[dumpdeck] autosave failed", err);
+          setSaveStatus("error");
+          toast.error("Autosave failed. Your latest changes may not be saved yet.");
+        });
+    }, 900);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeout);
+    };
+  }, [
+    draftHydrationChecked,
+    state.collectionTitleMetadata,
+    state.duplicateDecisions,
+    state.favoritePhotoIds,
+    state.finalOrder,
+    state.kept,
+    state.photos,
+    state.pinnedCoverId,
+    state.removed,
+    state.settings,
+    state.shortlist,
+    state.stage,
+  ]);
+
+  if (loading || (isAuthed && !draftHydrationChecked)) {
+    return (
+      <main className="grid min-h-screen place-items-center text-sm text-muted-foreground">
+        Restoring your project…
+      </main>
+    );
+  }
+
+  if (!isAuthed) {
+    return (
+      <main className="grid min-h-screen place-items-center px-5 text-center">
+        <div className="max-w-sm">
+          <h1 className="font-display text-3xl">Sign in to start sorting</h1>
+          <p className="mt-2 text-sm text-muted-foreground">
+            Your collections and sorting sessions are saved to your account.
+          </p>
+          <Link
+            to="/auth"
+            className="mt-5 inline-flex h-11 items-center rounded-xl bg-ink px-4 font-semibold text-cream"
+          >
+            Sign in
+          </Link>
+        </div>
+      </main>
+    );
+  }
+
+  if (!activeProjectId()) {
+    return (
+      <main className="grid min-h-screen place-items-center px-5 text-center">
+        <div className="max-w-sm">
+          <BrandMark className="mx-auto h-12 w-12" />
+          <h1 className="mt-4 font-display text-3xl">Choose a collection first</h1>
+          <p className="mt-2 text-sm text-muted-foreground">
+            FotoFairy saves uploads, cuts, captions, and final order under a collection.
+          </p>
+          <div className="mt-5 grid gap-2">
+            <button
+              type="button"
+              onClick={() => void navigate({ to: "/projects" })}
+              className="h-11 rounded-xl bg-ink px-4 font-semibold text-cream"
+            >
+              Back to home
+            </button>
+            <Link to="/projects" className="chip justify-center">
+              Saved collections
+            </Link>
+          </div>
+        </div>
+      </main>
+    );
+  }
+
   return (
     <main className="relative mx-auto min-h-screen max-w-md px-4 pb-28 pt-6">
       <TopBar />
+      <AutosaveIndicator status={saveStatus} />
       <ProgressDots stage={state.stage} />
 
       <AnimatePresence mode="wait">
@@ -101,7 +546,8 @@ function Shell() {
           className="mt-6"
         >
           {state.stage === "setup" && <SetupStage />}
-          {state.stage === "upload" && <UploadStage />}
+          {state.stage === "upload" &&
+            (useMergedUploadFlow ? <MergedUploadAnalyzeStage /> : <UploadStage />)}
           {state.stage === "analyze" && <AnalyzeStage />}
           {state.stage === "similar" && <SimilarStage />}
           {state.stage === "results" && <ResultsStage />}
@@ -114,23 +560,95 @@ function Shell() {
   );
 }
 
+function AutosaveIndicator({ status }: { status: "idle" | "saving" | "saved" | "error" }) {
+  if (status === "idle") return null;
+  const copy =
+    status === "saving" ? "Saving…" : status === "saved" ? "Saved" : "Autosave needs attention";
+  return (
+    <div
+      className={`mt-3 inline-flex items-center rounded-full px-3 py-1 text-[11px] font-semibold ${
+        status === "error" ? "bg-coral/15 text-coral" : "bg-mint/45 text-ink"
+      }`}
+      aria-live="polite"
+    >
+      {copy}
+    </div>
+  );
+}
+
+function mergeDraftPhotos(
+  uploadedPhotos: Photo[] | undefined,
+  finalOrder: Photo[],
+  removed: RemovedPhoto[],
+) {
+  const byId = new Map<string, Photo>();
+  for (const photo of uploadedPhotos ?? []) byId.set(photo.id, photo);
+  for (const photo of finalOrder) byId.set(photo.id, photo);
+  for (const entry of removed) byId.set(entry.photo.id, entry.photo);
+  return Array.from(byId.values());
+}
+
 function TopBar() {
   const { dispatch } = useDumpDeck();
+  const [confirmReset, setConfirmReset] = useState(false);
   return (
     <header className="flex items-center justify-between">
-      <Link to="/" className="flex items-center gap-2">
+      <Link to="/projects" className="flex items-center gap-2">
         <BrandMark className="h-9 w-9" />
         <BrandWordmark size="text-lg" />
       </Link>
-      <button
-        onClick={() => {
-          if (confirm("Start over? Your current progress will be cleared.")) dispatch({ type: "reset" });
-        }}
-        className="chip"
-        type="button"
-      >
+      <button onClick={() => setConfirmReset(true)} className="chip" type="button">
         <RotateCcw className="h-3 w-3" /> Reset
       </button>
+      <AnimatePresence>
+        {confirmReset && (
+          <motion.div
+            className="fixed inset-0 z-50 grid place-items-center bg-ink/35 px-5 backdrop-blur-sm"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={() => setConfirmReset(false)}
+          >
+            <motion.div
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="reset-flow-title"
+              className="w-full max-w-sm rounded-3xl bg-cream p-6 text-center shadow-2xl"
+              initial={{ scale: 0.96, y: 12 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.96, y: 12 }}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <h2 id="reset-flow-title" className="font-display text-3xl">
+                Start over?
+              </h2>
+              <p className="mt-2 text-sm text-muted-foreground">
+                This clears the current in-progress sort on this device. Saved collections and
+                drafts stay in your account.
+              </p>
+              <div className="mt-6 grid gap-2 sm:grid-cols-2">
+                <button
+                  type="button"
+                  className="h-11 rounded-xl bg-white font-semibold text-ink ring-1 ring-ink/10"
+                  onClick={() => setConfirmReset(false)}
+                >
+                  Keep sorting
+                </button>
+                <button
+                  type="button"
+                  className="h-11 rounded-xl bg-coral font-semibold text-white"
+                  onClick={() => {
+                    setConfirmReset(false);
+                    dispatch({ type: "reset" });
+                  }}
+                >
+                  Reset
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </header>
   );
 }
@@ -194,12 +712,37 @@ function SetupStage() {
     dispatch({ type: "setStage", stage: "upload" });
   }
 
-  const formatOpts: { id: PostFormat; label: string; ratio: string; box: string; grad: string }[] = [
-    { id: "square",    label: "Instagram square",   ratio: "1 : 1",     box: "h-14 w-14",     grad: "bg-gradient-to-br from-coral to-butter" },
-    { id: "portrait",  label: "Portrait carousel",  ratio: "4 : 5",     box: "h-16 w-[3.2rem]", grad: "bg-gradient-to-br from-lavender to-mint" },
-    { id: "landscape", label: "Landscape",          ratio: "1.91 : 1",  box: "h-10 w-[4.2rem]", grad: "bg-gradient-to-br from-mint to-butter" },
-    { id: "story",     label: "Story",              ratio: "9 : 16",    box: "h-16 w-9",       grad: "bg-gradient-to-br from-coral to-lavender" },
-  ];
+  const formatOpts: { id: PostFormat; label: string; ratio: string; box: string; grad: string }[] =
+    [
+      {
+        id: "square",
+        label: "Instagram square",
+        ratio: "1 : 1",
+        box: "h-14 w-14",
+        grad: "bg-gradient-to-br from-coral to-butter",
+      },
+      {
+        id: "portrait",
+        label: "Portrait carousel",
+        ratio: "4 : 5",
+        box: "h-16 w-[3.2rem]",
+        grad: "bg-gradient-to-br from-lavender to-mint",
+      },
+      {
+        id: "landscape",
+        label: "Landscape",
+        ratio: "1.91 : 1",
+        box: "h-10 w-[4.2rem]",
+        grad: "bg-gradient-to-br from-mint to-butter",
+      },
+      {
+        id: "story",
+        label: "Story",
+        ratio: "9 : 16",
+        box: "h-16 w-9",
+        grad: "bg-gradient-to-br from-coral to-lavender",
+      },
+    ];
 
   const vibeOpts: {
     id: VibeFocus;
@@ -208,15 +751,56 @@ function SetupStage() {
     hint: string;
     tile: string;
   }[] = [
-    { id: "cute",      label: "Cute",        Icon: Heart,            hint: "Soft, sweet moments",   tile: "from-coral/80 to-butter/80" },
-    { id: "aesthetic", label: "Aesthetic",   Icon: Palette,          hint: "Color, light, mood",    tile: "from-lavender to-mint" },
-    { id: "funny",     label: "Funny",       Icon: Laugh,            hint: "Chaotic, candid",       tile: "from-butter to-coral/70" },
-    { id: "vacation",  label: "Vacation",    Icon: Palmtree,         hint: "Travel + scenery",      tile: "from-mint to-lavender" },
-    { id: "food",      label: "Food",        Icon: UtensilsCrossed,  hint: "Plates + details",      tile: "from-coral/70 to-butter" },
-    { id: "friends",   label: "Friends",     Icon: Users,            hint: "People-first",          tile: "from-mint to-butter" },
-    { id: "random",    label: "Random dump", Icon: Shuffle,          hint: "A little of everything", tile: "from-lavender to-coral/70" },
+    {
+      id: "cute",
+      label: "Cute",
+      Icon: Heart,
+      hint: "Soft, sweet moments",
+      tile: "from-coral/80 to-butter/80",
+    },
+    {
+      id: "aesthetic",
+      label: "Aesthetic",
+      Icon: Palette,
+      hint: "Color, light, mood",
+      tile: "from-lavender to-mint",
+    },
+    {
+      id: "funny",
+      label: "Funny",
+      Icon: Laugh,
+      hint: "Chaotic, candid",
+      tile: "from-butter to-coral/70",
+    },
+    {
+      id: "vacation",
+      label: "Vacation",
+      Icon: Palmtree,
+      hint: "Travel + scenery",
+      tile: "from-mint to-lavender",
+    },
+    {
+      id: "food",
+      label: "Food",
+      Icon: UtensilsCrossed,
+      hint: "Plates + details",
+      tile: "from-coral/70 to-butter",
+    },
+    {
+      id: "friends",
+      label: "Friends",
+      Icon: Users,
+      hint: "People-first",
+      tile: "from-mint to-butter",
+    },
+    {
+      id: "random",
+      label: "Random mix",
+      Icon: Shuffle,
+      hint: "A little of everything",
+      tile: "from-lavender to-coral/70",
+    },
   ];
-
 
   const formatsFull = formats.length >= 3;
   const vibesFull = vibes.length >= 3;
@@ -256,7 +840,9 @@ function SetupStage() {
 
       <div className="mt-6">
         <div className="mb-2 flex items-baseline justify-between">
-          <div className="text-xs font-bold uppercase tracking-wider text-muted-foreground">Post format</div>
+          <div className="text-xs font-bold uppercase tracking-wider text-muted-foreground">
+            Post format
+          </div>
           <div className="text-[11px] text-muted-foreground">{formats.length}/3 picked</div>
         </div>
         <div className="grid grid-cols-2 gap-2">
@@ -287,7 +873,9 @@ function SetupStage() {
 
       <div className="mt-6">
         <div className="mb-2 flex items-baseline justify-between">
-          <div className="text-xs font-bold uppercase tracking-wider text-muted-foreground">Post vibe</div>
+          <div className="text-xs font-bold uppercase tracking-wider text-muted-foreground">
+            Post vibe
+          </div>
           <div className="text-[11px] text-muted-foreground">{vibes.length}/3 picked</div>
         </div>
         <div className="grid grid-cols-2 gap-2">
@@ -335,15 +923,275 @@ function SetupStage() {
 }
 
 /* ───────────── Upload ───────────── */
+async function makeLocalSampleUploads(): Promise<UploadItem[]> {
+  const samples = [
+    {
+      name: "Brunch table",
+      displayName: "Brunch table",
+      colorA: "#ff7a59",
+      colorB: "#f7d154",
+      label: "food",
+      seed: 0,
+    },
+    {
+      name: "Brunch table copy",
+      displayName: "Brunch table",
+      colorA: "#ff7a59",
+      colorB: "#f7d154",
+      label: "food",
+      seed: 0,
+    },
+    {
+      name: "City night",
+      displayName: "City night",
+      colorA: "#223049",
+      colorB: "#7cc6fe",
+      label: "city",
+      seed: 1,
+    },
+    {
+      name: "Beach walk",
+      displayName: "Beach walk",
+      colorA: "#4db6ac",
+      colorB: "#ffe08a",
+      label: "beach",
+      seed: 2,
+    },
+    {
+      name: "Mountain view",
+      displayName: "Mountain view",
+      colorA: "#6c7a89",
+      colorB: "#b8e0d2",
+      label: "landscape",
+      seed: 3,
+    },
+    {
+      name: "Portrait smile",
+      displayName: "Portrait smile",
+      colorA: "#c084fc",
+      colorB: "#ffd6a5",
+      label: "friends",
+      seed: 4,
+    },
+    {
+      name: "Dog park",
+      displayName: "Dog park",
+      colorA: "#78c6a3",
+      colorB: "#f4a261",
+      label: "pets",
+      seed: 5,
+    },
+    {
+      name: "Gallery wall",
+      displayName: "Gallery wall",
+      colorA: "#f5f3ff",
+      colorB: "#7c3aed",
+      label: "aesthetic",
+      seed: 6,
+    },
+    {
+      name: "Coffee detail",
+      displayName: "Coffee detail",
+      colorA: "#8d6e63",
+      colorB: "#ffe0b2",
+      label: "food",
+      seed: 7,
+    },
+    {
+      name: "Hotel mirror",
+      displayName: "Hotel mirror",
+      colorA: "#f8bbd0",
+      colorB: "#90caf9",
+      label: "outfit",
+      seed: 8,
+    },
+    {
+      name: "Museum steps",
+      displayName: "Museum steps",
+      colorA: "#cfd8dc",
+      colorB: "#ffab91",
+      label: "city",
+      seed: 9,
+    },
+    {
+      name: "Sunset road",
+      displayName: "Sunset road",
+      colorA: "#ff8a65",
+      colorB: "#5c6bc0",
+      label: "travel",
+      seed: 10,
+    },
+    {
+      name: "Park picnic",
+      displayName: "Park picnic",
+      colorA: "#aed581",
+      colorB: "#fff176",
+      label: "friends",
+      seed: 11,
+    },
+    {
+      name: "Train window",
+      displayName: "Train window",
+      colorA: "#78909c",
+      colorB: "#b3e5fc",
+      label: "travel",
+      seed: 12,
+    },
+    {
+      name: "Dessert plate",
+      displayName: "Dessert plate",
+      colorA: "#f48fb1",
+      colorB: "#fff59d",
+      label: "food",
+      seed: 13,
+    },
+    {
+      name: "Concert blur",
+      displayName: "Concert blur",
+      colorA: "#311b92",
+      colorB: "#f06292",
+      label: "night",
+      seed: 14,
+    },
+    {
+      name: "Lake dock",
+      displayName: "Lake dock",
+      colorA: "#4fc3f7",
+      colorB: "#a5d6a7",
+      label: "landscape",
+      seed: 15,
+    },
+    {
+      name: "Bookstore corner",
+      displayName: "Bookstore corner",
+      colorA: "#bcaaa4",
+      colorB: "#ffe082",
+      label: "indoors",
+      seed: 16,
+    },
+    {
+      name: "Market flowers",
+      displayName: "Market flowers",
+      colorA: "#ec407a",
+      colorB: "#81c784",
+      label: "detail",
+      seed: 17,
+    },
+    {
+      name: "Airport snack",
+      displayName: "Airport snack",
+      colorA: "#90a4ae",
+      colorB: "#ffcc80",
+      label: "travel",
+      seed: 18,
+    },
+  ];
+
+  return Promise.all(
+    samples.map(async (sample, index) => {
+      const width = sample.seed % 2 === 0 ? 900 : 720;
+      const height = sample.seed % 2 === 0 ? 1200 : 900;
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("Canvas is unavailable");
+
+      const gradient = ctx.createLinearGradient(0, 0, width, height);
+      gradient.addColorStop(0, sample.colorA);
+      gradient.addColorStop(1, sample.colorB);
+      ctx.fillStyle = gradient;
+      ctx.fillRect(0, 0, width, height);
+      ctx.globalAlpha = 0.2;
+      for (let i = 0; i < 12; i++) {
+        ctx.beginPath();
+        ctx.arc(
+          (((i + sample.seed) * 211) % width) + 40,
+          (((i + sample.seed) * 157) % height) + 40,
+          60 + (((i + sample.seed) * 23) % 110),
+          0,
+          Math.PI * 2,
+        );
+        ctx.fillStyle = i % 2 === 0 ? "#ffffff" : "#111827";
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = "rgba(255,255,255,0.86)";
+      ctx.fillRect(72, height - 210, width - 144, 120);
+      ctx.fillStyle = "#111827";
+      ctx.font = "700 48px system-ui, sans-serif";
+      ctx.fillText(sample.displayName, 108, height - 138);
+      ctx.font = "500 28px system-ui, sans-serif";
+      ctx.fillText(`Local ${sample.label} sample`, 108, height - 98);
+
+      const blob = await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob(
+          (result) => (result ? resolve(result) : reject(new Error("Could not create sample"))),
+          "image/jpeg",
+          0.9,
+        );
+      });
+      const url = URL.createObjectURL(blob);
+      return {
+        id: `local-sample-${index + 1}`,
+        url,
+        previewUrl: url,
+        name: `${sample.name}.jpg`,
+        width,
+        height,
+        fingerprint: `local-sample-${sample.seed}-${width}x${height}`,
+        byteSize: blob.size,
+        mimeType: blob.type,
+        lastModified: Date.now() - index * 1000,
+      };
+    }),
+  );
+}
+
 function UploadStage() {
   const { state, dispatch } = useDumpDeck();
   const [items, setItems] = useState<UploadItem[]>([]);
+  const [loadingSamples, setLoadingSamples] = useState(false);
 
   function handleAnalyze() {
+    const pendingItems = [...items];
+    if (!pendingItems.length) return;
+    const projectId = activeProjectId();
     sessionStorage.setItem(
       "dumpdeck:pending",
-      JSON.stringify(items.map((it) => ({ id: it.id, url: it.url, previewUrl: it.previewUrl, name: it.name, width: it.width, height: it.height }))),
+      JSON.stringify(
+        pendingItems.map((it) => ({
+          id: it.id,
+          url: it.url,
+          originalFileUrl: it.originalFileUrl,
+          previewFileUrl: it.previewFileUrl,
+          previewUrl: it.previewUrl,
+          storageBucket: it.storageBucket,
+          originalStoragePath: it.originalStoragePath,
+          previewStoragePath: it.previewStoragePath,
+          fileName: it.fileName,
+          uploadedAt: it.uploadedAt,
+          name: it.name,
+          width: it.width,
+          height: it.height,
+          fingerprint: it.fingerprint,
+          byteSize: it.byteSize,
+          mimeType: it.mimeType,
+          originalMimeType: it.originalMimeType,
+          convertedFromHeic: it.convertedFromHeic,
+          conversionQuality: it.conversionQuality,
+          conversionDecoder: it.conversionDecoder,
+          originalByteSize: it.originalByteSize,
+          previewByteSize: it.previewByteSize,
+          lastModified: it.lastModified,
+        })),
+      ),
     );
+    sessionStorage.setItem("dumpdeck:lastUploadCount", String(pendingItems.length));
+    if (projectId) {
+      sessionStorage.setItem(projectUploadCountKey(projectId), String(pendingItems.length));
+      localStorage.setItem(projectUploadCountKey(projectId), String(pendingItems.length));
+    }
     dispatch({ type: "clearRemoved" });
     dispatch({ type: "setStage", stage: "analyze" });
   }
@@ -357,10 +1205,14 @@ function UploadStage() {
       />
       <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px]">
         {state.settings.formats.map((f) => (
-          <span key={f} className="chip bg-lavender/40">{FORMAT_LABEL[f]}</span>
+          <span key={f} className="chip bg-lavender/40">
+            {FORMAT_LABEL[f]}
+          </span>
         ))}
         {state.settings.vibes.map((v) => (
-          <span key={v} className="chip bg-mint/40">#{v}</span>
+          <span key={v} className="chip bg-mint/40">
+            #{v}
+          </span>
         ))}
       </div>
       <div className="mt-5">
@@ -371,6 +1223,29 @@ function UploadStage() {
           onAnalyze={handleAnalyze}
         />
       </div>
+      {isLocalDevAuth && (
+        <div className="mt-3">
+          <button
+            type="button"
+            onClick={async () => {
+              setLoadingSamples(true);
+              try {
+                setItems(await makeLocalSampleUploads());
+                toast.success("Loaded local sample photos");
+              } catch (err) {
+                console.error("[dumpdeck] sample photo generation failed", err);
+                toast.error("Could not load sample photos");
+              } finally {
+                setLoadingSamples(false);
+              }
+            }}
+            disabled={loadingSamples}
+            className="chip bg-mint/50 text-ink disabled:opacity-60"
+          >
+            {loadingSamples ? "Loading samples…" : "Use local sample photos"}
+          </button>
+        </div>
+      )}
       <div className="mt-4">
         <button
           onClick={() => dispatch({ type: "setStage", stage: "setup" })}
@@ -384,100 +1259,2082 @@ function UploadStage() {
   );
 }
 
-/* ───────────── Analyze ───────────── */
-const ANALYZE_LINES = [
-  "Reading every pixel…",
-  "Loading TensorFlow people detector…",
-  "Counting people + faces (COCO-SSD + MediaPipe)…",
-  "Hashing for near-duplicates…",
-  "Cosine-matching visually similar photos…",
-  "Classifying selfies, food, landscapes…",
-  "Scoring against your vibe & format…",
-];
+type MergedRow = AnalysisRow & {
+  fileName: string;
+  file?: File;
+  storageStatus?: "queued" | "uploading" | "uploaded" | "failed" | "skipped";
+  localPreviewUrl?: string;
+};
 
+function MergedUploadAnalyzeStage() {
+  const { state, dispatch } = useDumpDeck();
+  const inputRef = useRef<HTMLInputElement>(null);
+  const rowsRef = useRef<MergedRow[]>([]);
+  const processingRunRef = useRef(0);
+  const storageQueueRef = useRef<UploadItem[]>([]);
+  const storageActiveRef = useRef(0);
+  const storageStartedAtRef = useRef(0);
+  const [rows, setRows] = useState<MergedRow[]>([]);
+  const [dragOver, setDragOver] = useState(false);
+  const [showScanHelp, setShowScanHelp] = useState(false);
+  const [pipelineVersion, setPipelineVersion] = useState("");
+  const [phase, setPhase] = useState<AnalysisPhase>("loading");
+  const [storageUploaded, setStorageUploaded] = useState(0);
+  const [storageFailed, setStorageFailed] = useState(0);
+  const [loadingSamples, setLoadingSamples] = useState(false);
+
+  useEffect(() => {
+    rowsRef.current = rows;
+  }, [rows]);
+
+  const items = rows.map((row) => row.item).filter(Boolean);
+  const scanState = useMemo(() => buildCanonicalScanState(rows), [rows]);
+  const quickScanProgress = scanState.totalCount
+    ? scanState.scannedCount / Math.max(1, scanState.totalCount)
+    : 0;
+  const canStartSorting = scanState.complete && scanState.usableCount >= 4 && phase !== "preparing";
+  const scanHelpText = scanState.totalCount > 0 ? scanTooltipSummary(scanState) : "";
+  const unusableRows = rows.filter((row) => rowHasQuickScanResult(row) && !rowIsUsable(row));
+  const sampleRows = rows.filter((row) => row.item || row.localPreviewUrl).slice(0, 9);
+  const taglinePhotos = useMemo(
+    () => rows.map((row) => row.photo).filter((photo): photo is Photo => !!photo),
+    [rows],
+  );
+  const friendlyLine = useAnalyzingTagline({
+    items,
+    photos: taglinePhotos,
+    phase,
+    active: rows.length > 0 && !canStartSorting,
+  });
+
+  function updateRows(updater: (current: MergedRow[]) => MergedRow[]) {
+    let nextRows = rowsRef.current;
+    setRows((current) => {
+      const next = updater(current);
+      rowsRef.current = next;
+      nextRows = next;
+      return next;
+    });
+    return nextRows;
+  }
+
+  function enqueueStorageUpload(item: UploadItem) {
+    storageQueueRef.current.push(item);
+    if (!storageStartedAtRef.current) storageStartedAtRef.current = performance.now();
+    pumpStorageUploads();
+  }
+
+  function pumpStorageUploads() {
+    while (
+      storageActiveRef.current < MERGED_STORAGE_CONCURRENCY &&
+      storageQueueRef.current.length > 0
+    ) {
+      const item = storageQueueRef.current.shift()!;
+      storageActiveRef.current += 1;
+      updateRows((current) =>
+        current.map((row) =>
+          row.item.id === item.id ? { ...row, storageStatus: "uploading" } : row,
+        ),
+      );
+      void persistProjectUploads(activeProjectId(), [item])
+        .then((storedItems) => {
+          const stored = storedItems[0];
+          if (!stored) return;
+          setStorageUploaded((count) => count + 1);
+          updateRows((current) =>
+            current.map((row) => {
+              if (row.item.id !== item.id) return row;
+              const nextItem = {
+                ...row.item,
+                url: stored.previewUrl ?? stored.previewFileUrl ?? stored.url,
+                originalFileUrl: stored.originalFileUrl,
+                previewFileUrl: stored.previewFileUrl,
+                previewUrl: stored.previewUrl,
+                storageBucket: stored.storageBucket,
+                originalStoragePath: stored.originalStoragePath,
+                previewStoragePath: stored.previewStoragePath,
+                fileName: stored.fileName,
+                uploadedAt: stored.uploadedAt,
+              };
+              const nextPhoto = row.photo
+                ? {
+                    ...row.photo,
+                    url: nextItem.previewUrl ?? nextItem.url,
+                    originalFileUrl: nextItem.originalFileUrl,
+                    previewFileUrl: nextItem.previewFileUrl,
+                    previewUrl: nextItem.previewUrl,
+                    storageBucket: nextItem.storageBucket,
+                    originalStoragePath: nextItem.originalStoragePath,
+                    previewStoragePath: nextItem.previewStoragePath,
+                    fileName: nextItem.fileName,
+                    uploadedAt: nextItem.uploadedAt,
+                    sourceMetadata: {
+                      ...row.photo.sourceMetadata,
+                      storageBucket: nextItem.storageBucket,
+                      originalStoragePath: nextItem.originalStoragePath,
+                      previewStoragePath: nextItem.previewStoragePath,
+                      originalFileUrl: nextItem.originalFileUrl,
+                      previewFileUrl: nextItem.previewUrl ?? nextItem.previewFileUrl,
+                      fileName: nextItem.fileName,
+                      uploadedAt: nextItem.uploadedAt,
+                    },
+                  }
+                : row.photo;
+              return {
+                ...row,
+                item: nextItem,
+                photo: nextPhoto,
+                storageStatus: "uploaded",
+              };
+            }),
+          );
+          if (stored.previewStoragePath || stored.originalStoragePath) {
+            const storedPhoto = rowsRef.current.find((row) => row.item.id === item.id)?.photo;
+            if (storedPhoto) dispatch({ type: "updatePhotoSources", photos: [storedPhoto] });
+          }
+        })
+        .catch((err) => {
+          console.warn("[dumpdeck] merged storage upload failed", {
+            projectId: activeProjectId(),
+            id: item.id,
+            name: item.name,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          setStorageFailed((count) => count + 1);
+          updateRows((current) =>
+            current.map((row) =>
+              row.item.id === item.id
+                ? {
+                    ...row,
+                    storageStatus: "failed",
+                    error: row.error ?? "Storage upload is still needed before saving.",
+                  }
+                : row,
+            ),
+          );
+        })
+        .finally(() => {
+          storageActiveRef.current -= 1;
+          if (storageQueueRef.current.length || storageActiveRef.current) {
+            pumpStorageUploads();
+            return;
+          }
+          console.debug("[perf] merged storage upload summary", {
+            projectId: activeProjectId(),
+            totalPhotos: rowsRef.current.length,
+            uploaded: rowsRef.current.filter((row) => row.storageStatus === "uploaded").length,
+            failed: rowsRef.current.filter((row) => row.storageStatus === "failed").length,
+            storageUploadMs: Math.round(performance.now() - storageStartedAtRef.current),
+          });
+        });
+    }
+  }
+
+  async function scanPreparedItem(
+    item: UploadItem,
+    pipeline: typeof import("@/lib/dumpdeck/pipeline"),
+  ) {
+    updateRows((current) =>
+      current.map((row) => (row.item.id === item.id ? { ...row, status: "local_scanning" } : row)),
+    );
+    try {
+      const { photo, clipEmbeddingVector } = await withTimeout(
+        pipeline.processLocalImage({
+          ...item,
+          settings: state.settings,
+        }),
+        LOCAL_SCAN_TIMEOUT_MS,
+        `Quick scan for ${item.name}`,
+      );
+      const localSkipReason = localRemovalReason(photo);
+      updateRows((current) =>
+        current.map((row) =>
+          row.item.id === item.id
+            ? {
+                ...row,
+                status: localSkipReason ? "skipped" : "local_complete",
+                photo,
+                clipEmbeddingVector,
+                localSkipReason,
+                error: localSkipReason,
+              }
+            : row,
+        ),
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Local quick scan failed";
+      console.warn("[dumpdeck] merged quick scan failed", {
+        id: item.id,
+        name: item.name,
+        message,
+      });
+      updateRows((current) =>
+        current.map((row) =>
+          row.item.id === item.id
+            ? {
+                ...row,
+                status: "failed",
+                error: message,
+              }
+            : row,
+        ),
+      );
+    }
+  }
+
+  async function handleFiles(files: FileList | File[]) {
+    const selected = Array.from(files);
+    const runId = processingRunRef.current;
+    const accepted = selected.filter(isSupportedPhotoFile);
+    const rejected = selected.filter((file) => !isSupportedPhotoFile(file));
+    const selectedAt = performance.now();
+    const rejectedRows: MergedRow[] = rejected.map((file) => {
+      const item: UploadItem = {
+        id: crypto.randomUUID(),
+        url: "",
+        name: file.name,
+        width: 0,
+        height: 0,
+        byteSize: file.size,
+        mimeType: file.type || "application/octet-stream",
+        lastModified: file.lastModified,
+      };
+      return {
+        item,
+        fileName: file.name,
+        status: "failed",
+        attempts: 0,
+        geminiRequests: 0,
+        storageStatus: "skipped",
+        error:
+          file.type.startsWith("video/") || /\.(mov|mp4|m4v)$/i.test(file.name)
+            ? `${file.name} is video-only. FotoFairy analyzes still photos for now.`
+            : `${file.name} is not a supported photo format.`,
+      };
+    });
+    const placeholderRows: MergedRow[] = accepted.map((file) => ({
+      item: {
+        id: crypto.randomUUID(),
+        url: "",
+        name: file.name,
+        width: 0,
+        height: 0,
+        byteSize: file.size,
+        mimeType: file.type || "image/jpeg",
+        lastModified: file.lastModified,
+      },
+      file,
+      fileName: file.name,
+      status: "uploaded",
+      attempts: 0,
+      geminiRequests: 0,
+      storageStatus: "queued",
+      error: isHeicFile(file) ? "Preparing HEIC preview…" : undefined,
+    }));
+
+    setPhase("local-scanning");
+    updateRows((current) => [...current, ...placeholderRows, ...rejectedRows]);
+    if (!accepted.length) return;
+
+    const pipeline = await import("@/lib/dumpdeck/pipeline");
+    if (runId !== processingRunRef.current) return;
+    setPipelineVersion(pipeline.imagePipelineVersion);
+
+    let prepareCursor = 0;
+    const preparedItems: UploadItem[] = [];
+    let firstPreviewMs: number | null = null;
+
+    async function worker() {
+      while (prepareCursor < accepted.length && runId === processingRunRef.current) {
+        const file = accepted[prepareCursor++];
+        const row = placeholderRows.find((entry) => entry.file === file);
+        if (!row) continue;
+        try {
+          updateRows((current) =>
+            current.map((entry) =>
+              entry.item.id === row.item.id
+                ? {
+                    ...entry,
+                    error: isHeicFile(file) ? "Preparing iPhone photo…" : undefined,
+                  }
+                : entry,
+            ),
+          );
+          const item = await readImage(file);
+          if (firstPreviewMs === null) firstPreviewMs = Math.round(performance.now() - selectedAt);
+          preparedItems.push(item);
+          updateRows((current) =>
+            current.map((entry) =>
+              entry.item.id === row.item.id
+                ? {
+                    ...entry,
+                    item,
+                    localPreviewUrl: item.previewUrl ?? item.url,
+                    error: undefined,
+                    storageStatus: "queued",
+                  }
+                : entry,
+            ),
+          );
+          enqueueStorageUpload(item);
+          void scanPreparedItem(item, pipeline);
+          await yieldToBrowser();
+        } catch (err) {
+          const message = err instanceof Error ? err.message : friendlyDecodeError(file);
+          updateRows((current) =>
+            current.map((entry) =>
+              entry.item.id === row.item.id
+                ? {
+                    ...entry,
+                    status: "failed",
+                    error: message,
+                    storageStatus: "skipped",
+                  }
+                : entry,
+            ),
+          );
+        }
+      }
+    }
+
+    await Promise.all(
+      Array.from({ length: Math.min(MERGED_PREPARE_CONCURRENCY, accepted.length) }, () => worker()),
+    );
+    console.debug("[perf] merged file preparation summary", {
+      totalSelected: selected.length,
+      accepted: accepted.length,
+      rejected: rejected.length,
+      prepared: preparedItems.length,
+      timeToFirstPreviewMs: firstPreviewMs,
+      totalFileSelectionMs: Math.round(performance.now() - selectedAt),
+      prepareConcurrency: MERGED_PREPARE_CONCURRENCY,
+      quickScanConcurrency: MERGED_LOCAL_SCAN_CONCURRENCY,
+    });
+  }
+
+  async function useSamples() {
+    setLoadingSamples(true);
+    try {
+      const samples = await makeLocalSampleUploads();
+      const sampleRows = samples.map((item): MergedRow => ({
+        item,
+        fileName: item.name,
+        status: "uploaded",
+        attempts: 0,
+        geminiRequests: 0,
+        storageStatus: "skipped",
+        localPreviewUrl: item.previewUrl ?? item.url,
+      }));
+      updateRows((current) => [...current, ...sampleRows]);
+      setPhase("local-scanning");
+      const pipeline = await import("@/lib/dumpdeck/pipeline");
+      setPipelineVersion(pipeline.imagePipelineVersion);
+      let cursor = 0;
+      async function worker() {
+        while (cursor < samples.length) {
+          const item = samples[cursor++];
+          await scanPreparedItem(item, pipeline);
+        }
+      }
+      await Promise.all(
+        Array.from({ length: Math.min(MERGED_LOCAL_SCAN_CONCURRENCY, samples.length) }, () =>
+          worker(),
+        ),
+      );
+      toast.success("Loaded local sample photos");
+    } catch (err) {
+      console.error("[dumpdeck] sample photo generation failed", err);
+      toast.error("Could not load sample photos");
+    } finally {
+      setLoadingSamples(false);
+    }
+  }
+
+  async function startSorting() {
+    if (!canStartSorting) return;
+    setPhase("preparing");
+    const sortingStartedAt = performance.now();
+    try {
+      const processed = rowsRef.current
+        .filter((row) => row.status !== "failed" && row.status !== "skipped" && row.photo?.analysis)
+        .map((row) => ({
+          photo: row.photo!,
+          clipEmbeddingVector: row.clipEmbeddingVector,
+        }));
+      if (processed.length < 4) {
+        setPhase("blocked");
+        toast.error("At least 4 scanned photos are needed to start sorting.");
+        return;
+      }
+
+      const { photos: clusteredPhotos } = assignDuplicateClusters(processed);
+      const { photos: rankedPhotos } = rankPhotos(clusteredPhotos, { settings: state.settings });
+      const { photos: out, events, collections } = organizePhotos(rankedPhotos);
+      void Promise.all([
+        saveDuplicateClusterAssignments(out, pipelineVersion),
+        savePhotoRankings(out, pipelineVersion),
+      ]).catch((err) => console.warn("[dumpdeck] metadata cache save failed", err));
+
+      const groups = buildDuplicateGroupsForPhotos(out);
+      const hasGroups = groups.some((group) => group.photos.length > 1);
+      const projectId = activeProjectId();
+      if (projectId) {
+        sessionStorage.setItem(projectUploadCountKey(projectId), String(rowsRef.current.length));
+        localStorage.setItem(projectUploadCountKey(projectId), String(rowsRef.current.length));
+      }
+      sessionStorage.setItem("dumpdeck:lastUploadCount", String(rowsRef.current.length));
+      dispatch({ type: "clearRemoved" });
+      dispatch({ type: "setPhotos", photos: out });
+
+      console.debug("[perf] merged sort preparation summary", {
+        totalPhotosSelected: rowsRef.current.length,
+        quickScanResolved: scanState.scannedCount,
+        usablePhotos: scanState.usableCount,
+        skippedOrFailed: rowsRef.current.filter((row) => !rowIsUsable(row)).length,
+        storageUploaded,
+        storageFailed,
+        duplicateGroups: groups.filter((group) => group.photos.length > 1).length,
+        events,
+        collections,
+        totalSortingPreparationMs: Math.round(performance.now() - sortingStartedAt),
+      });
+
+      if (hasGroups) {
+        dispatch({ type: "setStage", stage: "similar" });
+        return;
+      }
+      const shortlist = rankingShortlist(out, MAX_KEEP);
+      const cutEntries = removedByRanking(out, shortlist);
+      if (cutEntries.length) dispatch({ type: "addRemoved", entries: cutEntries });
+      dispatch({ type: "setShortlist", photos: shortlist });
+      dispatch({ type: "setStage", stage: "results" });
+    } catch (err) {
+      console.error("[dumpdeck] merged sorting preparation failed", err);
+      setPhase("ready");
+      toast.error("Sorting could not start. Please try again.");
+    }
+  }
+
+  const heading =
+    rows.length === 0
+      ? "Drop in your photos"
+      : scanState.totalCount > 0
+        ? `${scanState.scannedCount} of ${scanState.totalCount} photo${scanState.totalCount === 1 ? "" : "s"} scanned`
+        : "Preparing your photos";
+
+  return (
+    <section className="text-center">
+      <Heading
+        eyebrow={rows.length ? "Step 1 + 2" : "Step 1"}
+        title={rows.length ? "Reading your camera roll" : "Drop in your photos"}
+        body={
+          rows.length ? friendlyLine : "Pick photos and FotoFairy will start scanning as they load."
+        }
+      />
+
+      <label
+        onDragOver={(event) => {
+          event.preventDefault();
+          setDragOver(true);
+        }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={(event) => {
+          event.preventDefault();
+          setDragOver(false);
+          if (event.dataTransfer.files) void handleFiles(event.dataTransfer.files);
+        }}
+        className={`mx-auto mt-6 flex cursor-pointer flex-col items-center justify-center rounded-3xl border-2 border-dashed px-6 py-8 transition ${
+          dragOver ? "border-coral bg-coral/5" : "border-ink/15 bg-white/55"
+        }`}
+      >
+        <input
+          ref={inputRef}
+          type="file"
+          accept={INPUT_ACCEPT}
+          multiple
+          className="sr-only"
+          onChange={(event) => event.target.files && void handleFiles(event.target.files)}
+        />
+        <div className="grid h-12 w-12 place-items-center rounded-2xl bg-coral text-white shadow-lg">
+          <Upload className="h-5 w-5" />
+        </div>
+        <div className="mt-3 font-display text-2xl">
+          {rows.length ? "Add more photos" : "Drop your camera roll"}
+        </div>
+        <div className="mt-1 text-sm text-muted-foreground">
+          Thumbnails appear first; scanning starts right away.
+        </div>
+      </label>
+
+      {rows.length > 0 && (
+        <>
+          <div className="relative mx-auto mt-8 grid h-64 w-64 grid-cols-3 gap-1.5">
+            {sampleRows.map((row) => (
+              <motion.div
+                key={row.item.id}
+                initial={{ opacity: 0, scale: 0.7 }}
+                animate={{ opacity: 1, scale: 1 }}
+                className="relative overflow-hidden rounded-xl bg-muted"
+              >
+                {row.item.url || row.localPreviewUrl ? (
+                  <img
+                    src={row.item.previewUrl ?? row.localPreviewUrl ?? row.item.url}
+                    alt=""
+                    decoding="async"
+                    className="h-full w-full object-cover"
+                  />
+                ) : (
+                  <div className="grid h-full w-full place-items-center text-[10px] text-muted-foreground">
+                    Reading
+                  </div>
+                )}
+                <span className="absolute bottom-1 left-1 rounded-full bg-white/85 px-1.5 py-0.5 text-[9px] font-semibold text-ink">
+                  {row.status === "failed"
+                    ? "Needs review"
+                    : rowHasQuickScanResult(row)
+                      ? "Scanned"
+                      : row.item.url
+                        ? "Scanning"
+                        : "Loading"}
+                </span>
+              </motion.div>
+            ))}
+            {!canStartSorting && (
+              <motion.div
+                aria-hidden
+                animate={{ y: [0, 240, 0] }}
+                transition={{ duration: 2.2, repeat: Infinity, ease: "easeInOut" }}
+                className="pointer-events-none absolute inset-x-0 h-8 rounded-full bg-gradient-to-b from-transparent via-coral/60 to-transparent blur-sm"
+              />
+            )}
+          </div>
+
+          <div className="mx-auto mt-8 max-w-sm">
+            <div className="h-2 overflow-hidden rounded-full bg-ink/10">
+              <motion.div
+                className={`h-full rounded-full ${canStartSorting ? "bg-mint" : "bg-coral"}`}
+                animate={{ width: `${Math.round(quickScanProgress * 100)}%` }}
+              />
+            </div>
+            <div className="relative mx-auto mt-4 flex max-w-full items-center justify-center gap-2 px-2">
+              <div className="text-center font-display text-2xl leading-tight text-ink sm:text-3xl">
+                {heading}
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowScanHelp((open) => !open)}
+                aria-expanded={showScanHelp}
+                aria-label="What does this scan status mean?"
+                className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-white/80 text-ink shadow-sm ring-1 ring-ink/10 transition hover:bg-white"
+              >
+                <HelpCircle className="h-4 w-4" />
+              </button>
+              <AnimatePresence>
+                {showScanHelp && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 4, scale: 0.98 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={{ opacity: 0, y: 4, scale: 0.98 }}
+                    className="absolute left-1/2 top-full z-20 mt-3 w-[min(20rem,calc(100vw-3rem))] -translate-x-1/2 rounded-2xl bg-white p-3 text-left text-xs leading-relaxed text-ink shadow-xl ring-1 ring-ink/10"
+                  >
+                    <p>{scanHelpText}</p>
+                    <p className="mt-2 text-muted-foreground">
+                      Usable means the photo loaded successfully and passed the basic scan.
+                      Screenshots, corrupted files, unsupported formats, or failed uploads may be
+                      skipped.
+                    </p>
+                    {unusableRows.length > 0 && (
+                      <div className="mt-2 border-t border-ink/10 pt-2">
+                        <div className="font-semibold">Skipped reasons</div>
+                        <ul className="mt-1 max-h-24 space-y-1 overflow-y-auto">
+                          {unusableRows.map((row) => (
+                            <li key={row.item.id}>
+                              <span className="font-semibold">{row.item.name}:</span>{" "}
+                              <span>{rowFinalReason(row)}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+            {canStartSorting && (
+              <div className="mt-4 rounded-2xl bg-mint/20 px-4 py-3 text-left text-xs leading-relaxed text-ink">
+                <div className="font-semibold">Your photos are ready to review.</div>
+                <p className="mt-1 text-muted-foreground">
+                  Storage and deeper AI details can keep finishing quietly while you start sorting.
+                </p>
+              </div>
+            )}
+          </div>
+
+          {unusableRows.length > 0 && (
+            <div className="mx-auto mt-5 max-w-sm rounded-3xl bg-coral/10 p-3 text-left">
+              <div className="text-sm font-semibold text-coral">
+                {unusableRows.length} photo{unusableRows.length === 1 ? "" : "s"} need attention
+              </div>
+              <ul className="mt-2 max-h-28 space-y-1 overflow-y-auto text-xs text-ink/75">
+                {unusableRows.map((row) => (
+                  <li key={row.item.id}>
+                    <span className="font-semibold">{row.item.name}</span>: {rowFinalReason(row)}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          <div className="mx-auto mt-5 max-w-sm space-y-2">
+            <Button
+              onClick={startSorting}
+              disabled={!canStartSorting}
+              className="h-14 w-full rounded-2xl bg-ink text-base font-semibold text-cream hover:bg-coral disabled:opacity-55"
+            >
+              {phase === "preparing"
+                ? "Preparing your collection…"
+                : canStartSorting
+                  ? "Start Sorting"
+                  : "Start Sorting unlocks after quick scan"}
+            </Button>
+            {!canStartSorting && (
+              <p className="px-3 text-xs leading-relaxed text-muted-foreground">
+                Do not refresh FotoFairy until after you start sorting.
+              </p>
+            )}
+            <div className="flex justify-center gap-2">
+              <button
+                type="button"
+                onClick={() => inputRef.current?.click()}
+                className="chip bg-white/80"
+              >
+                + Add more
+              </button>
+              <button
+                type="button"
+                onClick={() => dispatch({ type: "setStage", stage: "setup" })}
+                className="chip"
+              >
+                ← Back to vibe
+              </button>
+            </div>
+            {(storageUploaded > 0 || storageFailed > 0 || storageActiveRef.current > 0) && (
+              <p className="text-xs text-muted-foreground">
+                {storageUploaded} saved to your project
+                {storageFailed ? ` · ${storageFailed} still need storage retry` : ""}
+              </p>
+            )}
+          </div>
+        </>
+      )}
+
+      {isLocalDevAuth && (
+        <div className="mt-3">
+          <button
+            type="button"
+            onClick={useSamples}
+            disabled={loadingSamples}
+            className="chip bg-mint/50 text-ink disabled:opacity-60"
+          >
+            {loadingSamples ? "Loading samples…" : "Use local sample photos"}
+          </button>
+        </div>
+      )}
+    </section>
+  );
+}
+
+/* ───────────── Analyze ───────────── */
+type AnalysisRow = {
+  item: UploadItem;
+  status: AnalysisStatus;
+  photo?: Photo;
+  clipEmbeddingVector?: number[];
+  error?: string;
+  attempts: number;
+  geminiRequests: number;
+  geminiCandidate?: boolean;
+  localSkipReason?: string;
+};
+
+type AnalysisPhase = "loading" | "local-scanning" | "refining" | "ready" | "preparing" | "blocked";
+
+type RefinementSnapshot = {
+  waiting: AnalysisRow[];
+  analyzing: AnalysisRow[];
+  retrying: AnalysisRow[];
+  completed: AnalysisRow[];
+  failed: AnalysisRow[];
+  skipped: AnalysisRow[];
+  screenshots: AnalysisRow[];
+  unsupported: AnalysisRow[];
+};
+
+type GeminiPhotoAudit = {
+  id: string;
+  name: string;
+  reason: string;
+  requests: number;
+  retries: number;
+  cache: "hit" | "miss" | "skipped" | "unknown";
+  status: "analyzed" | "failed" | "cancelled" | "skipped";
+  durationMs: number;
+  error?: string;
+};
+
+type GeminiRefinementAudit = {
+  requests: number;
+  retries: number;
+  failures: number;
+  cacheHits: number;
+  skippedReanalysis: number;
+  startedAt: number;
+  photos: GeminiPhotoAudit[];
+};
+
+type PipelineConfig = {
+  analysisConcurrency: number;
+  maxGeminiPhotos: number;
+  geminiModel: string;
+};
+
+async function getPipelineConfig(): Promise<PipelineConfig> {
+  try {
+    const response = await fetch("/api/dumpdeck/pipeline-config");
+    if (!response.ok) throw new Error(`Config request failed: ${response.status}`);
+    const data = await response.json();
+    const configured = Number(data.analysisConcurrency);
+    return {
+      analysisConcurrency: Number.isFinite(configured)
+        ? Math.min(10, Math.max(1, Math.round(configured)))
+        : 3,
+      maxGeminiPhotos: Number.isFinite(Number(data.maxGeminiPhotos))
+        ? Math.min(200, Math.max(0, Math.round(Number(data.maxGeminiPhotos))))
+        : 70,
+      geminiModel: typeof data.geminiModel === "string" ? data.geminiModel : "gemini-2.5-flash",
+    };
+  } catch (err) {
+    console.warn("[dumpdeck] pipeline config unavailable; using defaults", err);
+    return { analysisConcurrency: 3, maxGeminiPhotos: 70, geminiModel: "gemini-2.5-flash" };
+  }
+}
+
+function isRetryableAnalysisError(err: unknown) {
+  if (err && typeof err === "object" && "retryable" in err) {
+    return Boolean((err as { retryable?: unknown }).retryable);
+  }
+  const message = err instanceof Error ? err.message : String(err);
+  return /429|too.?many|resource_exhausted|rate limit|quota|temporar|timeout|network|upstream|unavailable|503|retry/i.test(
+    message,
+  );
+}
+
+function retryDelayMs(attempt: number, err?: unknown) {
+  const providerDelay =
+    err && typeof err === "object" && "retryAfterMs" in err
+      ? Number((err as { retryAfterMs?: unknown }).retryAfterMs)
+      : Number.NaN;
+  if (Number.isFinite(providerDelay) && providerDelay > 0) return providerDelay + retryJitterMs();
+  return [2000, 4000, 8000, 16000, 32000][Math.min(attempt - 1, 4)] + retryJitterMs();
+}
+
+function retryJitterMs() {
+  return Math.round(300 + Math.random() * 900);
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function yieldToBrowser() {
+  return new Promise((resolve) => window.setTimeout(resolve, 0));
+}
+
+function chunkArray<T>(items: T[], size: number) {
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
+}
+
+async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timeoutId: number | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = window.setTimeout(
+      () => reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`)),
+      ms,
+    );
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timeoutId !== undefined) window.clearTimeout(timeoutId);
+  }
+}
+
+function slowestStage(stages: Record<string, number>) {
+  return Object.entries(stages).reduce(
+    (slowest, [name, ms]) => (ms > slowest.ms ? { name, ms } : slowest),
+    { name: "none", ms: 0 },
+  );
+}
+
+function useAnalyzingTagline({
+  items,
+  photos,
+  phase,
+  active,
+}: {
+  items: UploadItem[];
+  photos: Photo[];
+  phase: AnalysisPhase;
+  active: boolean;
+}) {
+  const tickRef = useRef(0);
+  const latestRef = useRef({ items, photos, phase });
+  const recentRef = useRef<string[]>([]);
+  const [line, setLine] = useState(() => {
+    const initial = nextAnalyzingTagline({
+      items,
+      photos,
+      phase,
+      tick: 0,
+      recent: [],
+    });
+    recentRef.current = rememberTagline([], initial);
+    return initial;
+  });
+
+  useEffect(() => {
+    latestRef.current = { items, photos, phase };
+  }, [items, photos, phase]);
+
+  useEffect(() => {
+    if (!active) return;
+    const rotate = () => {
+      tickRef.current += 1;
+      const current = latestRef.current;
+      const next = nextAnalyzingTagline({
+        ...current,
+        tick: tickRef.current,
+        recent: recentRef.current,
+      });
+      setLine((previous) => {
+        const safeNext =
+          next === previous
+            ? nextAnalyzingTagline({
+                ...current,
+                tick: tickRef.current + 17,
+                recent: [previous, ...recentRef.current],
+              })
+            : next;
+        recentRef.current = rememberTagline(recentRef.current, safeNext);
+        return safeNext;
+      });
+    };
+    const id = window.setInterval(rotate, 6000);
+    return () => window.clearInterval(id);
+  }, [active]);
+
+  return line;
+}
+
+function localRemovalReason(photo: Photo) {
+  const convertedFromHeic = photo.sourceMetadata?.convertedFromHeic;
+  const sharpnessFloor = convertedFromHeic ? 0.07 : 0.12;
+  if (
+    photo.imageQuality?.sharpness !== undefined &&
+    photo.imageQuality.sharpness < sharpnessFloor
+  ) {
+    return "Very blurry in quick scan.";
+  }
+  const brightness = photo.imageQuality?.signals.brightness ?? photo.analysis.brightness;
+  if (brightness < 0.08) return "Extremely dark in quick scan.";
+  if (brightness > 0.94) return "Extremely overexposed in quick scan.";
+  if (looksLikeScreenshot(photo)) return "Likely screenshot/non-photo skipped before Gemini.";
+  return "";
+}
+
+function looksLikeScreenshot(photo: Photo) {
+  const name = photo.name.toLowerCase();
+  if (/\bscreen\s?shot\b|screenshot|screen_recording|screen-recording/.test(name)) return true;
+  const ratio = photo.width / Math.max(1, photo.height);
+  const commonScreenRatio =
+    Math.abs(ratio - 9 / 16) < 0.02 ||
+    Math.abs(ratio - 16 / 9) < 0.02 ||
+    Math.abs(ratio - 19.5 / 9) < 0.03;
+  const objectLabels = new Set(
+    (photo.detectedObjects ?? []).map((object) => object.labelNormalized),
+  );
+  const scene = photo.sceneAnalysis?.primaryScene.toLowerCase() ?? "";
+  const textOrUi =
+    objectLabels.has("text") || objectLabels.has("screen") || objectLabels.has("button");
+  return (
+    scene.includes("screenshot") ||
+    scene.includes("screen") ||
+    scene.includes("receipt") ||
+    scene.includes("document") ||
+    scene.includes("meme") ||
+    objectLabels.has("receipt") ||
+    objectLabels.has("document") ||
+    (commonScreenRatio &&
+      ((photo.analysis.saturation < 0.2 && photo.analysis.contrast > 0.5) || textOrUi) &&
+      photo.analysis.sharpness > 0.5)
+  );
+}
+
+function chooseGeminiCandidates(rows: AnalysisRow[], maxGeminiPhotos: number) {
+  if (maxGeminiPhotos <= 0) return [];
+  const eligible = rows.filter((row) => row.status === "local_complete" && row.photo);
+  const scored = eligible.map((row) => {
+    const photo = row.photo!;
+    const quality = photo.imageQuality?.overallTechnicalQuality ?? photo.scores.quality;
+    const uncertain =
+      (photo.photoTypeConfidence < 0.58 ? 0.18 : 0) +
+      (photo.analysis.peopleUnsure ? 0.16 : 0) +
+      (photo.photoType === "random" ? 0.12 : 0);
+    const semanticNeed = photo.tags.some((tag) =>
+      ["Food", "Landscape", "Selfie", "Group", "Unsure"].includes(tag),
+    )
+      ? 0.14
+      : 0;
+    const tagNeed = row.photo
+      ? photoScoreForTags(photo, row.photo.unifiedAnalysis?.analysis.objects.length ?? 0)
+      : 0;
+    return {
+      row,
+      score: photo.overall * 0.45 + quality * 0.24 + uncertain + semanticNeed + tagNeed,
+    };
+  });
+  return scored
+    .sort((a, b) => b.score - a.score)
+    .slice(0, Math.min(maxGeminiPhotos, scored.length))
+    .map((entry) => entry.row);
+}
+
+function geminiCandidateReason(row: AnalysisRow) {
+  const photo = row.photo;
+  if (!photo) return "semantic refinement needed";
+  const reasons: string[] = [];
+  const quality = photo.imageQuality?.overallTechnicalQuality ?? photo.scores.quality;
+  if (photo.photoTypeConfidence < 0.58) reasons.push("uncertain local scene/type");
+  if (photo.analysis.peopleUnsure) reasons.push("people/face signal needs confirmation");
+  if (photo.tags.some((tag) => ["Food", "Landscape", "Selfie", "Group", "Unsure"].includes(tag))) {
+    reasons.push("semantic tag confirmation");
+  }
+  if (photo.overall >= 0.62 || quality >= 0.62) reasons.push("likely finalist");
+  if (
+    photo.photoType === "detail" ||
+    photo.photoType === "food" ||
+    photo.photoType === "landscape"
+  ) {
+    reasons.push("non-people aesthetic/detail candidate");
+  }
+  return reasons.length ? reasons.join("; ") : "selected for deeper Gemini refinement";
+}
+
+function photoScoreForTags(photo: Photo, objectCount: number) {
+  const tags = photo.tags.join(" ").toLowerCase();
+  let score = 0;
+  if (tags.includes("food") || photo.photoType === "food") score += 0.1;
+  if (tags.includes("landscape") || photo.photoType === "landscape") score += 0.08;
+  if (photo.peopleCount > 0) score += 0.08;
+  if (objectCount === 0 && photo.photoType === "random") score += 0.04;
+  return score;
+}
+
+function isScreenshotSkipReason(reason?: string) {
+  return /screenshot|screen|non-photo|receipt|document|meme/i.test(reason ?? "");
+}
+
+function isUnsupportedSkipReason(reason?: string) {
+  return /unsupported|corrupt|couldn't|failed|invalid/i.test(reason ?? "");
+}
+
+type CanonicalScanState = {
+  totalCount: number;
+  usableCount: number;
+  skippedCount: number;
+  reviewNeededCount: number;
+  deepReviewedCount: number;
+  scannedCount: number;
+  pendingCount: number;
+  complete: boolean;
+};
+
+function buildCanonicalScanState(rows: AnalysisRow[]): CanonicalScanState {
+  const totalCount = rows.length;
+  const usableCount = rows.filter(rowIsUsable).length;
+  const skippedCount = rows.filter((row) => row.status === "skipped").length;
+  const scannedCount = Math.min(totalCount, rows.filter(rowHasQuickScanResult).length);
+  const reviewNeededCount = Math.max(0, scannedCount - usableCount - skippedCount);
+  const deepReviewedCount = rows.filter((row) => row.geminiCandidate).length;
+  const pendingCount = Math.max(0, totalCount - scannedCount);
+  return {
+    totalCount,
+    usableCount,
+    skippedCount,
+    reviewNeededCount,
+    deepReviewedCount,
+    scannedCount,
+    pendingCount,
+    complete: totalCount > 0 && scannedCount === totalCount,
+  };
+}
+
+function scanTooltipSummary(scanState: CanonicalScanState) {
+  const skippedOrReviewCount = scanState.skippedCount + scanState.reviewNeededCount;
+  return `${scanState.scannedCount} of ${scanState.totalCount} photo${scanState.totalCount === 1 ? "" : "s"} scanned · ${scanState.usableCount} usable photo${scanState.usableCount === 1 ? "" : "s"} found · ${scanState.deepReviewedCount} received a closer AI review · ${skippedOrReviewCount} photo${skippedOrReviewCount === 1 ? " needs" : "s need"} review or ${skippedOrReviewCount === 1 ? "was" : "were"} skipped${scanState.pendingCount > 0 ? ` · ${scanState.pendingCount} pending` : ""}`;
+}
+
+function rowHasQuickScanResult(row: AnalysisRow) {
+  return Boolean(row.photo?.analysis) || row.status === "skipped" || row.status === "failed";
+}
+
+function rowIsUsable(row: AnalysisRow) {
+  return Boolean(row.photo?.analysis) && row.status !== "failed" && row.status !== "skipped";
+}
+
+function rowFinalReason(row: AnalysisRow) {
+  return (
+    row.localSkipReason ??
+    row.error ??
+    (row.status === "failed"
+      ? "The photo could not be scanned."
+      : "The photo was skipped during the basic scan.")
+  );
+}
+
+function refinementSnapshot(rows: AnalysisRow[]): RefinementSnapshot {
+  const skipped = rows.filter((row) => row.status === "skipped");
+  return {
+    waiting: rows.filter((row) => row.status === "queued"),
+    analyzing: rows.filter((row) => row.status === "analyzing"),
+    retrying: rows.filter((row) => row.status === "retrying"),
+    completed: rows.filter((row) => row.geminiCandidate && row.status === "analyzed"),
+    failed: rows.filter((row) => row.status === "failed"),
+    skipped,
+    screenshots: skipped.filter((row) => isScreenshotSkipReason(row.localSkipReason ?? row.error)),
+    unsupported: rows.filter(
+      (row) =>
+        row.status === "failed" ||
+        (row.status === "skipped" && isUnsupportedSkipReason(row.localSkipReason ?? row.error)),
+    ),
+  };
+}
+
+function logRefinementSnapshot(
+  label: string,
+  rows: AnalysisRow[],
+  extra: Record<string, unknown> = {},
+) {
+  const snapshot = refinementSnapshot(rows);
+  console.debug(`[dumpdeck] ${label}`, {
+    remainingGeminiRequests:
+      snapshot.waiting.length + snapshot.analyzing.length + snapshot.retrying.length,
+    photosWaitingForRefinement: snapshot.waiting.map((row) => ({
+      id: row.item.id,
+      name: row.item.name,
+      reason: row.error,
+    })),
+    currentlyAnalyzing: snapshot.analyzing.map((row) => ({
+      id: row.item.id,
+      name: row.item.name,
+      attempts: row.attempts,
+      geminiRequests: row.geminiRequests,
+    })),
+    retries: snapshot.retrying.map((row) => ({
+      id: row.item.id,
+      name: row.item.name,
+      attempts: row.attempts,
+      geminiRequests: row.geminiRequests,
+      error: row.error,
+    })),
+    cacheHits: snapshot.completed.filter((row) => row.geminiRequests === 0).length,
+    photosSkipped: snapshot.skipped.length,
+    screenshotsOrNonPhotos: snapshot.screenshots.length,
+    unsupportedOrFailed: snapshot.unsupported.length,
+    totalRemainingWork:
+      snapshot.waiting.length +
+      snapshot.analyzing.length +
+      snapshot.retrying.length +
+      snapshot.failed.length,
+    ...extra,
+  });
+}
 
 function AnalyzeStage() {
   const { state, dispatch } = useDumpDeck();
   const [progress, setProgress] = useState(0);
-  const [line, setLine] = useState(0);
   const [sample, setSample] = useState<{ url: string; previewUrl?: string }[]>([]);
+  const [rows, setRows] = useState<AnalysisRow[]>([]);
+  const [phase, setPhase] = useState<AnalysisPhase>("loading");
+  const [showScanHelp, setShowScanHelp] = useState(false);
+  const [imagePipelineVersion, setImagePipelineVersion] = useState("");
+  const [analysisConcurrency, setAnalysisConcurrency] = useState(3);
+  const [maxGeminiPhotos, setMaxGeminiPhotos] = useState(70);
+  const runIdRef = useRef(0);
+  const rowsRef = useRef<AnalysisRow[]>([]);
+  const pendingItemsRef = useRef<UploadItem[]>([]);
+  const analysisStartedAtRef = useRef(0);
+  const localScanStartedAtRef = useRef(0);
+  const localScanDurationMsRef = useRef(0);
+  const meaningfulReadyAtRef = useRef(0);
+  const storageUploadRef = useRef({ uploaded: 0, durationMs: 0, failed: false });
 
   useEffect(() => {
-    let cancelled = false;
+    rowsRef.current = rows;
+  }, [rows]);
+
+  function updateRows(updater: (current: AnalysisRow[]) => AnalysisRow[]) {
+    let nextRows = rowsRef.current;
+    setRows((current) => {
+      const next = updater(current);
+      rowsRef.current = next;
+      nextRows = next;
+      return next;
+    });
+    return nextRows;
+  }
+
+  function mergeStoredUploads(storedItems: UploadItem[]) {
+    const byId = new Map(storedItems.map((item) => [item.id, item] as const));
+    const nextRows = updateRows((current) =>
+      current.map((row) => {
+        const stored = byId.get(row.item.id);
+        if (!stored) return row;
+        const nextItem = {
+          ...row.item,
+          url: stored.previewUrl ?? stored.previewFileUrl ?? stored.url,
+          originalFileUrl: stored.originalFileUrl,
+          previewFileUrl: stored.previewFileUrl,
+          previewUrl: stored.previewUrl,
+          storageBucket: stored.storageBucket,
+          originalStoragePath: stored.originalStoragePath,
+          previewStoragePath: stored.previewStoragePath,
+          fileName: stored.fileName,
+          uploadedAt: stored.uploadedAt,
+        };
+        const nextPhoto = row.photo
+          ? {
+              ...row.photo,
+              storageBucket: stored.storageBucket,
+              originalStoragePath: stored.originalStoragePath,
+              previewStoragePath: stored.previewStoragePath,
+              url: stored.previewUrl ?? stored.previewFileUrl ?? stored.url,
+              originalFileUrl: stored.originalFileUrl,
+              previewFileUrl: stored.previewFileUrl,
+              previewUrl: stored.previewUrl,
+              fileName: stored.fileName,
+              uploadedAt: stored.uploadedAt,
+              sourceMetadata: {
+                ...row.photo.sourceMetadata,
+                storageBucket: stored.storageBucket,
+                originalStoragePath: stored.originalStoragePath,
+                previewStoragePath: stored.previewStoragePath,
+                originalFileUrl: stored.originalFileUrl,
+                previewFileUrl: stored.previewUrl ?? stored.previewFileUrl,
+                fileName: stored.fileName,
+                uploadedAt: stored.uploadedAt,
+              },
+            }
+          : row.photo;
+        return { ...row, item: nextItem, photo: nextPhoto };
+      }),
+    );
+    const storedPhotos = nextRows
+      .map((row) => row.photo)
+      .filter((photo): photo is Photo =>
+        Boolean(photo?.previewStoragePath || photo?.originalStoragePath),
+      );
+    if (storedPhotos.length) dispatch({ type: "updatePhotoSources", photos: storedPhotos });
+  }
+
+  const failedRows = rows.filter((row) => row.status === "failed");
+  const scanState = useMemo(() => buildCanonicalScanState(rows), [rows]);
+  const unusableRows = rows.filter((row) => rowHasQuickScanResult(row) && !rowIsUsable(row));
+  const backgroundRefiningCount = rows.filter(
+    (row) => row.geminiCandidate && ["queued", "analyzing", "retrying"].includes(row.status),
+  ).length;
+  const retryingCount = rows.filter((row) => row.status === "retrying").length;
+  const mainProgress = scanState.totalCount
+    ? Math.min(1, scanState.scannedCount / Math.max(1, scanState.totalCount))
+    : Math.min(1, progress);
+  const hasActiveQuickScan = scanState.totalCount > 0 && !scanState.complete;
+  const hasActiveRefinement = rows.some(
+    (row) => row.status === "queued" || row.status === "analyzing" || row.status === "retrying",
+  );
+  const hasActiveAnalysis = hasActiveQuickScan || hasActiveRefinement;
+  const quickScanComplete = scanState.complete;
+  const canStartSorting =
+    quickScanComplete && phase !== "loading" && phase !== "preparing" && scanState.usableCount >= 4;
+  const largeHeadingScannedCount =
+    phase === "ready" && scanState.totalCount > 0 ? scanState.totalCount : scanState.scannedCount;
+
+  const progressLabel =
+    scanState.totalCount > 0
+      ? `${largeHeadingScannedCount} of ${scanState.totalCount} photo${scanState.totalCount === 1 ? "" : "s"} scanned`
+      : failedRows.length
+        ? `${failedRows.length} photo${failedRows.length === 1 ? "" : "s"} couldn't be scanned`
+        : phase === "preparing"
+          ? "Preparing your collection…"
+          : retryingCount > 0
+            ? "Taking a little longer on the best candidates…"
+            : "Preparing analysis…";
+  const scanHelpText = scanState.totalCount > 0 ? scanTooltipSummary(scanState) : "";
+  const taglinePhotos = useMemo(
+    () => rows.map((row) => row.photo).filter((photo): photo is Photo => !!photo),
+    [rows],
+  );
+  const friendlyLine = useAnalyzingTagline({
+    items: pendingItemsRef.current,
+    photos: taglinePhotos,
+    phase,
+    active: hasActiveAnalysis || phase === "local-scanning" || phase === "refining",
+  });
+
+  async function analyzeRows(
+    items: UploadItem[],
+    runId = runIdRef.current,
+    concurrency = analysisConcurrency,
+  ) {
+    if (!items.length) return;
+    analysisStartedAtRef.current = performance.now();
+    const pipeline = await import("@/lib/dumpdeck/pipeline");
+    setImagePipelineVersion(pipeline.imagePipelineVersion);
+
+    const localRows = await runLocalScan(items, runId, pipeline);
+    if (runIdRef.current !== runId) return;
+
+    const candidates = chooseGeminiCandidates(localRows, maxGeminiPhotos);
+    const candidateIds = new Set(candidates.map((row) => row.item.id));
+    const candidateReasons = new Map(
+      candidates.map((row) => [row.item.id, geminiCandidateReason(row)]),
+    );
+    const rowsAfterCandidateSelection = rowsRef.current.map((row) => {
+      if (!candidateIds.has(row.item.id)) {
+        return row.status === "local_complete" ? { ...row, status: "analyzed" } : row;
+      }
+      return {
+        ...row,
+        status: "queued",
+        geminiCandidate: true,
+        error: candidateReasons.get(row.item.id),
+        attempts: 0,
+        geminiRequests: 0,
+      };
+    });
+    rowsRef.current = rowsAfterCandidateSelection;
+    setRows(rowsAfterCandidateSelection);
+
+    const readyRows = rowsAfterCandidateSelection.filter(
+      (row) => row.photo?.analysis && row.status !== "failed" && row.status !== "skipped",
+    );
+    meaningfulReadyAtRef.current = performance.now();
+
+    console.debug("[dumpdeck] quick scan complete", {
+      totalUploaded: items.length,
+      uniqueLocalPhotos: localRows.filter((row) => row.status !== "skipped").length,
+      photosHandledOnlyByLocalScan: localRows.filter((row) => !candidateIds.has(row.item.id))
+        .length,
+      geminiCandidateIds: candidates.map((row) => row.item.id),
+      geminiCandidateReasons: candidates.map((row) => ({
+        id: row.item.id,
+        name: row.item.name,
+        reason: candidateReasons.get(row.item.id),
+      })),
+      maxGeminiPhotos,
+      selectedTags: state.settings.vibes,
+      localScanTimeMs: localScanDurationMsRef.current,
+      usablePhotosReady: readyRows.length,
+    });
+    console.debug("[dumpdeck] skipped Gemini calls", {
+      skipped: localRows
+        .filter((row) => !candidateIds.has(row.item.id))
+        .map((row) => ({
+          id: row.item.id,
+          name: row.item.name,
+          reason: row.localSkipReason || "local quick scan was confident enough",
+          photoType: row.photo?.photoType,
+          score: row.photo?.overall,
+        })),
+    });
+    logRefinementSnapshot("remaining refinement work after quick scan", rowsRef.current, {
+      totalUploaded: items.length,
+      localScanTimeMs: localScanDurationMsRef.current,
+      photosSelectedForGemini: candidates.length,
+      photosReadyNow: readyRows.length,
+      skippedBeforeGemini: rowsRef.current.filter((row) => row.status === "skipped").length,
+    });
+
+    if (!candidates.length) {
+      setPhase(readyRows.length >= 4 ? "ready" : "blocked");
+      return;
+    }
+
+    setPhase(readyRows.length >= 4 ? "ready" : "blocked");
+
+    void runGeminiQueue(
+      candidates.map((row) => row.item),
+      runId,
+      pipeline,
+      concurrency,
+      candidateReasons,
+    ).then((audit) => {
+      const totalRefinementTimeMs = Math.round(performance.now() - audit.startedAt);
+      const totalUploadTimeMs = Math.round(performance.now() - analysisStartedAtRef.current);
+      const meaningfulReadyTimeMs = Math.round(
+        meaningfulReadyAtRef.current - analysisStartedAtRef.current,
+      );
+      const unnecessaryWaitingAvoidedMs = Math.max(0, totalUploadTimeMs - meaningfulReadyTimeMs);
+      console.debug("[dumpdeck] Gemini refinement audit", {
+        totalUploadedPhotos: items.length,
+        totalUploadTimeMs,
+        localScanTimeMs: localScanDurationMsRef.current,
+        geminiRefinementTimeMs: totalRefinementTimeMs,
+        meaningfulReadyTimeMs,
+        unnecessaryWaitingAvoidedMs,
+        photosHandledOnlyByLocalScan: Math.max(0, localRows.length - candidates.length),
+        photosSentToGemini: candidates.length,
+        totalGeminiRequests: audit.requests,
+        retries: audit.retries,
+        failures: audit.failures,
+        photosSkipped: rowsRef.current.filter((row) => row.status === "skipped").length,
+        screenshotsSkipped: rowsRef.current.filter((row) =>
+          isScreenshotSkipReason(row.localSkipReason ?? row.error),
+        ).length,
+        cacheHits: audit.cacheHits,
+        skippedReanalysis: audit.skippedReanalysis,
+        duplicateGeminiCalls: audit.photos.filter((photo) => photo.requests > 1).length,
+        averageGeminiRequestsPerPhoto: candidates.length
+          ? Number((audit.requests / candidates.length).toFixed(2))
+          : 0,
+        reasonEachPhotoWasSent: audit.photos.map((photo) => ({
+          id: photo.id,
+          name: photo.name,
+          reason: photo.reason,
+          requests: photo.requests,
+          retries: photo.retries,
+          cache: photo.cache,
+          status: photo.status,
+          error: photo.error,
+        })),
+      });
+      console.debug("[perf] upload analysis batch summary", {
+        totalPhotosSelected: items.length,
+        totalPhotosUploadedToStorage: storageUploadRef.current.uploaded,
+        totalPhotosScannedLocally: localRows.length,
+        totalPhotosSentToGemini: candidates.length,
+        totalGeminiRequests: audit.requests,
+        retries: audit.retries,
+        cacheHits: audit.cacheHits,
+        totalTimeMs: totalUploadTimeMs,
+        stages: {
+          localScanMs: localScanDurationMsRef.current,
+          geminiRefinementMs: totalRefinementTimeMs,
+          meaningfulReadyMs: meaningfulReadyTimeMs,
+          backgroundStorageUploadMs: storageUploadRef.current.durationMs,
+        },
+        slowestStage: slowestStage({
+          localScanMs: localScanDurationMsRef.current,
+          geminiRefinementMs: totalRefinementTimeMs,
+          meaningfulReadyMs: meaningfulReadyTimeMs,
+          backgroundStorageUploadMs: storageUploadRef.current.durationMs,
+        }),
+      });
+      logRefinementSnapshot(
+        "remaining refinement work after Gemini queue settled",
+        rowsRef.current,
+      );
+      if (runIdRef.current !== runId) return;
+      if (
+        rowsRef.current.filter((row) => row.photo?.analysis && row.status !== "failed").length < 4
+      ) {
+        setPhase("blocked");
+      }
+    });
+  }
+
+  async function runLocalScan(
+    items: UploadItem[],
+    runId: number,
+    pipeline: typeof import("@/lib/dumpdeck/pipeline"),
+  ) {
+    setPhase("local-scanning");
+    localScanStartedAtRef.current = performance.now();
+    const seenFingerprints = new Set<string>();
+    const workItems: UploadItem[] = [];
+
+    for (const item of items) {
+      const exactDuplicate = item.fingerprint && seenFingerprints.has(item.fingerprint);
+      if (item.fingerprint) seenFingerprints.add(item.fingerprint);
+      if (exactDuplicate) {
+        updateRows((current) =>
+          current.map((row) =>
+            row.item.id === item.id
+              ? {
+                  ...row,
+                  status: "skipped",
+                  localSkipReason: "Exact duplicate detected during quick scan.",
+                  error: "Exact duplicate skipped before Gemini.",
+                }
+              : row,
+          ),
+        );
+        updateLocalScanProgress(items.length);
+        continue;
+      }
+      workItems.push(item);
+    }
+
+    async function scanOneLocalItem(item: UploadItem) {
+      updateRows((current) =>
+        current.map((row) =>
+          row.item.id === item.id ? { ...row, status: "local_scanning" } : row,
+        ),
+      );
+      for (let attempt = 1; attempt <= LOCAL_SCAN_MAX_ATTEMPTS; attempt++) {
+        try {
+          const { photo, clipEmbeddingVector } = await withTimeout(
+            pipeline.processLocalImage({
+              ...item,
+              settings: state.settings,
+            }),
+            LOCAL_SCAN_TIMEOUT_MS,
+            `Quick scan for ${item.name}`,
+          );
+          const localSkipReason = localRemovalReason(photo);
+          updateRows((current) =>
+            current.map((row) =>
+              row.item.id === item.id
+                ? {
+                    ...row,
+                    status: localSkipReason ? "skipped" : "local_complete",
+                    photo,
+                    clipEmbeddingVector,
+                    localSkipReason,
+                    error: localSkipReason,
+                  }
+                : row,
+            ),
+          );
+          updateLocalScanProgress(items.length);
+          if (item.convertedFromHeic) {
+            console.debug("[dumpdeck] HEIC quick scan completed", {
+              id: item.id,
+              name: item.name,
+              conversionQuality: item.conversionQuality,
+              conversionDecoder: item.conversionDecoder,
+              sharpness: photo.imageQuality?.sharpness,
+              technicalQuality: photo.imageQuality?.overallTechnicalQuality,
+              localSkipReason,
+            });
+          }
+          return;
+        } catch (err) {
+          const message = err instanceof Error ? err.message : "Local quick scan failed";
+          console.warn("[dumpdeck] local quick scan failed", {
+            id: item.id,
+            name: item.name,
+            attempt,
+            maxAttempts: LOCAL_SCAN_MAX_ATTEMPTS,
+            message,
+          });
+          if (attempt < LOCAL_SCAN_MAX_ATTEMPTS) {
+            updateRows((current) =>
+              current.map((row) =>
+                row.item.id === item.id
+                  ? {
+                      ...row,
+                      status: "local_scanning",
+                      attempts: attempt,
+                      error: `${message} Retrying quick scan…`,
+                    }
+                  : row,
+              ),
+            );
+            await sleep(350);
+            continue;
+          }
+          updateRows((current) =>
+            current.map((row) =>
+              row.item.id === item.id
+                ? {
+                    ...row,
+                    status: "failed",
+                    attempts: attempt,
+                    error: message,
+                  }
+                : row,
+            ),
+          );
+          updateLocalScanProgress(items.length);
+        }
+      }
+    }
+
+    for (const batch of chunkArray(workItems, LOCAL_SCAN_BATCH_SIZE)) {
+      if (runIdRef.current !== runId) break;
+      console.debug("[dumpdeck] quick scan batch started", {
+        batchSize: batch.length,
+        totalPhotos: items.length,
+        completedBeforeBatch: rowsRef.current.filter(rowHasQuickScanResult).length,
+      });
+      let cursor = 0;
+      async function worker() {
+        while (cursor < batch.length && runIdRef.current === runId) {
+          const item = batch[cursor++];
+          await scanOneLocalItem(item);
+        }
+      }
+      await Promise.all(
+        Array.from({ length: Math.min(LOCAL_SCAN_CONCURRENCY, Math.max(1, batch.length)) }, () =>
+          worker(),
+        ),
+      );
+      updateLocalScanProgress(items.length);
+      await yieldToBrowser();
+    }
+
+    localScanDurationMsRef.current = Math.round(performance.now() - localScanStartedAtRef.current);
+    return rowsRef.current.filter((row) => row.photo && row.status === "local_complete");
+  }
+
+  function updateLocalScanProgress(total: number, completedOverride?: number) {
+    const completed = completedOverride ?? rowsRef.current.filter(rowHasQuickScanResult).length;
+    const p = Math.min(0.5, (completed / Math.max(1, total)) * 0.5);
+    setProgress(p);
+  }
+
+  async function runGeminiQueue(
+    items: UploadItem[],
+    runId: number,
+    pipeline: typeof import("@/lib/dumpdeck/pipeline"),
+    initialConcurrency: number,
+    candidateReasons: Map<string, string>,
+  ) {
+    const pending = [...items];
+    let active = 0;
+    let currentConcurrency = Math.max(1, initialConcurrency);
+    const audit: GeminiRefinementAudit = {
+      requests: 0,
+      retries: 0,
+      failures: 0,
+      cacheHits: 0,
+      skippedReanalysis: 0,
+      startedAt: performance.now(),
+      photos: [],
+    };
+
+    return new Promise<GeminiRefinementAudit>((resolve) => {
+      const pump = () => {
+        if (runIdRef.current !== runId) {
+          resolve(audit);
+          return;
+        }
+        while (active < currentConcurrency && pending.length) {
+          const item = pending.shift()!;
+          const row = rowsRef.current.find((entry) => entry.item.id === item.id);
+          if (!row || row.status === "skipped" || row.status === "failed") {
+            audit.photos.push({
+              id: item.id,
+              name: item.name,
+              reason: "Skipped before Gemini because the photo was no longer eligible.",
+              requests: 0,
+              retries: 0,
+              cache: "skipped",
+              status: "skipped",
+              durationMs: 0,
+              error: row?.error,
+            });
+            continue;
+          }
+          active += 1;
+          void analyzeGeminiCandidate(
+            item,
+            runId,
+            pipeline,
+            candidateReasons.get(item.id) ?? "candidate-semantic-refinement",
+          )
+            .then((result) => {
+              if (!result) return;
+              audit.photos.push(result.audit);
+              audit.requests += result.audit.requests;
+              audit.retries += result.audit.retries;
+              if (result.audit.status === "failed") audit.failures += 1;
+              if (result.audit.cache === "hit") {
+                audit.cacheHits += 1;
+                audit.skippedReanalysis += 1;
+              }
+              if (result.queueSignal === "rate-limited") currentConcurrency = 1;
+            })
+            .finally(() => {
+              active -= 1;
+              const remainingActive = rowsRef.current.some(
+                (row) =>
+                  row.status === "queued" ||
+                  row.status === "analyzing" ||
+                  row.status === "retrying",
+              );
+              updateRefinedProgress();
+              if (!pending.length && active === 0 && !remainingActive) {
+                resolve(audit);
+              } else {
+                pump();
+              }
+            });
+        }
+        if (!pending.length && active === 0) {
+          resolve(audit);
+        }
+      };
+      pump();
+    });
+  }
+
+  async function analyzeGeminiCandidate(
+    item: UploadItem,
+    runId: number,
+    pipeline: typeof import("@/lib/dumpdeck/pipeline"),
+    reason: string,
+  ) {
+    let sawRateLimit = false;
+    let actualRequests = 0;
+    let retryCount = 0;
+    let cacheState: GeminiPhotoAudit["cache"] = "unknown";
+    const startedAt = performance.now();
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      if (runIdRef.current !== runId) {
+        return {
+          queueSignal: sawRateLimit ? "rate-limited" : "cancelled",
+          audit: {
+            id: item.id,
+            name: item.name,
+            reason,
+            requests: actualRequests,
+            retries: retryCount,
+            cache: cacheState,
+            status: "cancelled" as const,
+            durationMs: Math.round(performance.now() - startedAt),
+          },
+        };
+      }
+      updateRows((current) =>
+        current.map((row) =>
+          row.item.id === item.id
+            ? {
+                ...row,
+                status: "analyzing",
+                attempts: attempt,
+                error: attempt === 1 ? undefined : row.error,
+              }
+            : row,
+        ),
+      );
+
+      try {
+        const { photo, clipEmbeddingVector, cache } = await pipeline.processImage({
+          ...item,
+          settings: state.settings,
+          geminiRequestMeta: {
+            photoId: item.id,
+            photoName: item.name,
+            reason,
+            retryCount: attempt - 1,
+          },
+        });
+        cacheState = cache === "hit" || cache === "miss" || cache === "skipped" ? cache : "unknown";
+        if (cacheState !== "hit") actualRequests += 1;
+        if (runIdRef.current !== runId) {
+          return {
+            queueSignal: sawRateLimit ? "rate-limited" : "cancelled",
+            audit: {
+              id: item.id,
+              name: item.name,
+              reason,
+              requests: actualRequests,
+              retries: retryCount,
+              cache: cacheState,
+              status: "cancelled" as const,
+              durationMs: Math.round(performance.now() - startedAt),
+            },
+          };
+        }
+        updateRows((current) =>
+          current.map((row) =>
+            row.item.id === item.id
+              ? {
+                  ...row,
+                  status: "analyzed",
+                  photo,
+                  clipEmbeddingVector,
+                  error: undefined,
+                  attempts: attempt,
+                  geminiRequests: actualRequests,
+                }
+              : row,
+          ),
+        );
+        console.debug("[dumpdeck] photo analysis complete", {
+          id: item.id,
+          name: item.name,
+          reason,
+          cache,
+          attempts: attempt,
+          actualGeminiRequests: actualRequests,
+          retries: retryCount,
+          geminiAnalysisTimeMs: Math.round(performance.now() - startedAt),
+        });
+        return {
+          queueSignal: sawRateLimit ? "rate-limited" : "ok",
+          audit: {
+            id: item.id,
+            name: item.name,
+            reason,
+            requests: actualRequests,
+            retries: retryCount,
+            cache: cacheState,
+            status: "analyzed" as const,
+            durationMs: Math.round(performance.now() - startedAt),
+          },
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Analysis failed";
+        const retryable = isRetryableAnalysisError(err);
+        actualRequests += 1;
+        const status =
+          err && typeof err === "object" && "status" in err
+            ? (err as { status?: unknown }).status
+            : undefined;
+        if (status === 429 || /429|resource_exhausted|too.?many|quota/i.test(message)) {
+          sawRateLimit = true;
+        }
+        console.warn("[dumpdeck] photo analysis attempt failed", {
+          id: item.id,
+          name: item.name,
+          reason,
+          attempt,
+          retryable,
+          message,
+        });
+        if (runIdRef.current !== runId) return;
+        const localResultIsEnough =
+          sawRateLimit &&
+          meaningfulReadyAtRef.current > 0 &&
+          rowsRef.current.filter(
+            (row) => row.photo?.analysis && row.status !== "failed" && row.status !== "skipped",
+          ).length >= 4;
+        if (localResultIsEnough) {
+          updateRows((current) =>
+            current.map((row) =>
+              row.item.id === item.id
+                ? {
+                    ...row,
+                    status: "analyzed",
+                    attempts: attempt,
+                    geminiRequests: actualRequests,
+                    error: undefined,
+                  }
+                : row,
+            ),
+          );
+          console.debug("[dumpdeck] skipped low-impact Gemini retry", {
+            id: item.id,
+            name: item.name,
+            reason,
+            message,
+            localAnalysisAvailable: true,
+          });
+          return {
+            queueSignal: "rate-limited",
+            audit: {
+              id: item.id,
+              name: item.name,
+              reason: `${reason}; background refinement skipped after rate limit`,
+              requests: actualRequests,
+              retries: retryCount,
+              cache: cacheState,
+              status: "skipped" as const,
+              durationMs: Math.round(performance.now() - startedAt),
+              error: message,
+            },
+          };
+        }
+        if (retryable && attempt < 5) {
+          const waitMs = sawRateLimit
+            ? Math.max(30000, retryDelayMs(attempt, err))
+            : retryDelayMs(attempt, err);
+          updateRows((current) =>
+            current.map((row) =>
+              row.item.id === item.id
+                ? {
+                    ...row,
+                    status: "retrying",
+                    attempts: attempt,
+                    geminiRequests: actualRequests,
+                    error: `${message} Retrying in ${Math.ceil(waitMs / 1000)}s.`,
+                  }
+                : row,
+            ),
+          );
+          retryCount += 1;
+          await sleep(waitMs);
+          continue;
+        }
+        updateRows((current) =>
+          current.map((row) =>
+            row.item.id === item.id
+              ? {
+                  ...row,
+                  status: "failed",
+                  attempts: attempt,
+                  geminiRequests: actualRequests,
+                  error: message,
+                }
+              : row,
+          ),
+        );
+        return {
+          queueSignal: sawRateLimit ? "rate-limited" : "failed",
+          audit: {
+            id: item.id,
+            name: item.name,
+            reason,
+            requests: actualRequests,
+            retries: retryCount,
+            cache: cacheState,
+            status: "failed" as const,
+            durationMs: Math.round(performance.now() - startedAt),
+            error: message,
+          },
+        };
+      } finally {
+        updateRefinedProgress();
+      }
+    }
+    return {
+      queueSignal: sawRateLimit ? "rate-limited" : "failed",
+      audit: {
+        id: item.id,
+        name: item.name,
+        reason,
+        requests: actualRequests,
+        retries: retryCount,
+        cache: cacheState,
+        status: "failed" as const,
+        durationMs: Math.round(performance.now() - startedAt),
+        error: "Analysis retry limit reached",
+      },
+    };
+  }
+
+  function updateRefinedProgress() {
+    const refinedDone = rowsRef.current.filter(
+      (row) => row.geminiCandidate && (row.status === "analyzed" || row.status === "failed"),
+    ).length;
+    const totalRefined = Math.max(1, rowsRef.current.filter((row) => row.geminiCandidate).length);
+    const p = Math.min(1, 0.5 + (refinedDone / totalRefined) * 0.5);
+    setProgress(p);
+  }
+
+  function retryFailed() {
+    const failed = rowsRef.current.filter((row) => row.status === "failed").map((row) => row.item);
+    if (!failed.length) return;
+    const runId = ++runIdRef.current;
+    void analyzeRows(failed, runId, analysisConcurrency);
+  }
+
+  async function startSorting() {
+    if (!canStartSorting || phase === "preparing") return;
+    setPhase("preparing");
+    const sortingStartedAt = performance.now();
+    try {
+      const processed = rowsRef.current
+        .filter((row) => row.status !== "failed" && row.status !== "skipped" && row.photo?.analysis)
+        .map((row) => ({
+          photo: row.photo!,
+          clipEmbeddingVector: row.clipEmbeddingVector,
+        }));
+
+      if (processed.length < 4) {
+        setPhase("blocked");
+        toast.error("At least 4 analyzed photos are needed to start sorting.");
+        return;
+      }
+
+      const duplicateStartedAt = performance.now();
+      const { photos: clusteredPhotos } = assignDuplicateClusters(processed);
+      const duplicateDetectionMs = Math.round(performance.now() - duplicateStartedAt);
+      const rankingStartedAt = performance.now();
+      const { photos: rankedPhotos } = rankPhotos(clusteredPhotos, { settings: state.settings });
+      const finalRankingMs = Math.round(performance.now() - rankingStartedAt);
+      const groupingStartedAt = performance.now();
+      const { photos: out, events, collections } = organizePhotos(rankedPhotos);
+      const eventGroupingMs = Math.round(performance.now() - groupingStartedAt);
+      await Promise.all([
+        saveDuplicateClusterAssignments(out, imagePipelineVersion),
+        savePhotoRankings(out, imagePipelineVersion),
+      ]).catch((err) => {
+        console.warn("[dumpdeck] metadata cache save failed", err);
+      });
+
+      const groups = buildDuplicateGroupsForPhotos(out);
+      const hasGroups = groups.some((g) => g.photos.length > 1);
+
+      console.debug("[dumpdeck] analysis debug", {
+        selectedTags: state.settings.vibes,
+        analysisRows: rowsRef.current.map((row) => ({
+          id: row.item.id,
+          name: row.item.name,
+          status: row.status,
+          error: row.error,
+        })),
+        duplicateGroups: groups.filter((group) => group.photos.length > 1),
+        events,
+        collections,
+        scoreBreakdown: out.map((photo) => ({
+          id: photo.id,
+          name: photo.name,
+          score: photo.ranking?.overallScore,
+          breakdown: photo.ranking?.scoreBreakdown,
+          duplicateClusterId: photo.duplicateClusterId,
+        })),
+      });
+      console.debug("[perf] sorting preparation summary", {
+        totalPhotosSelected: rowsRef.current.length,
+        totalPhotosScannedLocally: processed.length,
+        duplicateDetectionMs,
+        finalRankingMs,
+        eventGroupingMs,
+        totalSortingPreparationMs: Math.round(performance.now() - sortingStartedAt),
+        slowestStage: slowestStage({
+          duplicateDetectionMs,
+          finalRankingMs,
+          eventGroupingMs,
+        }),
+      });
+      console.debug(
+        "[dumpdeck] duplicate groups",
+        groups.filter((group) => group.photos.length > 1),
+      );
+      console.debug("[dumpdeck] same-event groups", events);
+
+      dispatch({ type: "setPhotos", photos: out });
+
+      if (hasGroups) {
+        dispatch({ type: "setStage", stage: "similar" });
+      } else {
+        const sl = rankingShortlist(out, MAX_KEEP);
+        const cutEntries: RemovedPhoto[] = removedByRanking(out, sl);
+        if (cutEntries.length) dispatch({ type: "addRemoved", entries: cutEntries });
+        if (cutEntries.length) {
+          console.debug(
+            "[dumpdeck] final removal reasons assigned",
+            cutEntries.map((entry) => ({
+              id: entry.photo.id,
+              name: entry.photo.name,
+              reason: entry.reason,
+              source: entry.source,
+            })),
+          );
+          console.debug("[dumpdeck] AI cut score components", {
+            selectedTags: state.settings.vibes,
+            cutPhotos: cutEntries.map((entry) => ({
+              id: entry.photo.id,
+              name: entry.photo.name,
+              reason: entry.reason,
+              rank: entry.photo.ranking?.overallRank,
+              score: entry.photo.ranking?.overallScore,
+              signals: entry.photo.ranking?.signals,
+              breakdown: entry.photo.ranking?.scoreBreakdown,
+            })),
+          });
+        }
+        dispatch({ type: "setShortlist", photos: sl });
+        dispatch({ type: "setStage", stage: "results" });
+      }
+    } catch (err) {
+      console.error("[dumpdeck] sorting preparation failed", err);
+      setPhase("ready");
+      toast.error("Sorting could not start. Retry failed analysis or upload a fresh batch.");
+    }
+  }
+
+  useEffect(() => {
     (async () => {
+      const runId = ++runIdRef.current;
       const raw = sessionStorage.getItem("dumpdeck:pending");
       if (!raw) {
         dispatch({ type: "setStage", stage: "upload" });
         return;
       }
-      const items: UploadItem[] = JSON.parse(raw);
-      setSample(items.slice(0, 9).map((i) => ({ url: i.url, previewUrl: i.previewUrl })));
-
-      await warmupDetection();
-
-      const out: Photo[] = [];
-      for (let i = 0; i < items.length; i++) {
-        if (cancelled) return;
-        const it = items[i];
-        const src = it.previewUrl ?? it.url;
-        const [analysis, detection] = await Promise.all([
-          analyzeImage(src),
-          detectPeopleAndFaces(src),
-        ]);
-        analysis.detectedPeopleCount = detection.detectedPeopleCount;
-        analysis.detectedFaceCount = detection.detectedFaceCount;
-        analysis.detectionConfidence = detection.confidence;
-        analysis.peopleUnsure = detection.unsure;
-        analysis.peopleBoxes = detection.peopleBoxes;
-        analysis.faceBoxes = detection.faceBoxes;
-
-        const cls = classifyPhoto(it.width, it.height, analysis);
-        const s = scorePhoto({ width: it.width, height: it.height, analysis }, cls, state.settings);
-        out.push({
-          ...it,
-          analysis,
-          group: 0,
-          ...cls,
-          ...s,
-        });
-        const p = (i + 1) / items.length;
-        setProgress(p);
-        setLine(Math.min(ANALYZE_LINES.length - 1, Math.floor(p * ANALYZE_LINES.length)));
-        if (i % 4 === 3) await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      let items: UploadItem[];
+      try {
+        items = JSON.parse(raw) as UploadItem[];
+      } catch {
+        sessionStorage.removeItem("dumpdeck:pending");
+        toast.error("Upload session expired. Please choose your photos again.");
+        dispatch({ type: "setStage", stage: "upload" });
+        return;
       }
-
-      if (cancelled) return;
-
-      const groups = buildAllSimilarGroups(out);
-      const hasGroups = groups.some((g) => g.photos.length > 1);
-
-      dispatch({ type: "setPhotos", photos: out });
-
-      setTimeout(() => {
-        if (hasGroups) {
-          dispatch({ type: "setStage", stage: "similar" });
-        } else {
-          const sl = shortlist(out);
-          const cutEntries: RemovedPhoto[] = out
-            .filter((p) => !sl.some((q) => q.id === p.id))
-            .map((p) => ({
-              photo: p,
-              reason: "Cut from shortlist — low sharpness/contrast.",
-              source: "ai",
-            }));
-          if (cutEntries.length) dispatch({ type: "addRemoved", entries: cutEntries });
-          dispatch({ type: "setShortlist", photos: sl });
-          dispatch({ type: "setStage", stage: "results" });
-        }
-      }, 300);
+      if (!Array.isArray(items) || items.length === 0) {
+        sessionStorage.removeItem("dumpdeck:pending");
+        dispatch({ type: "setStage", stage: "upload" });
+        return;
+      }
+      const config = await getPipelineConfig();
+      if (runIdRef.current !== runId) return;
+      setAnalysisConcurrency(config.analysisConcurrency);
+      pendingItemsRef.current = items;
+      setSample(items.slice(0, 9).map((i) => ({ url: i.url, previewUrl: i.previewUrl })));
+      const initialRows: AnalysisRow[] = items.map((item) => ({
+        item,
+        status: "uploaded",
+        attempts: 0,
+        geminiRequests: 0,
+      }));
+      setRows(initialRows);
+      rowsRef.current = initialRows;
+      setProgress(0);
+      setMaxGeminiPhotos(config.maxGeminiPhotos);
+      const storageStartedAt = performance.now();
+      void persistProjectUploads(activeProjectId(), items)
+        .then((storedItems) => {
+          storageUploadRef.current = {
+            uploaded: storedItems.filter(
+              (item) => item.previewStoragePath || item.originalStoragePath,
+            ).length,
+            durationMs: Math.round(performance.now() - storageStartedAt),
+            failed: false,
+          };
+          mergeStoredUploads(storedItems);
+          console.debug("[perf] background project storage upload complete", {
+            projectId: activeProjectId(),
+            totalPhotosSelected: items.length,
+            totalPhotosUploadedToStorage: storageUploadRef.current.uploaded,
+            storageUploadMs: storageUploadRef.current.durationMs,
+          });
+        })
+        .catch((err) => {
+          storageUploadRef.current = {
+            uploaded: 0,
+            durationMs: Math.round(performance.now() - storageStartedAt),
+            failed: true,
+          };
+          console.warn("[dumpdeck] background project storage upload failed", err);
+        });
+      await analyzeRows(items, runId, config.analysisConcurrency);
     })();
-    return () => { cancelled = true; };
+    return () => {
+      runIdRef.current += 1;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
     <section className="text-center">
-      <Heading eyebrow="Step 2" title="AI is reading your roll" body="Brightness, sharpness, palette, people, near-duplicates." />
+      <Heading eyebrow="Step 2" title="Reading your camera roll" body={friendlyLine} />
 
       <div className="relative mx-auto mt-8 grid h-64 w-64 grid-cols-3 gap-1.5">
         {sample.map((p, i) => (
@@ -488,7 +3345,12 @@ function AnalyzeStage() {
             transition={{ delay: i * 0.05 }}
             className="overflow-hidden rounded-xl bg-muted"
           >
-            <img src={p.previewUrl ?? p.url} alt="" decoding="async" className="h-full w-full object-cover" />
+            <img
+              src={p.previewUrl ?? p.url}
+              alt=""
+              decoding="async"
+              className="h-full w-full object-cover"
+            />
           </motion.div>
         ))}
         <motion.div
@@ -499,21 +3361,146 @@ function AnalyzeStage() {
         />
       </div>
 
-      <div className="mx-auto mt-8 max-w-xs">
+      <div className="mx-auto mt-8 max-w-sm">
         <div className="h-2 overflow-hidden rounded-full bg-ink/10">
-          <motion.div className="h-full rounded-full bg-coral" animate={{ width: `${Math.round(progress * 100)}%` }} />
-        </div>
-        <AnimatePresence mode="wait">
           <motion.div
-            key={line}
-            initial={{ opacity: 0, y: 6 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -6 }}
-            className="mt-3 font-display text-xl"
+            className={`h-full rounded-full ${canStartSorting ? "bg-mint" : "bg-coral"}`}
+            animate={{ width: `${Math.round(mainProgress * 100)}%` }}
+          />
+        </div>
+        <div className="relative mx-auto mt-4 flex max-w-full items-center justify-center gap-2 px-2">
+          <AnimatePresence mode="wait">
+            <motion.div
+              key={progressLabel}
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -6 }}
+              className="text-center font-display text-2xl leading-tight text-ink sm:text-3xl"
+            >
+              {progressLabel}
+            </motion.div>
+          </AnimatePresence>
+          {rows.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setShowScanHelp((open) => !open)}
+              aria-expanded={showScanHelp}
+              aria-label="What does this scan status mean?"
+              className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-white/80 text-ink shadow-sm ring-1 ring-ink/10 transition hover:bg-white"
+            >
+              <HelpCircle className="h-4 w-4" />
+            </button>
+          )}
+          <AnimatePresence>
+            {showScanHelp && rows.length > 0 && (
+              <motion.div
+                initial={{ opacity: 0, y: 4, scale: 0.98 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                exit={{ opacity: 0, y: 4, scale: 0.98 }}
+                className="absolute left-1/2 top-full z-20 mt-3 w-[min(20rem,calc(100vw-3rem))] -translate-x-1/2 rounded-2xl bg-white p-3 text-left text-xs leading-relaxed text-ink shadow-xl ring-1 ring-ink/10"
+              >
+                <p>{scanHelpText}</p>
+                <p className="mt-2 text-muted-foreground">
+                  Usable means the photo loaded successfully and passed the basic scan. Screenshots,
+                  corrupted files, unsupported formats, or failed uploads may be skipped.
+                </p>
+                {unusableRows.length > 0 && (
+                  <div className="mt-2 border-t border-ink/10 pt-2">
+                    <div className="font-semibold">Skipped reasons</div>
+                    <ul className="mt-1 max-h-24 space-y-1 overflow-y-auto">
+                      {unusableRows.map((row) => (
+                        <li key={row.item.id}>
+                          <span className="font-semibold">{row.item.name}:</span>{" "}
+                          <span>{rowFinalReason(row)}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
+        {canStartSorting && backgroundRefiningCount > 0 && (
+          <div className="mt-4 rounded-2xl bg-mint/20 px-4 py-3 text-left text-xs leading-relaxed text-ink">
+            <div className="font-semibold">Your photos are ready to review.</div>
+            <p className="mt-1 text-muted-foreground">
+              You can start sorting now, or wait while FotoFairy finishes a deeper analysis that may
+              improve your results.
+            </p>
+          </div>
+        )}
+      </div>
+
+      {failedRows.length > 0 && (
+        <div className="mx-auto mt-5 max-w-sm rounded-3xl bg-coral/10 p-3 text-left">
+          <div className="text-sm font-semibold text-coral">
+            {failedRows.length} photo{failedRows.length === 1 ? "" : "s"} couldn't be scanned
+          </div>
+          <ul className="mt-2 max-h-28 space-y-1 overflow-y-auto text-xs text-ink/75">
+            {failedRows.map((row) => (
+              <li key={row.item.id} className="flex items-center gap-2">
+                <span className="h-8 w-8 shrink-0 overflow-hidden rounded-lg bg-muted">
+                  <img
+                    src={row.item.previewUrl ?? row.item.url}
+                    alt=""
+                    decoding="async"
+                    loading="lazy"
+                    className="h-full w-full object-cover"
+                  />
+                </span>
+                <span className="min-w-0">
+                  <span className="block truncate font-semibold">{row.item.name}</span>
+                  <span className="line-clamp-1 text-muted-foreground">{row.error}</span>
+                </span>
+              </li>
+            ))}
+          </ul>
+          <button
+            type="button"
+            onClick={retryFailed}
+            disabled={hasActiveAnalysis || phase === "preparing"}
+            className="mt-3 chip bg-white/80 text-ink disabled:opacity-60"
           >
-            {ANALYZE_LINES[line]}
-          </motion.div>
-        </AnimatePresence>
+            Try those photos again
+          </button>
+        </div>
+      )}
+
+      <div className="mx-auto mt-5 max-w-sm space-y-2">
+        <Button
+          onClick={startSorting}
+          disabled={!canStartSorting || phase === "preparing"}
+          className="h-14 w-full rounded-2xl bg-ink text-base font-semibold text-cream hover:bg-coral disabled:opacity-55"
+        >
+          {phase === "preparing"
+            ? "Preparing your collection…"
+            : canStartSorting
+              ? unusableRows.length
+                ? `Start Sorting with ${scanState.usableCount} ready photos`
+                : "Start Sorting"
+              : hasActiveQuickScan
+                ? "Start Sorting unlocks after quick scan"
+                : "Not enough analyzed photos"}
+        </Button>
+        {phase !== "preparing" && state.stage === "analyze" && (
+          <p className="px-3 text-xs leading-relaxed text-muted-foreground">
+            Do not refresh FotoFairy until after you start sorting.
+          </p>
+        )}
+        {failedRows.length > 0 && scanState.usableCount >= 4 && !hasActiveQuickScan && (
+          <p className="text-xs text-muted-foreground">
+            Failed photos will be skipped unless you retry them first.
+          </p>
+        )}
+        <button
+          type="button"
+          onClick={() => dispatch({ type: "setStage", stage: "upload" })}
+          disabled={hasActiveAnalysis || phase === "preparing"}
+          className="chip disabled:opacity-60"
+        >
+          ← Back to upload
+        </button>
       </div>
     </section>
   );
@@ -523,11 +3510,8 @@ function AnalyzeStage() {
 function SimilarStage() {
   const { state, dispatch } = useDumpDeck();
 
-  const allGroups = useMemo(() => buildAllSimilarGroups(state.photos), [state.photos]);
-  const similarGroups = useMemo(
-    () => allGroups.filter((g) => g.photos.length > 1),
-    [allGroups],
-  );
+  const allGroups = useMemo(() => buildDuplicateGroupsForPhotos(state.photos), [state.photos]);
+  const similarGroups = useMemo(() => allGroups.filter((g) => g.photos.length > 1), [allGroups]);
   const singletonIds = useMemo(() => {
     const ids = new Set<string>();
     allGroups.forEach((g) => {
@@ -547,10 +3531,20 @@ function SimilarStage() {
   const [picked, setPicked] = useState<Record<number, Set<string>>>(() => {
     const out: Record<number, Set<string>> = {};
     similarGroups.forEach((g) => {
-      out[g.id] = new Set([g.photos[0].id]);
+      out[g.id] = new Set([g.suggestedBestPhotoId || g.photos[0].id]);
     });
     return out;
   });
+  const [zoomPhoto, setZoomPhoto] = useState<Photo | null>(null);
+
+  useEffect(() => {
+    if (!zoomPhoto) return;
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") setZoomPhoto(null);
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [zoomPhoto]);
 
   function togglePick(groupId: number, photoId: string) {
     setPicked((cur) => {
@@ -571,7 +3565,10 @@ function SimilarStage() {
   function keepAiPick(groupId: number) {
     const g = similarGroups.find((x) => x.id === groupId);
     if (!g) return;
-    setPicked((cur) => ({ ...cur, [groupId]: new Set([g.photos[0].id]) }));
+    setPicked((cur) => ({
+      ...cur,
+      [groupId]: new Set([g.suggestedBestPhotoId || g.photos[0].id]),
+    }));
     toast.success("Keeping AI's pick for this group");
   }
 
@@ -584,7 +3581,9 @@ function SimilarStage() {
 
   function keepAllAi() {
     const next: Record<number, Set<string>> = {};
-    similarGroups.forEach((g) => (next[g.id] = new Set([g.photos[0].id])));
+    similarGroups.forEach(
+      (g) => (next[g.id] = new Set([g.suggestedBestPhotoId || g.photos[0].id])),
+    );
     setPicked(next);
     toast.success("Applied AI picks to every group");
   }
@@ -594,17 +3593,27 @@ function SimilarStage() {
     Object.values(picked).forEach((set) => set.forEach((id) => keepIds.add(id)));
 
     const drops: RemovedPhoto[] = [];
+    const decisions: DuplicateDecisionDraft[] = [];
     for (const g of similarGroups) {
       const selected = picked[g.id] ?? new Set<string>();
       const keptInGroup = g.photos.filter((p) => selected.has(p.id));
       const keptTop = keptInGroup[0] ?? g.photos[0];
+      decisions.push({
+        clusterId: keptTop.duplicateClusterId ?? `group-${g.id}`,
+        keptPhotoIds: keptInGroup.map((photo) => photo.id),
+        removedPhotoIds: g.photos
+          .filter((photo) => !selected.has(photo.id))
+          .map((photo) => photo.id),
+        reason: g.reason,
+      });
       for (const p of g.photos) {
         if (!selected.has(p.id)) {
           drops.push({
             photo: p,
-            reason: selected.size === 0
-              ? "User did not select from similar group."
-              : `Removed from similar group — kept "${keptTop.name}" instead.`,
+            reason:
+              selected.size === 0
+                ? "User did not select from similar group."
+                : `Removed from similar group — kept "${keptTop.name}" instead. ${g.reason}`,
             source: "user",
             similarToId: keptTop.id,
           });
@@ -612,15 +3621,60 @@ function SimilarStage() {
       }
     }
     if (drops.length) dispatch({ type: "addRemoved", entries: drops });
+    dispatch({ type: "setDuplicateDecisions", decisions });
 
     const survivors = state.photos.filter((p) => keepIds.has(p.id));
-    const sl = shortlist(survivors);
-    const cuts: RemovedPhoto[] = survivors
-      .filter((p) => !sl.some((q) => q.id === p.id))
-      .map((p) => ({ photo: p, reason: "Cut from shortlist — low sharpness/contrast.", source: "ai" }));
+    const { photos: rerankedSurvivors } = rankPhotos(survivors, { settings: state.settings });
+    const { photos: organizedSurvivors } = organizePhotos(rerankedSurvivors);
+    const allowMultipleClusterIds = new Set(
+      decisions
+        .filter((decision) => decision.keptPhotoIds.length > 1)
+        .map((decision) => decision.clusterId),
+    );
+    const baseShortlist = rankingShortlist(organizedSurvivors, MAX_KEEP, {
+      allowMultipleClusterIds,
+    });
+    const baseIds = new Set(baseShortlist.map((photo) => photo.id));
+    const explicitKeeps = organizedSurvivors
+      .filter((photo) => keepIds.has(photo.id) && !baseIds.has(photo.id))
+      .sort((a, b) => rankingScore(b) - rankingScore(a));
+    const sl = [...baseShortlist, ...explicitKeeps];
+    const cuts: RemovedPhoto[] = removedByRanking(organizedSurvivors, sl);
     if (cuts.length) dispatch({ type: "addRemoved", entries: cuts });
+    if (cuts.length) {
+      console.debug(
+        "[dumpdeck] final removal reasons assigned",
+        cuts.map((entry) => ({
+          id: entry.photo.id,
+          name: entry.photo.name,
+          reason: entry.reason,
+          source: entry.source,
+        })),
+      );
+      console.debug("[dumpdeck] AI cut score components", {
+        selectedTags: state.settings.vibes,
+        cutPhotos: cuts.map((entry) => ({
+          id: entry.photo.id,
+          name: entry.photo.name,
+          reason: entry.reason,
+          rank: entry.photo.ranking?.overallRank,
+          score: entry.photo.ranking?.overallScore,
+          signals: entry.photo.ranking?.signals,
+          breakdown: entry.photo.ranking?.scoreBreakdown,
+        })),
+      });
+    }
 
     dispatch({ type: "setShortlist", photos: sl });
+    console.debug("[dumpdeck] duplicate decisions", {
+      selectedTags: state.settings.vibes,
+      decisions,
+      kept: sl.map((photo) => photo.id),
+      removed: [...drops, ...cuts].map((entry) => ({
+        id: entry.photo.id,
+        reason: entry.reason,
+      })),
+    });
     dispatch({ type: "setStage", stage: "results" });
   }
 
@@ -632,8 +3686,8 @@ function SimilarStage() {
     <section>
       <Heading
         eyebrow="Step 3"
-        title="Look-alike shots"
-        body={`We found ${similarGroups.length} group${similarGroups.length === 1 ? "" : "s"} of similar photos. Pick up to ${MAX_PICK} from each — the rest get cut.`}
+        title="Duplicate review"
+        body={`We found ${similarGroups.length} conservative duplicate group${similarGroups.length === 1 ? "" : "s"}. Pick up to ${MAX_PICK} from each — unrelated photos stay out of this step.`}
       />
 
       <div className="mt-3 flex items-center justify-between gap-2 text-sm">
@@ -652,64 +3706,82 @@ function SimilarStage() {
             <div key={g.id} className="glass-card rounded-3xl p-3">
               <div className="mb-2 flex items-center justify-between px-1">
                 <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">
-                  Group {g.id + 1} · {g.kind === "near-dup" ? "Near-duplicates" : "Look-alikes"}
+                  Group {g.id + 1} · {g.kind === "exact" ? "Exact duplicates" : "Near-duplicates"}
                 </span>
                 <span className="text-[11px] font-semibold text-ink">
                   {sel.size} of {g.photos.length} selected
                 </span>
               </div>
               <p className="mb-2 px-1 text-[11px] text-muted-foreground">
-                These photos look similar. Pick up to {MAX_PICK} to keep.
+                {g.reason} Suggested best:{" "}
+                {g.photos.find((photo) => photo.id === g.suggestedBestPhotoId)?.name ??
+                  g.photos[0].name}
               </p>
 
               <div className="grid grid-cols-3 gap-1.5">
                 {g.photos.map((p, idx) => {
                   const isPicked = sel.has(p.id);
-                  const isAiPick = idx === 0;
+                  const isAiPick = p.id === g.suggestedBestPhotoId;
                   const photoBadges = badges[p.id] ?? [];
                   return (
-                    <button
+                    <div
                       key={p.id}
-                      type="button"
-                      onClick={() => togglePick(g.id, p.id)}
                       className={`relative overflow-hidden rounded-xl bg-muted transition ${
                         isPicked ? "ring-4 ring-coral" : "opacity-75"
                       }`}
                       style={{ aspectRatio: "1 / 1" }}
                     >
-                      <img
-                        src={p.previewUrl ?? p.url}
-                        alt=""
-                        decoding="async"
-                        loading="lazy"
-                        className="h-full w-full object-cover"
-                      />
-                      <div className="absolute left-1 top-1 rounded-full bg-white/90 px-1.5 py-0.5 text-[10px] font-bold text-ink">
-                        {Math.round(p.overall * 100)}
-                      </div>
-                      {isAiPick && (
-                        <div className="absolute right-1 top-1 rounded-md bg-coral px-1 py-0.5 text-[9px] font-bold text-white shadow">
-                          AI PICK
+                      <button
+                        type="button"
+                        onClick={() => togglePick(g.id, p.id)}
+                        className="absolute inset-0 h-full w-full text-left"
+                        aria-label={`${isPicked ? "Unselect" : "Select"} ${p.name}`}
+                      >
+                        <img
+                          src={p.previewUrl ?? p.url}
+                          alt=""
+                          decoding="async"
+                          loading="lazy"
+                          className="h-full w-full object-cover"
+                        />
+                        <div className="absolute left-1 top-1 rounded-full bg-white/90 px-1.5 py-0.5 text-[10px] font-bold text-ink">
+                          {Math.round(rankingScore(p) * 100)}
                         </div>
-                      )}
-                      {photoBadges.length > 0 && (
-                        <div className="absolute inset-x-1 bottom-1 flex flex-wrap gap-0.5">
-                          {photoBadges.slice(0, 2).map((b) => (
-                            <span
-                              key={b}
-                              className="rounded-sm bg-black/70 px-1 py-0.5 text-[8px] font-bold uppercase tracking-wide text-white"
-                            >
-                              {b}
-                            </span>
-                          ))}
-                        </div>
-                      )}
-                      {isPicked && (
-                        <div className="absolute right-1 bottom-1 grid h-6 w-6 place-items-center rounded-full bg-coral text-white shadow">
-                          <Check className="h-3.5 w-3.5" />
-                        </div>
-                      )}
-                    </button>
+                        {isAiPick && (
+                          <div className="absolute right-1 top-1 rounded-md bg-coral px-1 py-0.5 text-[9px] font-bold text-white shadow">
+                            BEST
+                          </div>
+                        )}
+                        {photoBadges.length > 0 && (
+                          <div className="absolute inset-x-8 bottom-1 flex flex-wrap gap-0.5">
+                            {photoBadges.slice(0, 2).map((b) => (
+                              <span
+                                key={b}
+                                className="rounded-sm bg-black/70 px-1 py-0.5 text-[8px] font-bold uppercase tracking-wide text-white"
+                              >
+                                {b}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                        {isPicked && (
+                          <div className="absolute right-1 bottom-1 grid h-6 w-6 place-items-center rounded-full bg-coral text-white shadow">
+                            <Check className="h-3.5 w-3.5" />
+                          </div>
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`Zoom ${p.name}`}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setZoomPhoto(p);
+                        }}
+                        className="absolute left-1 bottom-1 grid h-6 w-6 place-items-center rounded-full bg-white/90 text-ink shadow ring-1 ring-ink/10"
+                      >
+                        <Eye className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
                   );
                 })}
               </div>
@@ -720,14 +3792,10 @@ function SimilarStage() {
                   onClick={() => keepAiPick(g.id)}
                   className="chip bg-coral/15 text-coral"
                 >
-                  Keep AI's pick
+                  Keep best only
                 </button>
-                <button
-                  type="button"
-                  onClick={() => skipGroup(g.id)}
-                  className="chip"
-                >
-                  Skip group (keep all)
+                <button type="button" onClick={() => skipGroup(g.id)} className="chip">
+                  Keep multiple
                 </button>
                 <span className="chip bg-ink/5 text-ink/70">
                   {sel.size > 0 ? `${sel.size} selected` : "None selected"}
@@ -737,6 +3805,56 @@ function SimilarStage() {
           );
         })}
       </div>
+
+      <AnimatePresence>
+        {zoomPhoto && (
+          <motion.div
+            className="fixed inset-0 z-50 grid place-items-center bg-ink/75 p-4"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={() => setZoomPhoto(null)}
+          >
+            <motion.div
+              className="relative w-full max-w-3xl overflow-hidden rounded-3xl bg-white p-3 shadow-2xl"
+              initial={{ scale: 0.96, y: 10 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.96, y: 10 }}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <button
+                type="button"
+                onClick={() => setZoomPhoto(null)}
+                className="absolute right-4 top-4 z-10 grid h-10 w-10 place-items-center rounded-full bg-white/90 text-ink shadow ring-1 ring-ink/10"
+                aria-label="Close photo preview"
+              >
+                <X className="h-5 w-5" />
+              </button>
+              <div className="max-h-[75vh] overflow-hidden rounded-2xl bg-muted">
+                <img
+                  src={zoomPhoto.previewUrl ?? zoomPhoto.url}
+                  alt={zoomPhoto.name}
+                  decoding="async"
+                  className="max-h-[75vh] w-full object-contain"
+                />
+              </div>
+              <div className="mt-3 flex flex-wrap items-center justify-between gap-2 px-1 text-sm">
+                <div className="min-w-0">
+                  <div className="truncate font-semibold text-ink">{zoomPhoto.name}</div>
+                  <div className="text-xs text-muted-foreground">
+                    Score {Math.round(rankingScore(zoomPhoto) * 100)}
+                  </div>
+                </div>
+                <span className="chip bg-mint/40">
+                  {Object.values(picked).some((set) => set.has(zoomPhoto.id))
+                    ? "Selected"
+                    : "Not selected"}
+                </span>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       <StickyAction>
         <Button
@@ -751,14 +3869,49 @@ function SimilarStage() {
 }
 
 /* ───────────── Results ───────────── */
+type ReviewGroup = {
+  id: string;
+  title: string;
+  description?: string;
+  photos: Photo[];
+};
+
 function ResultsStage() {
   const { state, dispatch } = useDumpDeck();
   const [showRemoved, setShowRemoved] = useState(false);
+  const [reviewGroup, setReviewGroup] = useState<ReviewGroup | null>(null);
   const removed = state.photos.length - state.shortlist.length;
+  const removedIds = useMemo(
+    () => new Set(state.removed.map((entry) => entry.photo.id)),
+    [state.removed],
+  );
 
   function restore(id: string) {
     dispatch({ type: "restorePhoto", id });
     toast.success("Restored to your shortlist.");
+  }
+
+  function removeFromEventReview(photo: Photo, reason = "removed by user during event review.") {
+    dispatch({
+      type: "addRemoved",
+      entries: [
+        {
+          photo,
+          reason: "removed by user during event review.",
+          source: "user",
+        },
+      ],
+    });
+    dispatch({ type: "removePhoto", id: photo.id });
+    toast("Removed from this collection");
+  }
+
+  function keepFromFocusedReview(photo: Photo) {
+    if (removedIds.has(photo.id)) dispatch({ type: "restorePhoto", id: photo.id });
+  }
+
+  function setFavorite(photo: Photo, favorite: boolean) {
+    dispatch({ type: "setPhotoFavorite", id: photo.id, favorite });
   }
 
   return (
@@ -771,22 +3924,30 @@ function ResultsStage() {
 
       <div className="mt-4 grid grid-cols-3 gap-1.5 sm:gap-2">
         <ScoreBadge label="Cut" value={removed / Math.max(1, state.photos.length)} />
-        <ScoreBadge label="Top score" value={state.shortlist[0]?.overall ?? 0} />
-        <ScoreBadge label="Kept" value={state.shortlist.length / Math.max(1, state.photos.length)} />
+        <ScoreBadge
+          label="Top score"
+          value={state.shortlist[0] ? rankingScore(state.shortlist[0]) : 0}
+        />
+        <ScoreBadge
+          label="Kept"
+          value={state.shortlist.length / Math.max(1, state.photos.length)}
+        />
       </div>
 
       <div className="mt-3 flex items-center justify-between">
         <span className="text-xs text-muted-foreground">
           {state.shortlist.length} kept · {state.removed.length} removed
         </span>
-        <button
-          type="button"
-          onClick={() => setShowRemoved(true)}
-          className="chip"
-        >
+        <button type="button" onClick={() => setShowRemoved(true)} className="chip">
           <Eye className="h-3 w-3" /> View removed ({state.removed.length})
         </button>
       </div>
+
+      <OrganizationBrowser
+        photos={state.shortlist}
+        onOpenGroup={setReviewGroup}
+        onRemovePhoto={removeFromEventReview}
+      />
 
       <div className="mt-5 grid grid-cols-2 gap-3">
         {state.shortlist.map((p) => (
@@ -809,7 +3970,663 @@ function ResultsStage() {
         removed={state.removed}
         onRestore={restore}
       />
+      <FocusedGroupReview
+        group={reviewGroup}
+        favoritePhotoIds={state.favoritePhotoIds}
+        removedIds={removedIds}
+        onClose={() => setReviewGroup(null)}
+        onKeep={keepFromFocusedReview}
+        onRemove={(photo) =>
+          removeFromEventReview(photo, "Removed during focused shortlist review.")
+        }
+        onFavorite={setFavorite}
+      />
     </section>
+  );
+}
+
+type ReviewUndo =
+  | { type: "remove"; photos: Photo[] }
+  | { type: "keep"; photos: Photo[] }
+  | { type: "favorite"; photoId: string; previous: boolean }
+  | { type: "bulkRemove"; photos: Photo[] }
+  | { type: "keepFavoritesOnly"; photos: Photo[] };
+
+function FocusedGroupReview({
+  group,
+  favoritePhotoIds,
+  removedIds,
+  onClose,
+  onKeep,
+  onRemove,
+  onFavorite,
+}: {
+  group: ReviewGroup | null;
+  favoritePhotoIds: string[];
+  removedIds: Set<string>;
+  onClose: () => void;
+  onKeep: (photo: Photo) => void;
+  onRemove: (photo: Photo) => void;
+  onFavorite: (photo: Photo, favorite: boolean) => void;
+}) {
+  const [index, setIndex] = useState(0);
+  const [zoomed, setZoomed] = useState(false);
+  const [undoStack, setUndoStack] = useState<ReviewUndo[]>([]);
+  const [confirmRemoveAll, setConfirmRemoveAll] = useState(false);
+  const photos = group?.photos ?? [];
+  const current = photos[index];
+  const favoriteIds = useMemo(() => new Set(favoritePhotoIds), [favoritePhotoIds]);
+  const activeCount = photos.filter((photo) => !removedIds.has(photo.id)).length;
+
+  useEffect(() => {
+    if (!group) return;
+    setIndex(0);
+    setZoomed(false);
+    setUndoStack([]);
+    setConfirmRemoveAll(false);
+  }, [group]);
+
+  useEffect(() => {
+    if (!group) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        if (confirmRemoveAll) {
+          setConfirmRemoveAll(false);
+          return;
+        }
+        onClose();
+      }
+      if (event.key === "ArrowRight") setIndex((value) => Math.min(photos.length - 1, value + 1));
+      if (event.key === "ArrowLeft") setIndex((value) => Math.max(0, value - 1));
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [confirmRemoveAll, group, onClose, photos.length]);
+
+  useEffect(() => {
+    if (index >= photos.length) setIndex(Math.max(0, photos.length - 1));
+  }, [index, photos.length]);
+
+  if (!group || !current) return null;
+
+  const isFavorite = favoriteIds.has(current.id);
+  const isRemoved = removedIds.has(current.id);
+  const goPrev = () => setIndex((value) => Math.max(0, value - 1));
+  const goNext = () => setIndex((value) => Math.min(photos.length - 1, value + 1));
+  const remember = (undo: ReviewUndo) => setUndoStack((stack) => [...stack.slice(-9), undo]);
+
+  function keep(photo: Photo) {
+    const wasRemoved = removedIds.has(photo.id);
+    onKeep(photo);
+    if (wasRemoved) remember({ type: "keep", photos: [photo] });
+  }
+
+  function remove(photo: Photo) {
+    if (removedIds.has(photo.id)) return;
+    onRemove(photo);
+    remember({ type: "remove", photos: [photo] });
+  }
+
+  function favorite(photo: Photo, next: boolean) {
+    onFavorite(photo, next);
+    remember({ type: "favorite", photoId: photo.id, previous: favoriteIds.has(photo.id) });
+  }
+
+  function keepAll() {
+    const restored = photos.filter((photo) => removedIds.has(photo.id));
+    restored.forEach(onKeep);
+    if (restored.length) remember({ type: "keep", photos: restored });
+  }
+
+  function removeAll() {
+    setConfirmRemoveAll(true);
+  }
+
+  function confirmBulkRemove() {
+    const removed = photos.filter((photo) => !removedIds.has(photo.id));
+    removed.forEach(onRemove);
+    if (removed.length) remember({ type: "bulkRemove", photos: removed });
+    setConfirmRemoveAll(false);
+    toast.success("Removed from group", {
+      action: {
+        label: "Undo",
+        onClick: () => removed.forEach(onKeep),
+      },
+    });
+  }
+
+  function keepFavoritesOnly() {
+    const removed = photos.filter(
+      (photo) => !favoriteIds.has(photo.id) && !removedIds.has(photo.id),
+    );
+    removed.forEach(onRemove);
+    if (removed.length) remember({ type: "keepFavoritesOnly", photos: removed });
+  }
+
+  function undoLastAction() {
+    const last = undoStack.at(-1);
+    if (!last) return;
+    setUndoStack((stack) => stack.slice(0, -1));
+    if (last.type === "favorite") {
+      const photo = photos.find((candidate) => candidate.id === last.photoId);
+      if (photo) onFavorite(photo, last.previous);
+      return;
+    }
+    if (last.type === "keep") last.photos.forEach(onRemove);
+    else last.photos.forEach(onKeep);
+  }
+
+  function onDragEnd(_: MouseEvent | TouchEvent | PointerEvent, info: PanInfo) {
+    if (info.offset.x < -60) goNext();
+    if (info.offset.x > 60) goPrev();
+  }
+
+  return (
+    <AnimatePresence>
+      <motion.div
+        className="fixed inset-0 z-50 bg-ink/65 p-3 backdrop-blur-sm"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        onMouseDown={onClose}
+        role="dialog"
+        aria-modal="true"
+        aria-label={`${group.title} review`}
+      >
+        <motion.div
+          className="mx-auto flex h-full max-w-3xl flex-col rounded-3xl bg-cream p-4 shadow-2xl"
+          initial={{ y: 24, opacity: 0 }}
+          animate={{ y: 0, opacity: 1 }}
+          exit={{ y: 24, opacity: 0 }}
+          onMouseDown={(event) => event.stopPropagation()}
+        >
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <p className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">
+                Focused review
+              </p>
+              <h3 className="truncate font-display text-2xl">{group.title}</h3>
+              <p className="text-sm text-muted-foreground">
+                {index + 1} of {photos.length} · {activeCount} kept
+              </p>
+            </div>
+            <button type="button" onClick={onClose} className="chip bg-white">
+              <X className="h-4 w-4" /> Done
+            </button>
+          </div>
+
+          <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+            <button type="button" onClick={keepAll} className="chip justify-center bg-mint/60">
+              Keep all
+            </button>
+            <button type="button" onClick={removeAll} className="chip justify-center bg-coral/15">
+              Remove all
+            </button>
+            <button
+              type="button"
+              onClick={keepFavoritesOnly}
+              className="chip justify-center bg-white"
+            >
+              Keep favorites only
+            </button>
+            <button
+              type="button"
+              onClick={undoLastAction}
+              disabled={undoStack.length === 0}
+              className="chip justify-center bg-white disabled:opacity-50"
+            >
+              <Undo2 className="h-3.5 w-3.5" /> Undo
+            </button>
+          </div>
+
+          <div className="relative mt-4 flex min-h-[260px] flex-1">
+            <motion.div
+              key={current.id}
+              drag={zoomed ? false : "x"}
+              dragConstraints={{ left: 0, right: 0 }}
+              onDragEnd={onDragEnd}
+              className={`relative grid w-full place-items-center rounded-3xl bg-ink/5 p-2 sm:p-3 ${
+                zoomed ? "overflow-auto" : "overflow-hidden"
+              }`}
+            >
+              <img
+                src={current.previewUrl ?? current.url}
+                alt={current.name}
+                width={current.width || undefined}
+                height={current.height || undefined}
+                decoding="async"
+                className={`h-auto w-auto max-w-full select-none rounded-2xl object-contain transition ${
+                  zoomed
+                    ? "max-h-none cursor-zoom-out"
+                    : "max-h-[min(62dvh,calc(100dvh-22rem))] cursor-zoom-in"
+                } ${isRemoved ? "opacity-45 grayscale" : ""}`}
+                style={{
+                  aspectRatio:
+                    current.width && current.height
+                      ? `${current.width} / ${current.height}`
+                      : undefined,
+                  transform: zoomed ? "scale(1.35)" : "scale(1)",
+                  transformOrigin: "center",
+                }}
+                onClick={() => setZoomed((value) => !value)}
+              />
+              {zoomed && (
+                <button
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setZoomed(false);
+                  }}
+                  className="absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-white/95 px-3 py-1 text-xs font-bold text-ink shadow"
+                >
+                  Fit full photo
+                </button>
+              )}
+              {isRemoved && (
+                <div className="absolute left-3 top-3 rounded-full bg-white/90 px-3 py-1 text-xs font-bold text-ink">
+                  Removed
+                </div>
+              )}
+              {isFavorite && (
+                <div className="absolute right-3 top-3 rounded-full bg-white/90 px-3 py-1 text-xs font-bold text-ink">
+                  Favorite
+                </div>
+              )}
+            </motion.div>
+
+            <button
+              type="button"
+              onClick={goPrev}
+              disabled={index === 0}
+              className="absolute left-2 top-1/2 grid h-10 w-10 -translate-y-1/2 place-items-center rounded-full bg-white/90 shadow disabled:opacity-35"
+              aria-label="Previous photo"
+            >
+              <ArrowLeft className="h-4 w-4" />
+            </button>
+            <button
+              type="button"
+              onClick={goNext}
+              disabled={index === photos.length - 1}
+              className="absolute right-2 top-1/2 grid h-10 w-10 -translate-y-1/2 place-items-center rounded-full bg-white/90 shadow disabled:opacity-35"
+              aria-label="Next photo"
+            >
+              <ArrowRight className="h-4 w-4" />
+            </button>
+          </div>
+
+          <div className="mt-4 grid grid-cols-3 gap-2">
+            <button
+              type="button"
+              onClick={() => keep(current)}
+              className={`h-11 rounded-2xl text-sm font-bold ${
+                !isRemoved ? "bg-mint text-ink" : "bg-white text-ink"
+              }`}
+            >
+              Keep
+            </button>
+            <button
+              type="button"
+              onClick={() => remove(current)}
+              className={`h-11 rounded-2xl text-sm font-bold ${
+                isRemoved ? "bg-coral text-white" : "bg-white text-ink"
+              }`}
+            >
+              Remove
+            </button>
+            <button
+              type="button"
+              onClick={() => favorite(current, !isFavorite)}
+              className={`h-11 rounded-2xl text-sm font-bold ${
+                isFavorite ? "bg-yellow-200 text-ink" : "bg-white text-ink"
+              }`}
+            >
+              <Heart className="mr-1 inline h-4 w-4" />
+              Favorite
+            </button>
+          </div>
+
+          <div className="mt-3 flex gap-2 overflow-x-auto pb-1 no-scrollbar">
+            {photos.map((photo, photoIndex) => (
+              <button
+                type="button"
+                key={photo.id}
+                onClick={() => setIndex(photoIndex)}
+                className={`relative h-14 w-14 shrink-0 overflow-hidden rounded-xl border-2 bg-muted ${
+                  photoIndex === index ? "border-coral" : "border-transparent"
+                } ${removedIds.has(photo.id) ? "opacity-45" : ""}`}
+                aria-label={`Open photo ${photoIndex + 1}`}
+              >
+                <img
+                  src={photo.previewUrl ?? photo.url}
+                  alt=""
+                  decoding="async"
+                  loading="lazy"
+                  className="h-full w-full object-cover"
+                />
+                {favoriteIds.has(photo.id) && (
+                  <Heart className="absolute right-1 top-1 h-3 w-3 fill-yellow-200 text-ink" />
+                )}
+              </button>
+            ))}
+          </div>
+
+          <AnimatePresence>
+            {confirmRemoveAll && (
+              <motion.div
+                className="fixed inset-0 z-[60] grid place-items-center bg-ink/50 p-5"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                onMouseDown={() => setConfirmRemoveAll(false)}
+              >
+                <motion.div
+                  className="w-full max-w-sm rounded-3xl bg-cream p-5 shadow-2xl"
+                  initial={{ scale: 0.96, opacity: 0 }}
+                  animate={{ scale: 1, opacity: 1 }}
+                  exit={{ scale: 0.96, opacity: 0 }}
+                  onMouseDown={(event) => event.stopPropagation()}
+                  role="alertdialog"
+                  aria-modal="true"
+                  aria-labelledby="remove-group-title"
+                >
+                  <h4 id="remove-group-title" className="font-display text-2xl">
+                    Remove all photos from this group?
+                  </h4>
+                  <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
+                    This will remove {photos.length} photo{photos.length === 1 ? "" : "s"} from “
+                    {group.title}.” You can undo this before saving your final collection.
+                  </p>
+                  <div className="mt-5 grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setConfirmRemoveAll(false)}
+                      className="h-11 rounded-2xl bg-white text-sm font-bold text-ink"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      onClick={confirmBulkRemove}
+                      className="h-11 rounded-2xl bg-coral text-sm font-bold text-white"
+                    >
+                      Remove all
+                    </button>
+                  </div>
+                </motion.div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </motion.div>
+      </motion.div>
+    </AnimatePresence>
+  );
+}
+
+function OrganizationBrowser({
+  photos,
+  onOpenGroup,
+  onRemovePhoto,
+}: {
+  photos: Photo[];
+  onOpenGroup: (group: ReviewGroup) => void;
+  onRemovePhoto: (photo: Photo) => void;
+}) {
+  const organization = useMemo(() => {
+    const byCollection = new Map<
+      string,
+      {
+        id: string;
+        title: string;
+        summary: string;
+        cover?: Photo;
+        events: Map<string, { id: string; title: string; description: string; photos: Photo[] }>;
+        photos: Photo[];
+      }
+    >();
+    const standalonePhotos: Photo[] = [];
+
+    photos.forEach((photo) => {
+      const collection = photo.collectionGroup;
+      const event = photo.eventGroup;
+      if (!collection || !event) {
+        standalonePhotos.push(photo);
+        return;
+      }
+
+      const collectionId = collection.groupId;
+      if (!byCollection.has(collectionId)) {
+        byCollection.set(collectionId, {
+          id: collectionId,
+          title: collection.title || "Similar Photos",
+          summary: collection.summary || "Photos grouped from the same moment.",
+          cover: photos.find((candidate) => candidate.id === collection.coverPhoto) ?? photo,
+          events: new Map(),
+          photos: [],
+        });
+      }
+      const collectionGroup = byCollection.get(collectionId)!;
+      collectionGroup.photos.push(photo);
+
+      const eventId = event.groupId;
+      if (!collectionGroup.events.has(eventId)) {
+        collectionGroup.events.set(eventId, {
+          id: eventId,
+          title: event.title || "Same Moment",
+          description: event.description || "Photos grouped from the same moment.",
+          photos: [],
+        });
+      }
+      collectionGroup.events.get(eventId)!.photos.push(photo);
+    });
+
+    return { collections: Array.from(byCollection.values()), standalonePhotos };
+  }, [photos]);
+
+  if (photos.length === 0) return null;
+
+  return (
+    <div className="mt-5 rounded-3xl border border-ink/10 bg-white/70 p-3">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <div className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">
+            Camera Roll → Collections → Events → Photos
+          </div>
+          <div className="font-display text-lg">AI organization</div>
+        </div>
+        <span className="chip bg-mint/40">{photos.length} photos</span>
+      </div>
+
+      <div className="mt-3 space-y-3">
+        {organization.collections.map((collection) => (
+          <div key={collection.id} className="rounded-2xl bg-cream/80 p-2">
+            <button
+              type="button"
+              onClick={() =>
+                onOpenGroup({
+                  id: collection.id,
+                  title: collection.title,
+                  description: collection.summary,
+                  photos: collection.photos,
+                })
+              }
+              className="flex w-full gap-3 rounded-xl text-left transition hover:bg-white/50 focus:outline-none focus:ring-2 focus:ring-coral/40"
+            >
+              {collection.cover && (
+                <div className="h-16 w-16 shrink-0 overflow-hidden rounded-xl bg-muted">
+                  <img
+                    src={collection.cover.previewUrl ?? collection.cover.url}
+                    alt=""
+                    decoding="async"
+                    loading="lazy"
+                    className="h-full w-full object-cover"
+                  />
+                </div>
+              )}
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="truncate text-sm font-semibold">{collection.title}</div>
+                  <span className="text-[11px] text-muted-foreground">
+                    {collection.events.size} event{collection.events.size === 1 ? "" : "s"}
+                  </span>
+                </div>
+                <p className="mt-0.5 line-clamp-2 text-xs text-muted-foreground">
+                  {collection.summary}
+                </p>
+              </div>
+            </button>
+
+            <div className="mt-2 space-y-2">
+              {Array.from(collection.events.values()).map((eventGroup) => (
+                <div key={eventGroup.id} className="rounded-xl bg-white/70 p-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onOpenGroup({
+                        id: eventGroup.id,
+                        title: eventGroup.title,
+                        description: eventGroup.description,
+                        photos: eventGroup.photos,
+                      })
+                    }
+                    className="flex w-full items-center justify-between gap-2 rounded-lg text-left transition hover:bg-cream/60 focus:outline-none focus:ring-2 focus:ring-coral/40"
+                  >
+                    <div className="min-w-0">
+                      <div className="truncate text-xs font-semibold">{eventGroup.title}</div>
+                      <div className="line-clamp-1 text-[11px] text-muted-foreground">
+                        {eventGroup.description}
+                      </div>
+                    </div>
+                    <span className="chip bg-ink/5 text-ink/70">{eventGroup.photos.length}</span>
+                  </button>
+                  <div className="mt-2 flex gap-1 overflow-x-auto pb-1 no-scrollbar">
+                    {eventGroup.photos.map((photo) => (
+                      <div
+                        role="button"
+                        tabIndex={0}
+                        key={photo.id}
+                        onClick={() =>
+                          onOpenGroup({
+                            id: eventGroup.id,
+                            title: eventGroup.title,
+                            description: eventGroup.description,
+                            photos: eventGroup.photos,
+                          })
+                        }
+                        onKeyDown={(keyboardEvent) => {
+                          if (keyboardEvent.key === "Enter" || keyboardEvent.key === " ") {
+                            keyboardEvent.preventDefault();
+                            onOpenGroup({
+                              id: eventGroup.id,
+                              title: eventGroup.title,
+                              description: eventGroup.description,
+                              photos: eventGroup.photos,
+                            });
+                          }
+                        }}
+                        className="group relative h-14 w-14 shrink-0 overflow-hidden rounded-lg bg-muted"
+                      >
+                        <img
+                          src={photo.previewUrl ?? photo.url}
+                          alt=""
+                          decoding="async"
+                          loading="lazy"
+                          className="h-full w-full object-cover"
+                        />
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            onRemovePhoto(photo);
+                          }}
+                          className="absolute right-1 top-1 grid h-5 w-5 place-items-center rounded-full bg-black/65 text-white opacity-100 shadow transition sm:opacity-0 sm:group-hover:opacity-100"
+                          aria-label={`Remove ${photo.name} from event`}
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+        {organization.standalonePhotos.length > 0 && (
+          <div className="rounded-2xl bg-white/70 p-2">
+            <button
+              type="button"
+              onClick={() =>
+                onOpenGroup({
+                  id: "other_photos",
+                  title: "Other Photos",
+                  description: "Photos that did not confidently belong to a specific group.",
+                  photos: organization.standalonePhotos,
+                })
+              }
+              className="flex w-full items-center justify-between gap-2 rounded-xl text-left transition hover:bg-cream/60 focus:outline-none focus:ring-2 focus:ring-coral/40"
+            >
+              <div className="min-w-0">
+                <div className="truncate text-sm font-semibold">Other Photos</div>
+                <div className="line-clamp-1 text-xs text-muted-foreground">
+                  Photos that did not confidently belong to a specific group.
+                </div>
+              </div>
+              <span className="chip bg-ink/5 text-ink/70">
+                {organization.standalonePhotos.length}
+              </span>
+            </button>
+            <div className="mt-2 flex gap-1 overflow-x-auto pb-1 no-scrollbar">
+              {organization.standalonePhotos.map((photo) => (
+                <div
+                  role="button"
+                  tabIndex={0}
+                  key={photo.id}
+                  onClick={() =>
+                    onOpenGroup({
+                      id: "other_photos",
+                      title: "Other Photos",
+                      description: "Photos that did not confidently belong to a specific group.",
+                      photos: organization.standalonePhotos,
+                    })
+                  }
+                  onKeyDown={(keyboardEvent) => {
+                    if (keyboardEvent.key === "Enter" || keyboardEvent.key === " ") {
+                      keyboardEvent.preventDefault();
+                      onOpenGroup({
+                        id: "other_photos",
+                        title: "Other Photos",
+                        description: "Photos that did not confidently belong to a specific group.",
+                        photos: organization.standalonePhotos,
+                      });
+                    }
+                  }}
+                  className="group relative h-14 w-14 shrink-0 overflow-hidden rounded-lg bg-muted"
+                >
+                  <img
+                    src={photo.previewUrl ?? photo.url}
+                    alt=""
+                    decoding="async"
+                    loading="lazy"
+                    className="h-full w-full object-cover"
+                  />
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onRemovePhoto(photo);
+                    }}
+                    className="absolute right-1 top-1 grid h-5 w-5 place-items-center rounded-full bg-black/65 text-white opacity-100 shadow transition sm:opacity-0 sm:group-hover:opacity-100"
+                    aria-label={`Remove ${photo.name} from other photos`}
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -837,38 +4654,95 @@ function CurateStage() {
     setFocusIdx((i) => Math.max(0, i - 1));
   }, []);
 
-  const remove = useCallback((id: string) => {
-    setRemaining((cur) => {
-      const idx = cur.findIndex((p) => p.id === id);
-      if (idx === -1) return cur;
-      const photo = cur[idx];
-      dispatch({
-        type: "addRemoved",
-        entries: [{ photo, reason: "Removed by you during curate.", source: "user" }],
+  const remove = useCallback(
+    (id: string) => {
+      setRemaining((cur) => {
+        const idx = cur.findIndex((p) => p.id === id);
+        if (idx === -1) return cur;
+        const photo = cur[idx];
+        dispatch({
+          type: "addRemoved",
+          entries: [{ photo, reason: "Removed by you during curate.", source: "user" }],
+        });
+        const next = cur.filter((p) => p.id !== id);
+        setFocusIdx((fi) =>
+          Math.min(Math.max(0, next.length - 1), idx === fi ? idx : fi > idx ? fi - 1 : fi),
+        );
+        return next;
       });
-      const next = cur.filter((p) => p.id !== id);
-      setFocusIdx((fi) => Math.min(Math.max(0, next.length - 1), idx === fi ? idx : fi > idx ? fi - 1 : fi));
-      return next;
-    });
-  }, [dispatch]);
+    },
+    [dispatch],
+  );
 
-  const restore = useCallback((id: string) => {
-    const entry = state.removed.find((r) => r.photo.id === id);
-    if (!entry) return;
-    setRemaining((cur) => (cur.some((p) => p.id === id) ? cur : [...cur, entry.photo]));
-    dispatch({ type: "restorePhoto", id });
-    toast.success("Restored to your shortlist.");
-  }, [state.removed, dispatch]);
+  const restore = useCallback(
+    (id: string) => {
+      const entry = state.removed.find((r) => r.photo.id === id);
+      if (!entry) return;
+      setRemaining((cur) => (cur.some((p) => p.id === id) ? cur : [...cur, entry.photo]));
+      dispatch({ type: "restorePhoto", id });
+      toast.success("Restored to your shortlist.");
+    },
+    [state.removed, dispatch],
+  );
+
+  function onDragEnd(_: unknown, info: PanInfo) {
+    setDragX(0);
+    const threshold = 110;
+    if (info.offset.x < -threshold) {
+      if (focus) removeCurrent(focus.id);
+    } else if (info.offset.x > threshold) {
+      keepCurrent();
+    }
+  }
+
+  const completeWith = useCallback(
+    (nextPhotos: Photo[]) => {
+      dispatch({ type: "setKept", photos: nextPhotos });
+      dispatch({
+        type: "setFinalOrder",
+        photos: orderWithPinned(nextPhotos, state.pinnedCoverId),
+      });
+      dispatch({ type: "setStage", stage: "final" });
+    },
+    [dispatch, state.pinnedCoverId],
+  );
+
+  const continueToFinal = useCallback(() => {
+    dispatch({ type: "setKept", photos: remaining });
+    dispatch({ type: "setFinalOrder", photos: orderWithPinned(remaining, state.pinnedCoverId) });
+    dispatch({ type: "setStage", stage: "final" });
+  }, [dispatch, remaining, state.pinnedCoverId]);
+
+  const keepCurrent = useCallback(() => {
+    toast.success("Kept");
+    if (focusIdx >= remaining.length - 1 && remaining.length <= MAX_KEEP) {
+      completeWith(remaining);
+      return;
+    }
+    advance();
+  }, [advance, completeWith, focusIdx, remaining]);
+
+  const removeCurrent = useCallback(
+    (id: string) => {
+      const nextPhotos = remaining.filter((photo) => photo.id !== id);
+      remove(id);
+      toast.success("Removed");
+      if (focusIdx >= remaining.length - 1 && nextPhotos.length <= MAX_KEEP) {
+        window.setTimeout(() => completeWith(nextPhotos), 0);
+      }
+    },
+    [completeWith, focusIdx, remaining, remove],
+  );
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (showRemoved) return;
       if (e.key === "ArrowLeft") {
         e.preventDefault();
-        if (focus) remove(focus.id);
+        if (focus) removeCurrent(focus.id);
       } else if (e.key === "ArrowRight") {
         e.preventDefault();
-        advance();
+        keepCurrent();
       } else if (e.key === "ArrowUp") {
         e.preventDefault();
         goBack();
@@ -880,37 +4754,7 @@ function CurateStage() {
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [focus, advance, goBack, remove, restore, state.removed, showRemoved]);
-
-  function onDragEnd(_: unknown, info: PanInfo) {
-    setDragX(0);
-    const threshold = 110;
-    if (info.offset.x < -threshold) {
-      if (focus) remove(focus.id);
-    } else if (info.offset.x > threshold) {
-      advance();
-    }
-  }
-
-  function continueToFinal() {
-    const nearDupGroups = groupNearDuplicates(remaining).filter((g) => g.photos.length > 1);
-    const autoCut = nearDupGroups.flatMap((g) => g.photos.slice(1).map((photo) => ({
-      photo,
-      reason: `Removed before final because it was almost identical to "${g.photos[0].name}".`,
-      source: "ai" as const,
-      similarToId: g.photos[0].id,
-    })));
-    const finalPhotos = nearDupGroups.length
-      ? remaining.filter((p) => !autoCut.some((r) => r.photo.id === p.id))
-      : remaining;
-    if (autoCut.length) {
-      dispatch({ type: "addRemoved", entries: autoCut });
-      toast.success(`Removed ${autoCut.length} near-duplicate${autoCut.length === 1 ? "" : "s"} before final.`);
-    }
-    dispatch({ type: "setKept", photos: finalPhotos });
-    dispatch({ type: "setFinalOrder", photos: finalPhotos });
-    dispatch({ type: "setStage", stage: "final" });
-  }
+  }, [focus, goBack, keepCurrent, removeCurrent, restore, state.removed, showRemoved]);
 
   return (
     <section>
@@ -925,13 +4769,11 @@ function CurateStage() {
         {overBy > 0 ? (
           <span className="chip bg-coral/20 text-coral">Cut {overBy} more</span>
         ) : (
-          <span className="chip inline-flex items-center gap-1 bg-mint/60 text-ink"><Check className="h-3 w-3" /> Under limit</span>
+          <span className="chip inline-flex items-center gap-1 bg-mint/60 text-ink">
+            <Check className="h-3 w-3" /> Under limit
+          </span>
         )}
-        <button
-          type="button"
-          onClick={() => setShowRemoved(true)}
-          className="chip"
-        >
+        <button type="button" onClick={() => setShowRemoved(true)} className="chip">
           <Eye className="h-3 w-3" /> Removed ({state.removed.length})
         </button>
       </div>
@@ -939,15 +4781,15 @@ function CurateStage() {
       <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-ink/10">
         <div
           className={`h-full rounded-full transition-all ${overBy > 0 ? "bg-coral" : "bg-mint"}`}
-          style={{ width: `${Math.min(100, ((focusIdx + 1) / Math.max(1, remaining.length)) * 100)}%` }}
+          style={{
+            width: `${Math.min(100, ((focusIdx + 1) / Math.max(1, remaining.length)) * 100)}%`,
+          }}
         />
       </div>
 
       {focus ? (
         <div className="mt-5 relative">
-          <div
-            className="pointer-events-none absolute inset-0 z-10 flex items-center justify-between px-4"
-          >
+          <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-between px-4">
             <div
               className="rounded-2xl bg-coral px-3 py-2 text-xs font-bold text-white shadow-lg transition"
               style={{ opacity: Math.max(0, -dragX / 120) }}
@@ -978,7 +4820,13 @@ function CurateStage() {
               className="relative overflow-hidden rounded-3xl bg-muted shadow-xl touch-pan-y"
             >
               <div style={{ aspectRatio: "4 / 5" }}>
-                <img src={focus.previewUrl ?? focus.url} alt="" decoding="async" className="h-full w-full object-cover pointer-events-none" draggable={false} />
+                <img
+                  src={focus.previewUrl ?? focus.url}
+                  alt=""
+                  decoding="async"
+                  className="h-full w-full object-cover pointer-events-none"
+                  draggable={false}
+                />
               </div>
               <div className="pointer-events-none absolute inset-x-0 bottom-0 h-1/2 bg-gradient-to-t from-black/70 via-black/10 to-transparent" />
               <div className="absolute left-3 top-3 flex flex-wrap gap-1">
@@ -987,18 +4835,20 @@ function CurateStage() {
                 ))}
               </div>
               <div className="absolute right-3 top-3 rounded-full bg-white/95 px-2 py-1 text-[11px] font-bold text-ink">
-                {Math.round(focus.overall * 100)}
+                {Math.round(rankingScore(focus) * 100)}
               </div>
               <div className="absolute inset-x-3 bottom-3 text-[11px] font-semibold uppercase tracking-wider text-white/90">
-                {focus.photoType}
-                {focus.photoTypeConfidence < 0.55 && " (unsure)"} ·{" "}
-                {focus.peopleCount === 4 ? "4+" : focus.peopleCount} people · {focus.orientation}
+                {analysisOf(focus)?.scene ?? focus.photoType}
+                {(analysisOf(focus)?.confidence ?? focus.photoTypeConfidence) < 0.55 &&
+                  " (unsure)"}{" "}
+                · {analysisOf(focus)?.peopleCount ?? focus.peopleCount} people ·{" "}
+                {analysisOf(focus)?.orientation ?? focus.orientation}
               </div>
             </motion.div>
           </AnimatePresence>
 
-          {focus.reasons[0] && (
-            <p className="mt-2 px-1 text-xs text-muted-foreground">{focus.reasons[0]}</p>
+          {reasoningFor(focus) && (
+            <p className="mt-2 px-1 text-xs text-muted-foreground">{reasoningFor(focus)}</p>
           )}
 
           <div className="mt-3 grid grid-cols-4 gap-2">
@@ -1012,14 +4862,13 @@ function CurateStage() {
               <ArrowLeft className="h-4 w-4" />
             </Button>
             <Button
-              onClick={() => remove(focus.id)}
+              onClick={() => removeCurrent(focus.id)}
               className="h-12 rounded-2xl bg-coral font-semibold text-white shadow-lg hover:bg-coral/90"
             >
               <Trash2 className="mr-1 h-4 w-4" /> Remove
             </Button>
             <Button
-              onClick={advance}
-              disabled={focusIdx >= remaining.length - 1}
+              onClick={keepCurrent}
               className="col-span-2 h-12 rounded-2xl bg-ink font-semibold text-cream"
             >
               Keep <ArrowRight className="ml-2 h-4 w-4" />
@@ -1036,7 +4885,9 @@ function CurateStage() {
         </div>
       )}
 
-      {remaining.length > 0 && <MiniStrip remaining={remaining} focusIdx={focusIdx} onJump={setFocusIdx} />}
+      {remaining.length > 0 && (
+        <MiniStrip remaining={remaining} focusIdx={focusIdx} onJump={setFocusIdx} />
+      )}
 
       {canContinue ? (
         <StickyAction>
@@ -1044,7 +4895,7 @@ function CurateStage() {
             onClick={continueToFinal}
             className="h-14 w-full rounded-2xl bg-ink text-base font-semibold text-cream hover:bg-coral"
           >
-            Next: Order my dump ({remaining.length}) →
+            Next: Order my collection ({remaining.length}) →
           </Button>
         </StickyAction>
       ) : (
@@ -1104,7 +4955,10 @@ function RemovedModal({
                   {removed.length} photo{removed.length === 1 ? "" : "s"} cut
                 </div>
               </div>
-              <button onClick={onClose} className="grid h-9 w-9 place-items-center rounded-full bg-ink/10">
+              <button
+                onClick={onClose}
+                className="grid h-9 w-9 place-items-center rounded-full bg-ink/10"
+              >
                 <X className="h-4 w-4" />
               </button>
             </div>
@@ -1131,12 +4985,27 @@ function categorize(r: RemovedPhoto): "similar" | "ai" | "user" {
 }
 
 function friendlyReason(r: RemovedPhoto): string {
+  if (r.source === "user" && r.reason) return r.reason;
   const cat = categorize(r);
   if (cat === "similar") return r.reason || "Too similar to another photo.";
   if (cat === "ai") {
+    if (/^Keep:\s*/i.test(r.reason)) {
+      const positiveSignal = r.reason
+        .replace(/^Keep:\s*/i, "")
+        .replace(/\.$/, "")
+        .trim();
+      return positiveSignal
+        ? `Cut because stronger options ranked higher, even though this had ${positiveSignal.toLowerCase()}.`
+        : "Cut because stronger options ranked higher.";
+    }
+    if (r.reason) return r.reason;
+    const reasoning = analysisOf(r.photo)?.reasoning;
+    if (reasoning && !/^Keep:/i.test(reasoning)) return reasoning;
     if (/shortlist/i.test(r.reason)) return "Lower quality / sharpness score.";
-    return r.reason || "AI cut — lower overall score.";
+    return "Cut because this was lower-ranked than similar options.";
   }
+  const reasoning = analysisOf(r.photo)?.reasoning;
+  if (reasoning) return reasoning;
   return r.reason || "You removed this one.";
 }
 
@@ -1149,8 +5018,8 @@ function RemovedCategories({
 }) {
   const groups: { key: "similar" | "ai" | "user"; label: string; items: RemovedPhoto[] }[] = [
     { key: "similar", label: "Removed as duplicate / similar", items: [] },
-    { key: "ai",      label: "Removed by AI",                  items: [] },
-    { key: "user",    label: "Removed by you",                 items: [] },
+    { key: "ai", label: "Removed by AI", items: [] },
+    { key: "user", label: "Removed by you", items: [] },
   ];
   for (const r of removed) {
     const cat = categorize(r);
@@ -1158,57 +5027,67 @@ function RemovedCategories({
   }
   return (
     <div className="space-y-5">
-      {groups.filter((g) => g.items.length > 0).map((g) => (
-        <div key={g.key}>
-          <div className="mb-2 flex items-center justify-between px-1">
-            <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">
-              {g.label}
-            </span>
-            <span className="text-[11px] text-muted-foreground">{g.items.length}</span>
-          </div>
-          <ul className="space-y-2">
-            {g.items.map((r) => (
-              <li key={r.photo.id} className="glass-card flex gap-3 rounded-2xl p-2">
-                <div className="h-20 w-20 shrink-0 overflow-hidden rounded-xl bg-muted">
-                  <img
-                    src={r.photo.previewUrl ?? r.photo.url}
-                    alt=""
-                    decoding="async"
-                    loading="lazy"
-                    className="h-full w-full object-cover"
-                  />
-                </div>
-                <div className="flex min-w-0 flex-1 flex-col justify-between">
-                  <div>
-                    <div className="flex items-center gap-1.5">
-                      <span
-                        className={`chip ${
-                          g.key === "similar"
-                            ? "bg-lavender/60"
-                            : g.key === "ai"
-                              ? "bg-mint/40"
-                              : "bg-coral/15 text-coral"
-                        }`}
-                      >
-                        {g.key === "similar" ? "Similar" : g.key === "ai" ? "AI cut" : "You cut"}
-                      </span>
-                      <span className="truncate text-xs text-muted-foreground">{r.photo.name}</span>
-                    </div>
-                    <p className="mt-1 line-clamp-2 text-xs text-ink/80">{friendlyReason(r)}</p>
+      {groups
+        .filter((g) => g.items.length > 0)
+        .map((g) => (
+          <div key={g.key}>
+            <div className="mb-2 flex items-center justify-between px-1">
+              <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">
+                {g.label}
+              </span>
+              <span className="text-[11px] text-muted-foreground">{g.items.length}</span>
+            </div>
+            <ul className="space-y-2">
+              {g.items.map((r) => (
+                <li key={r.photo.id} className="glass-card flex gap-3 rounded-2xl p-2">
+                  <div className="h-20 w-20 shrink-0 overflow-hidden rounded-xl bg-muted">
+                    <img
+                      src={r.photo.previewUrl ?? r.photo.url}
+                      alt=""
+                      decoding="async"
+                      loading="lazy"
+                      className="h-full w-full object-cover"
+                    />
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => onRestore(r.photo.id)}
-                    className="self-start chip bg-mint/60 text-ink"
-                  >
-                    <Undo2 className="h-3 w-3" /> Restore
-                  </button>
-                </div>
-              </li>
-            ))}
-          </ul>
-        </div>
-      ))}
+                  <div className="flex min-w-0 flex-1 flex-col justify-between">
+                    <div>
+                      <div className="flex items-center gap-1.5">
+                        <span
+                          className={`chip ${
+                            g.key === "similar"
+                              ? "bg-lavender/60"
+                              : g.key === "ai"
+                                ? "bg-mint/40"
+                                : "bg-coral/15 text-coral"
+                          }`}
+                        >
+                          {g.key === "similar" ? "Similar" : g.key === "ai" ? "AI cut" : "You cut"}
+                        </span>
+                        <span className="truncate text-xs text-muted-foreground">
+                          {r.photo.name}
+                        </span>
+                      </div>
+                      <p className="mt-1 line-clamp-2 text-xs text-ink/80">{friendlyReason(r)}</p>
+                      {analysisOf(r.photo) && (
+                        <p className="mt-1 text-[11px] text-muted-foreground">
+                          Rank {analysisOf(r.photo)!.overallRank || "—"} · confidence{" "}
+                          {Math.round(analysisOf(r.photo)!.confidence * 100)}%
+                        </p>
+                      )}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => onRestore(r.photo.id)}
+                      className="self-start chip bg-mint/60 text-ink"
+                    >
+                      <Undo2 className="h-3 w-3" /> Restore
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))}
     </div>
   );
 }
@@ -1217,6 +5096,7 @@ function RemovedCategories({
 function FinalStage() {
   const { state, dispatch } = useDumpDeck();
   const [ordering, setOrdering] = useState(false);
+  const pinnedCover = state.finalOrder.find((photo) => photo.id === state.pinnedCoverId);
 
   function removeSlide(id: string) {
     const photo = state.finalOrder.find((p) => p.id === id);
@@ -1226,15 +5106,44 @@ function FinalStage() {
         entries: [{ photo, reason: "Removed from final collection.", source: "user" }],
       });
     }
+    if (state.pinnedCoverId === id) dispatch({ type: "setPinnedCover", id: null });
     dispatch({ type: "setFinalOrder", photos: state.finalOrder.filter((p) => p.id !== id) });
+  }
+
+  function pinCover(id: string) {
+    const ordered = orderWithPinned(state.finalOrder, id);
+    dispatch({ type: "setPinnedCover", id });
+    dispatch({ type: "setFinalOrder", photos: ordered });
+    toast.success("Cover pinned as slide 1.");
+  }
+
+  function unpinCover() {
+    dispatch({ type: "setPinnedCover", id: null });
+    toast("Cover pin removed.");
   }
 
   function runAiOrder() {
     setOrdering(true);
     setTimeout(() => {
-      dispatch({ type: "setFinalOrder", photos: aiOrder(state.finalOrder, state.settings) });
+      const ordered = aiOrder(state.finalOrder, state.settings, {
+        pinnedCoverId: state.pinnedCoverId,
+      });
+      dispatch({ type: "setFinalOrder", photos: ordered });
       setOrdering(false);
-      toast.success("AI ordered your post");
+      console.debug("[dumpdeck] final order", {
+        selectedTags: state.settings.vibes,
+        ordered: ordered.map((photo, index) => ({
+          slide: index + 1,
+          id: photo.id,
+          scene: analysisOf(photo)?.scene ?? photo.photoType,
+          event: photo.eventGroup?.title,
+          collection: photo.collectionGroup?.title,
+          people: analysisOf(photo)?.peopleCount ?? photo.peopleCount,
+          orientation: analysisOf(photo)?.orientation ?? photo.orientation,
+          score: rankingScore(photo),
+        })),
+      });
+      toast.success("AI ordered your collection");
     }, 700);
   }
 
@@ -1242,17 +5151,26 @@ function FinalStage() {
     <section>
       <Heading
         eyebrow="Step 6"
-        title="Your final dump"
+        title="Your final collection"
         body="Drag to reorder, or let AI build a balanced, dispersed flow."
       />
 
       <div className="mt-4 grid grid-cols-3 gap-2">
-        <ScoreBadge label="Slides" value={state.finalOrder.length / 20} />
+        <ScoreBadge
+          label="Slides"
+          value={state.finalOrder.length / 20}
+          title="How full this carousel is relative to FotoFairy's 20-slide working limit."
+        />
         <ScoreBadge
           label="Avg score"
-          value={state.finalOrder.reduce((a, p) => a + p.overall, 0) / Math.max(1, state.finalOrder.length)}
+          value={averagePhotoScore(state.finalOrder, rankingScore)}
+          title="Average final ranking score from quality, aesthetic, duplicate, and preference signals."
         />
-        <ScoreBadge label="Vibe" value={0.92} />
+        <ScoreBadge
+          label="Vibe match"
+          value={averagePhotoScore(state.finalOrder, vibeAlignmentScore)}
+          title="Average alignment with the selected vibe/tags. This is computed from ranking metadata, not a fixed score."
+        />
       </div>
 
       <Button
@@ -1261,13 +5179,70 @@ function FinalStage() {
         className="mt-5 h-12 w-full rounded-2xl bg-coral text-base font-semibold text-white shadow-lg hover:bg-coral/90"
       >
         <Wand2 className="mr-2 h-4 w-4" />
-        {ordering ? "Arranging the flow…" : "AI order my post"}
+        {ordering ? "Arranging the flow…" : "AI order my collection"}
       </Button>
+
+      <div className="glass-card mt-5 rounded-3xl p-4">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <p className="text-xs font-bold uppercase tracking-wider text-muted-foreground">
+              Cover photo
+            </p>
+            <p className="mt-1 text-sm text-muted-foreground">
+              {pinnedCover
+                ? "Pinned cover stays first while AI arranges the rest."
+                : "Pick one slide to lock in as the cover."}
+            </p>
+          </div>
+          {pinnedCover && (
+            <button type="button" onClick={unpinCover} className="chip bg-white/80 text-ink">
+              Unpin
+            </button>
+          )}
+        </div>
+        <div className="mt-3 flex gap-2 overflow-x-auto pb-1 no-scrollbar">
+          {state.finalOrder.map((photo, index) => {
+            const pinned = photo.id === state.pinnedCoverId;
+            return (
+              <button
+                key={photo.id}
+                type="button"
+                onClick={() => (pinned ? unpinCover() : pinCover(photo.id))}
+                className={`relative h-20 w-16 shrink-0 overflow-hidden rounded-2xl bg-muted transition ${
+                  pinned ? "ring-4 ring-coral" : "ring-1 ring-ink/10"
+                }`}
+                aria-label={pinned ? `Unpin ${photo.name} as cover` : `Pin ${photo.name} as cover`}
+              >
+                <img
+                  src={photo.previewUrl ?? photo.url}
+                  alt=""
+                  decoding="async"
+                  loading="lazy"
+                  className="h-full w-full object-cover"
+                />
+                <span className="absolute left-1 top-1 rounded-full bg-white/90 px-1.5 py-0.5 text-[10px] font-bold text-ink">
+                  {index + 1}
+                </span>
+                {pinned && (
+                  <span className="absolute inset-x-1 bottom-1 inline-flex items-center justify-center gap-1 rounded-full bg-coral px-1.5 py-0.5 text-[9px] font-bold text-white">
+                    <Pin className="h-2.5 w-2.5" /> Cover
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+      </div>
 
       <div className="mt-5">
         <SortableGrid
           photos={state.finalOrder}
-          onChange={(next) => dispatch({ type: "setFinalOrder", photos: next })}
+          onChange={(next) =>
+            dispatch({
+              type: "setFinalOrder",
+              photos: orderWithPinned(next, state.pinnedCoverId),
+            })
+          }
           onRemove={removeSlide}
         />
       </div>
@@ -1285,20 +5260,251 @@ function FinalStage() {
 }
 
 /* ───────────── Export ───────────── */
+function inferAiGeneratedCollectionTitle(photos: Photo[]) {
+  const titles = new Map<string, number>();
+  for (const photo of photos) {
+    const title = photo.collectionGroup?.title?.trim();
+    if (!title || /camera roll|photo moment|miscellaneous/i.test(title)) continue;
+    titles.set(title, (titles.get(title) ?? 0) + 1);
+  }
+  const [best] = Array.from(titles.entries()).sort((a, b) => b[1] - a[1])[0] ?? [];
+  return best ?? "FotoFairy Collection";
+}
+
+function normalizeCollectionTitleForSave(
+  aiGeneratedTitle: string,
+  userCaption: string,
+): CollectionTitleMetadata {
+  const aiTitle = aiGeneratedTitle.trim().slice(0, 100) || "FotoFairy Collection";
+  const caption = userCaption.trim().slice(0, 100);
+  return {
+    aiGeneratedTitle: aiTitle,
+    userCaption: caption || undefined,
+    displayTitle: caption || aiTitle,
+  };
+}
+
+type InstagramExportAspect = "portrait" | "square" | "landscape" | "cover";
+type InstagramPhotoMode = "fit" | "fill";
+type InstagramPreparedFile = {
+  photoId: string;
+  file: File;
+  url: string;
+};
+
+const INSTAGRAM_CAROUSEL_LIMIT = 20;
+const INSTAGRAM_EXPORT_CONCURRENCY = 3;
+const INSTAGRAM_EXPORT_QUALITY = 0.92;
+const INSTAGRAM_EXPORT_WIDTH = 1600;
+
+const INSTAGRAM_ASPECTS: Record<
+  Exclude<InstagramExportAspect, "cover">,
+  { label: string; width: number; height: number; hint: string }
+> = {
+  portrait: { label: "Portrait", width: 4, height: 5, hint: "Classic carousel" },
+  square: { label: "Square", width: 1, height: 1, hint: "Grid-friendly" },
+  landscape: { label: "Landscape", width: 1.91, height: 1, hint: "Wide moments" },
+};
+
+function sanitizeFilePart(input: string) {
+  return (
+    input
+      .trim()
+      .replace(/['"]/g, "")
+      .replace(/[^a-z0-9]+/gi, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 28) || "FotoFairy"
+  );
+}
+
+function instagramCaptionText(caption: string, hashtags: string) {
+  return [caption.trim(), hashtags.trim()].filter(Boolean).join("\n\n").trim();
+}
+
+function sourceForPhoto(photo: Photo) {
+  return (
+    photo.previewUrl ??
+    photo.previewFileUrl ??
+    photo.url ??
+    photo.originalFileUrl ??
+    photo.sourceMetadata?.previewFileUrl ??
+    photo.sourceMetadata?.originalFileUrl ??
+    ""
+  );
+}
+
+function hasDurableExportSource(photo: Photo) {
+  const source = sourceForPhoto(photo);
+  return Boolean(source && !source.startsWith("blob:"));
+}
+
+function aspectForExport(aspect: InstagramExportAspect, coverPhoto: Photo | undefined) {
+  if (aspect !== "cover") return INSTAGRAM_ASPECTS[aspect];
+  const width = coverPhoto?.width && coverPhoto.width > 0 ? coverPhoto.width : 4;
+  const height = coverPhoto?.height && coverPhoto.height > 0 ? coverPhoto.height : 5;
+  return {
+    label: "Match cover photo",
+    width,
+    height,
+    hint: "Uses slide 1",
+  };
+}
+
+function canvasSizeForAspect(aspect: { width: number; height: number }) {
+  const ratio = aspect.width / Math.max(1, aspect.height);
+  const width = INSTAGRAM_EXPORT_WIDTH;
+  const height = Math.max(1, Math.round(width / ratio));
+  return { width, height };
+}
+
+function imageFromUrl(src: string) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    image.crossOrigin = "anonymous";
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("Image could not be decoded for export."));
+    image.src = src;
+  });
+}
+
+async function exportPhotoForInstagram({
+  photo,
+  index,
+  aspect,
+  mode,
+  title,
+}: {
+  photo: Photo;
+  index: number;
+  aspect: { width: number; height: number };
+  mode: InstagramPhotoMode;
+  title: string;
+}) {
+  const source = sourceForPhoto(photo);
+  if (!source) throw new Error("Photo is missing a usable image source.");
+  if (source.startsWith("blob:")) {
+    throw new Error("Photo still uses a temporary browser URL. Save/reopen before exporting.");
+  }
+
+  const image = await imageFromUrl(source);
+  const canvas = document.createElement("canvas");
+  const size = canvasSizeForAspect(aspect);
+  canvas.width = size.width;
+  canvas.height = size.height;
+  const ctx = canvas.getContext("2d", { alpha: false });
+  if (!ctx) throw new Error("Browser could not create an export canvas.");
+  ctx.fillStyle = "#f8f3ea";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const imageRatio = image.naturalWidth / Math.max(1, image.naturalHeight);
+  const canvasRatio = canvas.width / Math.max(1, canvas.height);
+  const scale =
+    mode === "fill"
+      ? Math.max(canvas.width / image.naturalWidth, canvas.height / image.naturalHeight)
+      : Math.min(
+          1,
+          Math.min(canvas.width / image.naturalWidth, canvas.height / image.naturalHeight),
+        );
+  let drawWidth = image.naturalWidth * scale;
+  let drawHeight = image.naturalHeight * scale;
+
+  if (mode === "fit") {
+    const fitScale =
+      imageRatio > canvasRatio
+        ? canvas.width / image.naturalWidth
+        : canvas.height / image.naturalHeight;
+    drawWidth = image.naturalWidth * Math.min(1, fitScale);
+    drawHeight = image.naturalHeight * Math.min(1, fitScale);
+  }
+
+  const x = (canvas.width - drawWidth) / 2;
+  const y = (canvas.height - drawHeight) / 2;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(image, x, y, drawWidth, drawHeight);
+
+  const blob = await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(
+      (result) => (result ? resolve(result) : reject(new Error("Could not render JPEG export."))),
+      "image/jpeg",
+      INSTAGRAM_EXPORT_QUALITY,
+    );
+  });
+  canvas.width = 1;
+  canvas.height = 1;
+
+  const fileName = `${sanitizeFilePart(title)}-${String(index + 1).padStart(2, "0")}.jpg`;
+  return new File([blob], fileName, { type: "image/jpeg", lastModified: Date.now() });
+}
+
+async function copyTextToClipboard(text: string) {
+  await navigator.clipboard.writeText(text);
+}
+
+function productEvent(name: string, data: Record<string, unknown>) {
+  console.debug(`[analytics] ${name}`, {
+    ...data,
+    deviceCategory: /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent) ? "mobile" : "desktop",
+  });
+}
+
+function canNativeShareFiles(files: File[]) {
+  const shareNavigator = navigator as Navigator & {
+    canShare?: (data: ShareData) => boolean;
+  };
+  if (!navigator.share) return false;
+  if (!shareNavigator.canShare) return true;
+  try {
+    return shareNavigator.canShare({ files });
+  } catch {
+    return false;
+  }
+}
+
 function ExportStage() {
   const { state, dispatch } = useDumpDeck();
+  const { user } = useAuth();
   const [downloading, setDownloading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [savedDraftId, setSavedDraftId] = useState(() => activeDraftId());
+  const [instagramOpen, setInstagramOpen] = useState(false);
+  const instagramEnabled = instagramExportEnabled();
+  const aiGeneratedTitle = useMemo(
+    () =>
+      state.collectionTitleMetadata?.aiGeneratedTitle ??
+      inferAiGeneratedCollectionTitle(state.finalOrder),
+    [state.collectionTitleMetadata?.aiGeneratedTitle, state.finalOrder],
+  );
+  const [collectionCaption, setCollectionCaption] = useState(
+    () =>
+      state.collectionTitleMetadata?.userCaption ??
+      state.collectionTitleMetadata?.displayTitle ??
+      aiGeneratedTitle,
+  );
+  const collectionTitleMetadata = useMemo(
+    () => ({
+      ...state.collectionTitleMetadata,
+      ...normalizeCollectionTitleForSave(aiGeneratedTitle, collectionCaption),
+    }),
+    [aiGeneratedTitle, collectionCaption, state.collectionTitleMetadata],
+  );
+
+  useEffect(() => {
+    if (state.collectionTitleMetadata) return;
+    dispatch({ type: "setCollectionTitleMetadata", metadata: collectionTitleMetadata });
+  }, [collectionTitleMetadata, dispatch, state.collectionTitleMetadata]);
 
   function removeSlide(id: string) {
     const photo = state.finalOrder.find((p) => p.id === id);
     if (photo) {
       dispatch({
         type: "addRemoved",
-        entries: [{ photo, reason: "Removed from final post.", source: "user" }],
+        entries: [{ photo, reason: "Removed from final collection.", source: "user" }],
       });
     }
+    if (state.pinnedCoverId === id) dispatch({ type: "setPinnedCover", id: null });
     dispatch({ type: "setFinalOrder", photos: state.finalOrder.filter((p) => p.id !== id) });
-    toast("Removed from post");
+    toast("Removed from collection");
   }
 
   async function download() {
@@ -1315,7 +5521,7 @@ function ExportStage() {
       const url = URL.createObjectURL(out);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `dumpdeck-${Date.now()}.zip`;
+      a.download = `fotofairy-${Date.now()}.zip`;
       a.click();
       URL.revokeObjectURL(url);
       toast.success("Downloaded! Time to post.");
@@ -1326,17 +5532,52 @@ function ExportStage() {
     }
   }
 
-  function save() {
+  async function save() {
+    setSaving(true);
     try {
-      const data = state.finalOrder.map((p, i) => ({ slide: i + 1, name: p.name, tags: p.tags }));
-      localStorage.setItem("dumpdeck:saved", JSON.stringify({ at: Date.now(), data }));
-      toast.success("Collection saved to this browser.");
-    } catch {
-      toast.error("Couldn't save.");
+      const result = await saveFinalDraft({
+        draftId: activeDraftId(),
+        projectId: activeProjectId(),
+        allPhotos: state.photos,
+        finalOrder: state.finalOrder,
+        removed: state.removed,
+        settings: state.settings,
+        duplicateDecisions: state.duplicateDecisions,
+        pinnedCoverPhotoId: state.pinnedCoverId,
+        favoritePhotoIds: state.favoritePhotoIds,
+        collectionTitleMetadata,
+      });
+      console.debug("[dumpdeck] draft save response", {
+        userId: user?.id,
+        draftId: activeDraftId(),
+        projectId: activeProjectId(),
+        result,
+        orderedPhotoIds: state.finalOrder.map((photo) => photo.id),
+        rejectedPhotoIds: state.removed.map((entry) => entry.photo.id),
+        duplicateDecisions: state.duplicateDecisions,
+        pinnedCoverPhotoId: state.pinnedCoverId,
+      });
+      sessionStorage.setItem("dumpdeck:activeDraftId", result.id);
+      setSavedDraftId(result.id);
+      toast.success(
+        result.storage === "supabase" ? "Collection saved" : "Saved locally only for this browser.",
+      );
+    } catch (err) {
+      console.error("[dumpdeck] draft save failed", err);
+      toast.error("We couldn’t save your collection right now. Please try again.");
+    } finally {
+      setSaving(false);
     }
   }
 
   const aspect = FORMAT_ASPECT[state.settings.formats[0] ?? "portrait"];
+  const missingDurableSources = state.finalOrder.filter((photo) => !hasDurableExportSource(photo));
+  const canOpenInstagramExport =
+    instagramEnabled &&
+    state.finalOrder.length > 0 &&
+    state.finalOrder.length <= INSTAGRAM_CAROUSEL_LIMIT &&
+    missingDurableSources.length === 0 &&
+    Boolean(savedDraftId);
 
   return (
     <section>
@@ -1349,8 +5590,17 @@ function ExportStage() {
       <div className="mt-5 flex gap-3 overflow-x-auto pb-2 no-scrollbar -mx-4 px-4">
         {state.finalOrder.map((p, i) => (
           <div key={p.id} className="relative w-[78%] shrink-0">
-            <div className="relative overflow-hidden rounded-3xl bg-muted shadow-xl" style={{ aspectRatio: aspect }}>
-              <img src={p.previewUrl ?? p.url} alt="" decoding="async" loading="lazy" className="h-full w-full object-cover" />
+            <div
+              className="relative overflow-hidden rounded-3xl bg-muted shadow-xl"
+              style={{ aspectRatio: aspect }}
+            >
+              <img
+                src={p.previewUrl ?? p.url}
+                alt=""
+                decoding="async"
+                loading="lazy"
+                className="h-full w-full object-cover"
+              />
               <button
                 type="button"
                 onClick={() => removeSlide(p.id)}
@@ -1388,23 +5638,84 @@ function ExportStage() {
 
       <CaptionIdeas />
 
-      <div className="mt-6 space-y-2">
+      <div className="mt-6 rounded-3xl bg-white/70 p-4 shadow-sm">
+        <label htmlFor="collection-caption" className="text-sm font-bold text-ink">
+          Collection caption
+        </label>
+        <p className="mt-1 text-xs text-muted-foreground">
+          This will appear as the saved collection title.
+        </p>
+        <input
+          id="collection-caption"
+          value={collectionCaption}
+          maxLength={100}
+          onChange={(event) => {
+            const next = event.target.value.slice(0, 100);
+            setCollectionCaption(next);
+            dispatch({
+              type: "setCollectionTitleMetadata",
+              metadata: {
+                ...state.collectionTitleMetadata,
+                ...normalizeCollectionTitleForSave(aiGeneratedTitle, next),
+              },
+            });
+          }}
+          placeholder={aiGeneratedTitle}
+          className="mt-3 h-12 w-full rounded-2xl border border-ink/10 bg-cream px-4 text-sm font-semibold text-ink outline-none transition focus:border-coral"
+        />
+        <p className="mt-2 text-[11px] text-muted-foreground">AI label: {aiGeneratedTitle}</p>
+      </div>
 
+      <div className="mt-6 space-y-2">
         <Button
-          onClick={download}
-          disabled={downloading || state.finalOrder.length === 0}
-          className="h-14 w-full rounded-2xl bg-coral text-base font-semibold text-white shadow-lg hover:bg-coral/90"
+          onClick={save}
+          disabled={saving || state.finalOrder.length === 0}
+          className="h-14 w-full rounded-2xl bg-ink text-base font-semibold text-cream shadow-lg hover:bg-coral"
         >
-          <Download className="mr-2 h-4 w-4" />
-          {downloading ? "Zipping…" : "Download ordered photos"}
+          <Save className="mr-2 h-4 w-4" /> {saving ? "Saving…" : "Save collection"}
         </Button>
+        {instagramEnabled && savedDraftId && (
+          <Button
+            onClick={() => {
+              if (state.finalOrder.length > INSTAGRAM_CAROUSEL_LIMIT) {
+                toast.error(
+                  `Instagram export supports up to ${INSTAGRAM_CAROUSEL_LIMIT} photos. Remove a few before sharing.`,
+                );
+                return;
+              }
+              if (missingDurableSources.length > 0) {
+                toast.error("Save and reopen this collection so every photo has a durable source.");
+                return;
+              }
+              setInstagramOpen(true);
+            }}
+            disabled={!canOpenInstagramExport}
+            className="h-14 w-full rounded-2xl bg-coral text-base font-semibold text-white shadow-lg hover:bg-coral/90"
+          >
+            <Instagram className="mr-2 h-4 w-4" />
+            Share to Instagram
+          </Button>
+        )}
+        {instagramEnabled && !savedDraftId && (
+          <p className="rounded-2xl bg-mint/20 px-3 py-2 text-center text-xs text-muted-foreground">
+            Save this collection first, then FotoFairy can prepare it for Instagram.
+          </p>
+        )}
+        {instagramEnabled && state.finalOrder.length > INSTAGRAM_CAROUSEL_LIMIT && (
+          <p className="rounded-2xl bg-coral/10 px-3 py-2 text-center text-xs text-coral">
+            Instagram export supports up to {INSTAGRAM_CAROUSEL_LIMIT} photos. FotoFairy will not
+            silently omit extras.
+          </p>
+        )}
         <div className="grid grid-cols-2 gap-2">
           <Button
             variant="outline"
-            onClick={save}
+            onClick={download}
+            disabled={downloading || state.finalOrder.length === 0}
             className="h-12 rounded-2xl border-ink/15 bg-white/70 font-semibold"
           >
-            <Save className="mr-2 h-4 w-4" /> Save collection
+            <Download className="mr-2 h-4 w-4" />
+            {downloading ? "Zipping…" : "Download images"}
           </Button>
           <Button
             variant="outline"
@@ -1414,12 +5725,673 @@ function ExportStage() {
             ← Edit order
           </Button>
         </div>
+        <div className="grid grid-cols-2 gap-2">
+          <Button
+            variant="outline"
+            onClick={() => {
+              void copyTextToClipboard(collectionTitleMetadata.displayTitle ?? collectionCaption)
+                .then(() => toast.success("Caption copied"))
+                .catch(() => toast.error("Couldn’t copy caption"));
+            }}
+            className="h-12 rounded-2xl border-ink/15 bg-white/70 font-semibold"
+          >
+            <Copy className="mr-2 h-4 w-4" />
+            Copy Caption
+          </Button>
+          <Link
+            to="/projects"
+            className="inline-flex h-12 items-center justify-center rounded-2xl border border-ink/15 bg-white/70 text-sm font-semibold text-ink"
+          >
+            Saved Collections
+          </Link>
+        </div>
       </div>
 
       <p className="mt-6 text-center text-xs text-muted-foreground">
-        Heuristic on-device analysis — drop in a vision model for production-grade scoring.
+        Collections save privately when you are signed in.
       </p>
+      {instagramEnabled && (
+        <InstagramExportModal
+          open={instagramOpen}
+          onClose={() => setInstagramOpen(false)}
+          photos={state.finalOrder}
+          titleMetadata={collectionTitleMetadata}
+          pinnedCoverId={state.pinnedCoverId}
+          onMetadataChange={(metadata) =>
+            dispatch({
+              type: "setCollectionTitleMetadata",
+              metadata: {
+                ...state.collectionTitleMetadata,
+                ...metadata,
+              },
+            })
+          }
+        />
+      )}
+      <DebugPanel />
     </section>
+  );
+}
+
+function InstagramExportModal({
+  open,
+  onClose,
+  photos,
+  titleMetadata,
+  pinnedCoverId,
+  onMetadataChange,
+}: {
+  open: boolean;
+  onClose: () => void;
+  photos: Photo[];
+  titleMetadata: CollectionTitleMetadata;
+  pinnedCoverId: string | null;
+  onMetadataChange: (metadata: CollectionTitleMetadata) => void;
+}) {
+  const coverPhoto = photos.find((photo) => photo.id === pinnedCoverId) ?? photos[0];
+  const [aspectRatio, setAspectRatio] = useState<InstagramExportAspect>(
+    titleMetadata.instagramExportAspectRatio ?? "portrait",
+  );
+  const [photoModes, setPhotoModes] = useState<Record<string, InstagramPhotoMode>>(
+    titleMetadata.instagramPhotoModes ?? {},
+  );
+  const [caption, setCaption] = useState(
+    titleMetadata.instagramExportCaption ??
+      titleMetadata.displayTitle ??
+      titleMetadata.userCaption ??
+      "FotoFairy collection",
+  );
+  const [hashtags, setHashtags] = useState(titleMetadata.instagramExportHashtags ?? "");
+  const [exporting, setExporting] = useState(false);
+  const [prepared, setPrepared] = useState<InstagramPreparedFile[]>([]);
+  const [progress, setProgress] = useState({ done: 0, total: photos.length, status: "Ready" });
+  const [failed, setFailed] = useState<{ index: number; photo: Photo; message: string } | null>(
+    null,
+  );
+  const [copied, setCopied] = useState(false);
+  const cancelRef = useRef(false);
+
+  useEffect(() => {
+    if (!open) return;
+    productEvent("instagram_export_opened", {
+      photoCount: photos.length,
+      exportFormat: aspectRatio,
+    });
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape" && !exporting) onClose();
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [aspectRatio, exporting, onClose, open, photos.length]);
+
+  function persistInstagramMetadata(partial: CollectionTitleMetadata) {
+    onMetadataChange({
+      ...titleMetadata,
+      instagramExportCaption: caption,
+      instagramExportHashtags: hashtags,
+      instagramExportAspectRatio: aspectRatio,
+      instagramPhotoModes: photoModes,
+      instagramExportOrder: photos.map((photo) => photo.id),
+      ...partial,
+    });
+  }
+
+  function clearPreparedFiles() {
+    prepared.forEach((file) => URL.revokeObjectURL(file.url));
+    setPrepared([]);
+  }
+
+  async function prepareExport() {
+    clearPreparedFiles();
+    setFailed(null);
+    setExporting(true);
+    cancelRef.current = false;
+    setProgress({
+      done: 0,
+      total: photos.length,
+      status: `Preparing 0 of ${photos.length} photos`,
+    });
+    productEvent("instagram_export_started", {
+      photoCount: photos.length,
+      exportFormat: aspectRatio,
+    });
+
+    const aspect = aspectForExport(aspectRatio, coverPhoto);
+    const results: InstagramPreparedFile[] = [];
+    let cursor = 0;
+    let completed = 0;
+
+    async function worker() {
+      while (cursor < photos.length && !cancelRef.current) {
+        const index = cursor++;
+        const photo = photos[index];
+        try {
+          const file = await exportPhotoForInstagram({
+            photo,
+            index,
+            aspect,
+            mode: photoModes[photo.id] ?? "fit",
+            title: titleMetadata.displayTitle ?? titleMetadata.userCaption ?? "FotoFairy",
+          });
+          results[index] = {
+            photoId: photo.id,
+            file,
+            url: URL.createObjectURL(file),
+          };
+          completed += 1;
+          setProgress({
+            done: completed,
+            total: photos.length,
+            status:
+              completed === photos.length
+                ? `${photos.length} of ${photos.length} photos ready`
+                : `Preparing ${completed} of ${photos.length} photos`,
+          });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : "Photo could not be prepared.";
+          console.warn("[instagram-export] photo export failed", {
+            photoId: photo.id,
+            sourceType: sourceForPhoto(photo).startsWith("blob:") ? "blob" : "durable-url",
+            sourcePath:
+              photo.previewStoragePath ??
+              photo.originalStoragePath ??
+              photo.sourceMetadata?.previewStoragePath ??
+              photo.sourceMetadata?.originalStoragePath ??
+              "url",
+            exportStage: "canvas-render",
+            failureReason: message,
+          });
+          productEvent("instagram_export_failed", {
+            photoCount: photos.length,
+            exportFormat: aspectRatio,
+            failureCategory: "photo_prepare_failed",
+          });
+          setFailed({ index, photo, message });
+          cancelRef.current = true;
+          break;
+        }
+      }
+    }
+
+    await Promise.all(
+      Array.from({ length: Math.min(INSTAGRAM_EXPORT_CONCURRENCY, photos.length) }, () => worker()),
+    );
+    setExporting(false);
+    if (cancelRef.current) return [];
+    const preparedResults = results.filter(Boolean);
+    setPrepared(preparedResults);
+    onMetadataChange({
+      ...titleMetadata,
+      instagramExportCaption: caption,
+      instagramExportHashtags: hashtags,
+      instagramExportAspectRatio: aspectRatio,
+      instagramPhotoModes: photoModes,
+      instagramExportOrder: photos.map((photo) => photo.id),
+      lastInstagramExportedAt: new Date().toISOString(),
+    });
+    productEvent("instagram_export_completed", {
+      photoCount: photos.length,
+      exportFormat: aspectRatio,
+    });
+    return preparedResults;
+  }
+
+  function cancelExport() {
+    cancelRef.current = true;
+    setExporting(false);
+    clearPreparedFiles();
+    productEvent("instagram_export_cancelled", {
+      photoCount: photos.length,
+      exportFormat: aspectRatio,
+    });
+  }
+
+  async function copyCaption() {
+    try {
+      await copyTextToClipboard(instagramCaptionText(caption, hashtags));
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1600);
+      toast.success("Caption copied");
+      productEvent("instagram_caption_copied", {
+        photoCount: photos.length,
+        exportFormat: aspectRatio,
+      });
+    } catch {
+      toast.error("Couldn’t copy caption");
+    }
+  }
+
+  async function downloadZip() {
+    const files = prepared.length ? prepared : await prepareExport();
+    if (!files.length || failed) return;
+    const zip = new JSZip();
+    files.forEach((entry) => zip.file(entry.file.name, entry.file));
+    zip.file("caption.txt", instagramCaptionText(caption, hashtags));
+    const blob = await zip.generateAsync({ type: "blob" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `${sanitizeFilePart(titleMetadata.displayTitle ?? "FotoFairy")}-instagram.zip`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    await copyCaption();
+    productEvent("instagram_download_fallback_used", {
+      photoCount: photos.length,
+      exportFormat: aspectRatio,
+    });
+  }
+
+  async function shareOrDownload() {
+    const files = prepared.length ? prepared : await prepareExport();
+    if (!files.length || failed) return;
+    const nativeFiles = files.map((entry) => entry.file);
+    const text = instagramCaptionText(caption, hashtags);
+    if (canNativeShareFiles(nativeFiles)) {
+      try {
+        await navigator.share({
+          title: "FotoFairy collection",
+          text,
+          files: nativeFiles,
+        });
+        productEvent("instagram_share_sheet_opened", {
+          photoCount: photos.length,
+          exportFormat: aspectRatio,
+        });
+        toast("Choose Instagram from the share menu.");
+        return;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (!/abort|cancel/i.test(message)) console.warn("[instagram-export] share failed", err);
+      }
+    }
+    await downloadZip();
+  }
+
+  const aspect = aspectForExport(aspectRatio, coverPhoto);
+  const size = canvasSizeForAspect(aspect);
+  const captionText = instagramCaptionText(caption, hashtags);
+
+  return (
+    <AnimatePresence>
+      {open && (
+        <motion.div
+          className="fixed inset-0 z-50 flex items-end justify-center bg-ink/45 px-3 pt-10 backdrop-blur-sm sm:items-center"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          onMouseDown={() => !exporting && onClose()}
+        >
+          <motion.div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="instagram-export-title"
+            className="flex max-h-[92dvh] w-full max-w-md flex-col overflow-hidden rounded-t-3xl bg-cream shadow-2xl sm:rounded-3xl"
+            initial={{ y: 40, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            exit={{ y: 40, opacity: 0 }}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-ink/10 px-4 py-3">
+              <div>
+                <div className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">
+                  Export
+                </div>
+                <h2 id="instagram-export-title" className="font-display text-2xl">
+                  Ready for Instagram
+                </h2>
+              </div>
+              <button
+                type="button"
+                onClick={onClose}
+                disabled={exporting}
+                className="grid h-9 w-9 place-items-center rounded-full bg-white text-ink disabled:opacity-50"
+                aria-label="Close Instagram export"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto px-4 py-4">
+              <div className="rounded-3xl bg-white/75 p-3">
+                <div
+                  className="mx-auto max-h-64 max-w-[14rem] overflow-hidden rounded-2xl bg-[#f8f3ea] shadow-inner"
+                  style={{ aspectRatio: `${aspect.width} / ${aspect.height}` }}
+                >
+                  {coverPhoto && (
+                    <img
+                      src={coverPhoto.previewUrl ?? coverPhoto.url}
+                      alt=""
+                      decoding="async"
+                      className="h-full w-full object-contain"
+                    />
+                  )}
+                </div>
+                <div className="mt-3 text-center text-sm font-semibold">
+                  {photos.length} photo{photos.length === 1 ? "" : "s"} · {size.width}×{size.height}
+                  px JPEG
+                </div>
+                <p className="mt-1 text-center text-xs text-muted-foreground">
+                  FotoFairy prepares these in your saved order. You’ll select them in the same order
+                  when Instagram opens.
+                </p>
+              </div>
+
+              <div className="mt-4">
+                <div className="text-xs font-bold uppercase tracking-wider text-muted-foreground">
+                  Instagram format
+                </div>
+                <div className="mt-2 grid grid-cols-2 gap-2">
+                  {(["portrait", "square", "landscape", "cover"] as InstagramExportAspect[]).map(
+                    (option) => {
+                      const optionMeta = aspectForExport(option, coverPhoto);
+                      return (
+                        <button
+                          key={option}
+                          type="button"
+                          onClick={() => {
+                            setAspectRatio(option);
+                            persistInstagramMetadata({
+                              instagramExportAspectRatio: option,
+                            });
+                            setPrepared([]);
+                          }}
+                          className={`rounded-2xl p-3 text-left ring-1 transition ${
+                            aspectRatio === option
+                              ? "bg-coral text-white ring-coral"
+                              : "bg-white/70 text-ink ring-ink/10"
+                          }`}
+                        >
+                          <div className="text-sm font-bold">{optionMeta.label}</div>
+                          <div className="mt-0.5 text-[11px] opacity-75">{optionMeta.hint}</div>
+                        </button>
+                      );
+                    },
+                  )}
+                </div>
+              </div>
+
+              <div className="mt-4">
+                <label
+                  htmlFor="instagram-caption"
+                  className="text-xs font-bold uppercase tracking-wider text-muted-foreground"
+                >
+                  Post caption
+                </label>
+                <textarea
+                  id="instagram-caption"
+                  value={caption}
+                  onChange={(event) => {
+                    const next = event.target.value;
+                    setCaption(next);
+                    persistInstagramMetadata({ instagramExportCaption: next });
+                    setPrepared([]);
+                  }}
+                  rows={4}
+                  className="mt-2 w-full resize-none rounded-2xl border border-ink/10 bg-white/80 px-3 py-2 text-sm outline-none focus:border-coral"
+                />
+                <label
+                  htmlFor="instagram-hashtags"
+                  className="mt-3 block text-xs font-bold uppercase tracking-wider text-muted-foreground"
+                >
+                  Hashtags
+                </label>
+                <input
+                  id="instagram-hashtags"
+                  value={hashtags}
+                  onChange={(event) => {
+                    const next = event.target.value;
+                    setHashtags(next);
+                    persistInstagramMetadata({ instagramExportHashtags: next });
+                    setPrepared([]);
+                  }}
+                  placeholder="#photodump"
+                  className="mt-2 h-11 w-full rounded-2xl border border-ink/10 bg-white/80 px-3 text-sm outline-none focus:border-coral"
+                />
+              </div>
+
+              <div className="mt-4">
+                <div className="flex items-center justify-between">
+                  <div className="text-xs font-bold uppercase tracking-wider text-muted-foreground">
+                    Export order
+                  </div>
+                  <span className="text-xs text-muted-foreground">
+                    {photos.length}/{INSTAGRAM_CAROUSEL_LIMIT}
+                  </span>
+                </div>
+                <div className="mt-2 flex gap-2 overflow-x-auto pb-1 no-scrollbar">
+                  {photos.map((photo, index) => {
+                    const mode = photoModes[photo.id] ?? "fit";
+                    return (
+                      <div key={photo.id} className="w-20 shrink-0">
+                        <div className="relative h-20 overflow-hidden rounded-2xl bg-muted">
+                          <img
+                            src={photo.previewUrl ?? photo.url}
+                            alt=""
+                            decoding="async"
+                            loading="lazy"
+                            className="h-full w-full object-cover"
+                          />
+                          <span className="absolute left-1 top-1 rounded-full bg-white/90 px-1.5 py-0.5 text-[10px] font-bold text-ink">
+                            {String(index + 1).padStart(2, "0")}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const nextModes = {
+                              ...photoModes,
+                              [photo.id]: mode === "fit" ? "fill" : "fit",
+                            };
+                            setPhotoModes(() => nextModes);
+                            persistInstagramMetadata({
+                              instagramPhotoModes: nextModes,
+                            });
+                            setPrepared([]);
+                          }}
+                          className="mt-1 w-full rounded-full bg-white px-2 py-1 text-[10px] font-bold text-ink ring-1 ring-ink/10"
+                        >
+                          {mode === "fit" ? "Fit full" : "Fill frame"}
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="mt-4 rounded-2xl bg-mint/20 p-3 text-xs leading-relaxed text-ink">
+                <div className="font-bold">Manual posting steps</div>
+                <ol className="mt-1 list-decimal space-y-1 pl-4 text-muted-foreground">
+                  <li>Share or save the numbered JPEGs.</li>
+                  <li>Choose Instagram from the share menu, or open Instagram manually.</li>
+                  <li>Select the photos in numbered order and paste your caption.</li>
+                </ol>
+              </div>
+
+              <div className="mt-3 text-xs text-muted-foreground" aria-live="polite">
+                {progress.status}
+              </div>
+              {exporting && (
+                <div className="mt-2 h-2 overflow-hidden rounded-full bg-ink/10">
+                  <div
+                    className="h-full rounded-full bg-mint transition-all"
+                    style={{ width: `${(progress.done / Math.max(1, progress.total)) * 100}%` }}
+                  />
+                </div>
+              )}
+              {failed && (
+                <div role="alert" className="mt-3 rounded-2xl bg-coral/10 p-3 text-xs text-coral">
+                  Photo {failed.index + 1} couldn’t be prepared: {failed.message}
+                  <div className="mt-2 flex gap-2">
+                    <button
+                      type="button"
+                      onClick={prepareExport}
+                      className="chip bg-white text-ink"
+                    >
+                      Retry
+                    </button>
+                    <button type="button" onClick={onClose} className="chip bg-white text-ink">
+                      Return to collection
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="border-t border-ink/10 bg-cream/95 p-4 pb-[calc(1rem+env(safe-area-inset-bottom))]">
+              <Button
+                onClick={shareOrDownload}
+                disabled={exporting || photos.length === 0 || Boolean(failed)}
+                className="h-14 w-full rounded-2xl bg-ink text-base font-semibold text-cream hover:bg-coral"
+              >
+                <Instagram className="mr-2 h-4 w-4" />
+                {prepared.length
+                  ? canNativeShareFiles(prepared.map((entry) => entry.file))
+                    ? "Share photos"
+                    : "Download photos"
+                  : "Prepare photos"}
+              </Button>
+              <div className="mt-2 grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={downloadZip}
+                  disabled={exporting}
+                  className="h-11 rounded-2xl bg-white text-sm font-bold text-ink ring-1 ring-ink/10 disabled:opacity-50"
+                >
+                  Save to device
+                </button>
+                <button
+                  type="button"
+                  onClick={copyCaption}
+                  className="h-11 rounded-2xl bg-white text-sm font-bold text-ink ring-1 ring-ink/10"
+                >
+                  {copied ? "Copied" : "Copy caption"}
+                </button>
+              </div>
+              {exporting && (
+                <button
+                  type="button"
+                  onClick={cancelExport}
+                  className="mt-2 w-full text-xs font-bold text-muted-foreground"
+                >
+                  Cancel export
+                </button>
+              )}
+              <p className="mt-2 text-center text-[11px] leading-relaxed text-muted-foreground">
+                FotoFairy prepares files only. It does not publish or log in to Instagram for you.
+              </p>
+              {captionText.length === 0 && (
+                <p className="mt-1 text-center text-[11px] text-muted-foreground">
+                  Caption is empty; that’s okay.
+                </p>
+              )}
+            </div>
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
+}
+
+function DebugPanel() {
+  const { state } = useDumpDeck();
+
+  if (!import.meta.env.DEV) return null;
+
+  const duplicateGroups = buildDuplicateGroupsForPhotos(state.photos).filter(
+    (group) => group.photos.length > 1,
+  );
+  const events = Array.from(
+    new Map(
+      state.photos
+        .map((photo) => photo.eventGroup)
+        .filter((event): event is NonNullable<Photo["eventGroup"]> => Boolean(event))
+        .map((event) => [event.groupId, event]),
+    ).values(),
+  );
+  const collections = Array.from(
+    new Map(
+      state.photos
+        .map((photo) => photo.collectionGroup)
+        .filter((collection): collection is NonNullable<Photo["collectionGroup"]> =>
+          Boolean(collection),
+        )
+        .map((collection) => [collection.groupId, collection]),
+    ).values(),
+  );
+
+  return (
+    <details className="mt-5 rounded-2xl border border-ink/10 bg-white/70 p-3 text-left text-xs">
+      <summary className="cursor-pointer font-semibold">Debug analysis</summary>
+      <div className="mt-3 space-y-3">
+        <div>
+          <div className="font-semibold">Selected tags</div>
+          <div className="text-muted-foreground">{state.settings.vibes.join(", ")}</div>
+        </div>
+        <div>
+          <div className="font-semibold">Duplicate groups</div>
+          <ul className="mt-1 space-y-1 text-muted-foreground">
+            {duplicateGroups.map((group) => (
+              <li key={group.id}>
+                {group.reason} · {group.photos.map((photo) => photo.name).join(" / ")}
+              </li>
+            ))}
+            {duplicateGroups.length === 0 && <li>None</li>}
+          </ul>
+        </div>
+        <div>
+          <div className="font-semibold">Events</div>
+          <ul className="mt-1 space-y-1 text-muted-foreground">
+            {events.map((event) => (
+              <li key={event.groupId}>
+                {event.title}: {event.photoCount} photo{event.photoCount === 1 ? "" : "s"} ·{" "}
+                {event.description}
+              </li>
+            ))}
+            {events.length === 0 && <li>None</li>}
+          </ul>
+        </div>
+        <div>
+          <div className="font-semibold">Collections</div>
+          <ul className="mt-1 space-y-1 text-muted-foreground">
+            {collections.map((collection) => (
+              <li key={collection.groupId}>
+                {collection.title}: {collection.eventCount} event
+                {collection.eventCount === 1 ? "" : "s"} · {collection.photoCount} photo
+                {collection.photoCount === 1 ? "" : "s"}
+              </li>
+            ))}
+            {collections.length === 0 && <li>None</li>}
+          </ul>
+        </div>
+        <div>
+          <div className="font-semibold">Score breakdown</div>
+          <ul className="mt-1 space-y-1 text-muted-foreground">
+            {state.photos.map((photo) => (
+              <li key={photo.id}>
+                {photo.name}: {Math.round(rankingScore(photo) * 100)} · tag boost{" "}
+                {Math.round((photo.ranking?.scoreBreakdown?.tagBoost ?? 0) * 100)}
+              </li>
+            ))}
+          </ul>
+        </div>
+        <div>
+          <div className="font-semibold">Final selected</div>
+          <div className="text-muted-foreground">
+            {state.finalOrder.map((photo) => photo.name).join(", ") || "None yet"}
+          </div>
+        </div>
+        <div>
+          <div className="font-semibold">Rejected</div>
+          <ul className="mt-1 space-y-1 text-muted-foreground">
+            {state.removed.map((entry) => (
+              <li key={entry.photo.id}>
+                {entry.photo.name}: {entry.reason}
+              </li>
+            ))}
+          </ul>
+        </div>
+      </div>
+    </details>
   );
 }
 
@@ -1428,8 +6400,7 @@ function CaptionIdeas() {
   const { state } = useDumpDeck();
   const [seed, setSeed] = useState(0);
   const ideas = useMemo<CaptionIdea[]>(
-    () => generateCaptions(state.finalOrder, state.settings.vibes),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    () => generateCaptions(state.finalOrder, state.settings.vibes, seed),
     [state.finalOrder, state.settings.vibes, seed],
   );
 
@@ -1453,7 +6424,7 @@ function CaptionIdeas() {
           </span>
           <h2 className="font-display mt-2 text-2xl leading-tight">Pick a caption</h2>
           <p className="mt-1 text-xs text-muted-foreground">
-            Generated from your vibes and the tags in your final post. Tap to copy.
+            Generated from your vibes and the tags in your final collection. Tap to copy.
           </p>
         </div>
         <button
@@ -1523,11 +6494,7 @@ function MiniStrip({
   const [open, setOpen] = useState(false);
   return (
     <div className="mt-5">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="chip"
-      >
+      <button type="button" onClick={() => setOpen((v) => !v)} className="chip">
         {open ? "Hide" : "Show"} all {remaining.length}
       </button>
       {open && (

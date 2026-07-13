@@ -4,14 +4,19 @@ export function ScoreBadge({
   label,
   value,
   className,
+  title,
 }: {
   label: string;
   value: number;
   className?: string;
+  title?: string;
 }) {
   const pct = Math.round(value * 100);
   return (
-    <div className={cn("rounded-2xl bg-white/70 backdrop-blur px-3 py-2 text-ink", className)}>
+    <div
+      className={cn("rounded-2xl bg-white/70 backdrop-blur px-3 py-2 text-ink", className)}
+      title={title}
+    >
       <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</div>
       <div className="flex items-baseline gap-1">
         <span className="font-display text-2xl leading-none">{pct}</span>

@@ -7,12 +7,7 @@ import {
   useSensors,
   type DragEndEvent,
 } from "@dnd-kit/core";
-import {
-  SortableContext,
-  arrayMove,
-  rectSortingStrategy,
-  useSortable,
-} from "@dnd-kit/sortable";
+import { SortableContext, arrayMove, rectSortingStrategy, useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { GripVertical, X } from "lucide-react";
 import type { Photo } from "@/lib/dumpdeck/types";
@@ -53,7 +48,15 @@ export function SortableGrid({
   );
 }
 
-function SortableItem({ photo, slide, onRemove }: { photo: Photo; slide: number; onRemove?: (id: string) => void }) {
+function SortableItem({
+  photo,
+  slide,
+  onRemove,
+}: {
+  photo: Photo;
+  slide: number;
+  onRemove?: (id: string) => void;
+}) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: photo.id,
   });
@@ -71,7 +74,14 @@ function SortableItem({ photo, slide, onRemove }: { photo: Photo; slide: number;
       className="group relative overflow-hidden rounded-2xl bg-muted shadow-md ring-1 ring-ink/5 touch-none"
     >
       <div style={{ aspectRatio: "4 / 5" }}>
-        <img src={photo.previewUrl ?? photo.url} alt="" decoding="async" loading="lazy" className="h-full w-full object-cover" draggable={false} />
+        <img
+          src={photo.previewUrl ?? photo.url}
+          alt=""
+          decoding="async"
+          loading="lazy"
+          className="h-full w-full object-cover"
+          draggable={false}
+        />
       </div>
       <div className="absolute left-1.5 top-1.5 rounded-full bg-ink/80 px-2 py-0.5 text-[10px] font-bold text-white">
         {slide}

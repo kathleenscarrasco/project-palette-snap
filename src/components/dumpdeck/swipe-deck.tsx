@@ -29,9 +29,7 @@ export function SwipeDeck({
     return (
       <div className="glass-card flex flex-col items-center justify-center rounded-3xl p-10 text-center">
         <div className="font-display text-3xl">All done!</div>
-        <p className="mt-2 text-sm text-muted-foreground">
-          Tap continue to build your final dump.
-        </p>
+        <p className="mt-2 text-sm text-muted-foreground">Tap continue to build your final dump.</p>
       </div>
     );
   }
@@ -108,7 +106,12 @@ function SwipeCard({
       exit={{ x: exitX, opacity: 0, transition: { duration: 0.25 } }}
       className="absolute inset-0 cursor-grab overflow-hidden rounded-[2rem] bg-muted shadow-2xl active:cursor-grabbing"
     >
-      <img src={photo.url} alt={photo.name} className="h-full w-full object-cover" draggable={false} />
+      <img
+        src={photo.url}
+        alt={photo.name}
+        className="h-full w-full object-cover"
+        draggable={false}
+      />
       <div className="pointer-events-none absolute inset-x-0 bottom-0 h-1/2 bg-gradient-to-t from-black/70 via-black/20 to-transparent" />
 
       <motion.div
