@@ -9,6 +9,7 @@ import {
   Eye,
   HelpCircle,
   Heart,
+  Instagram,
   Laugh,
   Palette,
   Palmtree,
@@ -153,6 +154,12 @@ function mergedUploadFlowEnabled() {
   if (import.meta.env.VITE_MERGED_UPLOAD_FLOW === "true") return true;
   if (typeof window === "undefined") return false;
   return new URLSearchParams(window.location.search).get("mergedUploadFlow") === "1";
+}
+
+function instagramExportEnabled() {
+  if (import.meta.env.VITE_INSTAGRAM_EXPORT_ENABLED === "true") return true;
+  if (typeof window === "undefined") return false;
+  return new URLSearchParams(window.location.search).get("instagramExport") === "1";
 }
 
 function safeSessionItem(key: string) {
@@ -5277,11 +5284,191 @@ function normalizeCollectionTitleForSave(
   };
 }
 
+type InstagramExportAspect = "portrait" | "square" | "landscape" | "cover";
+type InstagramPhotoMode = "fit" | "fill";
+type InstagramPreparedFile = {
+  photoId: string;
+  file: File;
+  url: string;
+};
+
+const INSTAGRAM_CAROUSEL_LIMIT = 20;
+const INSTAGRAM_EXPORT_CONCURRENCY = 3;
+const INSTAGRAM_EXPORT_QUALITY = 0.92;
+const INSTAGRAM_EXPORT_WIDTH = 1600;
+
+const INSTAGRAM_ASPECTS: Record<
+  Exclude<InstagramExportAspect, "cover">,
+  { label: string; width: number; height: number; hint: string }
+> = {
+  portrait: { label: "Portrait", width: 4, height: 5, hint: "Classic carousel" },
+  square: { label: "Square", width: 1, height: 1, hint: "Grid-friendly" },
+  landscape: { label: "Landscape", width: 1.91, height: 1, hint: "Wide moments" },
+};
+
+function sanitizeFilePart(input: string) {
+  return (
+    input
+      .trim()
+      .replace(/['"]/g, "")
+      .replace(/[^a-z0-9]+/gi, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 28) || "FotoFairy"
+  );
+}
+
+function instagramCaptionText(caption: string, hashtags: string) {
+  return [caption.trim(), hashtags.trim()].filter(Boolean).join("\n\n").trim();
+}
+
+function sourceForPhoto(photo: Photo) {
+  return (
+    photo.previewUrl ??
+    photo.previewFileUrl ??
+    photo.url ??
+    photo.originalFileUrl ??
+    photo.sourceMetadata?.previewFileUrl ??
+    photo.sourceMetadata?.originalFileUrl ??
+    ""
+  );
+}
+
+function hasDurableExportSource(photo: Photo) {
+  const source = sourceForPhoto(photo);
+  return Boolean(source && !source.startsWith("blob:"));
+}
+
+function aspectForExport(aspect: InstagramExportAspect, coverPhoto: Photo | undefined) {
+  if (aspect !== "cover") return INSTAGRAM_ASPECTS[aspect];
+  const width = coverPhoto?.width && coverPhoto.width > 0 ? coverPhoto.width : 4;
+  const height = coverPhoto?.height && coverPhoto.height > 0 ? coverPhoto.height : 5;
+  return {
+    label: "Match cover photo",
+    width,
+    height,
+    hint: "Uses slide 1",
+  };
+}
+
+function canvasSizeForAspect(aspect: { width: number; height: number }) {
+  const ratio = aspect.width / Math.max(1, aspect.height);
+  const width = INSTAGRAM_EXPORT_WIDTH;
+  const height = Math.max(1, Math.round(width / ratio));
+  return { width, height };
+}
+
+function imageFromUrl(src: string) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    image.crossOrigin = "anonymous";
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("Image could not be decoded for export."));
+    image.src = src;
+  });
+}
+
+async function exportPhotoForInstagram({
+  photo,
+  index,
+  aspect,
+  mode,
+  title,
+}: {
+  photo: Photo;
+  index: number;
+  aspect: { width: number; height: number };
+  mode: InstagramPhotoMode;
+  title: string;
+}) {
+  const source = sourceForPhoto(photo);
+  if (!source) throw new Error("Photo is missing a usable image source.");
+  if (source.startsWith("blob:")) {
+    throw new Error("Photo still uses a temporary browser URL. Save/reopen before exporting.");
+  }
+
+  const image = await imageFromUrl(source);
+  const canvas = document.createElement("canvas");
+  const size = canvasSizeForAspect(aspect);
+  canvas.width = size.width;
+  canvas.height = size.height;
+  const ctx = canvas.getContext("2d", { alpha: false });
+  if (!ctx) throw new Error("Browser could not create an export canvas.");
+  ctx.fillStyle = "#f8f3ea";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const imageRatio = image.naturalWidth / Math.max(1, image.naturalHeight);
+  const canvasRatio = canvas.width / Math.max(1, canvas.height);
+  const scale =
+    mode === "fill"
+      ? Math.max(canvas.width / image.naturalWidth, canvas.height / image.naturalHeight)
+      : Math.min(
+          1,
+          Math.min(canvas.width / image.naturalWidth, canvas.height / image.naturalHeight),
+        );
+  let drawWidth = image.naturalWidth * scale;
+  let drawHeight = image.naturalHeight * scale;
+
+  if (mode === "fit") {
+    const fitScale =
+      imageRatio > canvasRatio
+        ? canvas.width / image.naturalWidth
+        : canvas.height / image.naturalHeight;
+    drawWidth = image.naturalWidth * Math.min(1, fitScale);
+    drawHeight = image.naturalHeight * Math.min(1, fitScale);
+  }
+
+  const x = (canvas.width - drawWidth) / 2;
+  const y = (canvas.height - drawHeight) / 2;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(image, x, y, drawWidth, drawHeight);
+
+  const blob = await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(
+      (result) => (result ? resolve(result) : reject(new Error("Could not render JPEG export."))),
+      "image/jpeg",
+      INSTAGRAM_EXPORT_QUALITY,
+    );
+  });
+  canvas.width = 1;
+  canvas.height = 1;
+
+  const fileName = `${sanitizeFilePart(title)}-${String(index + 1).padStart(2, "0")}.jpg`;
+  return new File([blob], fileName, { type: "image/jpeg", lastModified: Date.now() });
+}
+
+async function copyTextToClipboard(text: string) {
+  await navigator.clipboard.writeText(text);
+}
+
+function productEvent(name: string, data: Record<string, unknown>) {
+  console.debug(`[analytics] ${name}`, {
+    ...data,
+    deviceCategory: /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent) ? "mobile" : "desktop",
+  });
+}
+
+function canNativeShareFiles(files: File[]) {
+  const shareNavigator = navigator as Navigator & {
+    canShare?: (data: ShareData) => boolean;
+  };
+  if (!navigator.share) return false;
+  if (!shareNavigator.canShare) return true;
+  try {
+    return shareNavigator.canShare({ files });
+  } catch {
+    return false;
+  }
+}
+
 function ExportStage() {
   const { state, dispatch } = useDumpDeck();
   const { user } = useAuth();
   const [downloading, setDownloading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [savedDraftId, setSavedDraftId] = useState(() => activeDraftId());
+  const [instagramOpen, setInstagramOpen] = useState(false);
+  const instagramEnabled = instagramExportEnabled();
   const aiGeneratedTitle = useMemo(
     () =>
       state.collectionTitleMetadata?.aiGeneratedTitle ??
@@ -5295,8 +5482,11 @@ function ExportStage() {
       aiGeneratedTitle,
   );
   const collectionTitleMetadata = useMemo(
-    () => normalizeCollectionTitleForSave(aiGeneratedTitle, collectionCaption),
-    [aiGeneratedTitle, collectionCaption],
+    () => ({
+      ...state.collectionTitleMetadata,
+      ...normalizeCollectionTitleForSave(aiGeneratedTitle, collectionCaption),
+    }),
+    [aiGeneratedTitle, collectionCaption, state.collectionTitleMetadata],
   );
 
   useEffect(() => {
@@ -5368,6 +5558,7 @@ function ExportStage() {
         pinnedCoverPhotoId: state.pinnedCoverId,
       });
       sessionStorage.setItem("dumpdeck:activeDraftId", result.id);
+      setSavedDraftId(result.id);
       toast.success(
         result.storage === "supabase" ? "Collection saved" : "Saved locally only for this browser.",
       );
@@ -5380,6 +5571,13 @@ function ExportStage() {
   }
 
   const aspect = FORMAT_ASPECT[state.settings.formats[0] ?? "portrait"];
+  const missingDurableSources = state.finalOrder.filter((photo) => !hasDurableExportSource(photo));
+  const canOpenInstagramExport =
+    instagramEnabled &&
+    state.finalOrder.length > 0 &&
+    state.finalOrder.length <= INSTAGRAM_CAROUSEL_LIMIT &&
+    missingDurableSources.length === 0 &&
+    Boolean(savedDraftId);
 
   return (
     <section>
@@ -5456,7 +5654,10 @@ function ExportStage() {
             setCollectionCaption(next);
             dispatch({
               type: "setCollectionTitleMetadata",
-              metadata: normalizeCollectionTitleForSave(aiGeneratedTitle, next),
+              metadata: {
+                ...state.collectionTitleMetadata,
+                ...normalizeCollectionTitleForSave(aiGeneratedTitle, next),
+              },
             });
           }}
           placeholder={aiGeneratedTitle}
@@ -5467,21 +5668,54 @@ function ExportStage() {
 
       <div className="mt-6 space-y-2">
         <Button
-          onClick={download}
-          disabled={downloading || state.finalOrder.length === 0}
-          className="h-14 w-full rounded-2xl bg-coral text-base font-semibold text-white shadow-lg hover:bg-coral/90"
+          onClick={save}
+          disabled={saving || state.finalOrder.length === 0}
+          className="h-14 w-full rounded-2xl bg-ink text-base font-semibold text-cream shadow-lg hover:bg-coral"
         >
-          <Download className="mr-2 h-4 w-4" />
-          {downloading ? "Zipping…" : "Download ordered photos"}
+          <Save className="mr-2 h-4 w-4" /> {saving ? "Saving…" : "Save collection"}
         </Button>
+        {instagramEnabled && savedDraftId && (
+          <Button
+            onClick={() => {
+              if (state.finalOrder.length > INSTAGRAM_CAROUSEL_LIMIT) {
+                toast.error(
+                  `Instagram export supports up to ${INSTAGRAM_CAROUSEL_LIMIT} photos. Remove a few before sharing.`,
+                );
+                return;
+              }
+              if (missingDurableSources.length > 0) {
+                toast.error("Save and reopen this collection so every photo has a durable source.");
+                return;
+              }
+              setInstagramOpen(true);
+            }}
+            disabled={!canOpenInstagramExport}
+            className="h-14 w-full rounded-2xl bg-coral text-base font-semibold text-white shadow-lg hover:bg-coral/90"
+          >
+            <Instagram className="mr-2 h-4 w-4" />
+            Share to Instagram
+          </Button>
+        )}
+        {instagramEnabled && !savedDraftId && (
+          <p className="rounded-2xl bg-mint/20 px-3 py-2 text-center text-xs text-muted-foreground">
+            Save this collection first, then FotoFairy can prepare it for Instagram.
+          </p>
+        )}
+        {instagramEnabled && state.finalOrder.length > INSTAGRAM_CAROUSEL_LIMIT && (
+          <p className="rounded-2xl bg-coral/10 px-3 py-2 text-center text-xs text-coral">
+            Instagram export supports up to {INSTAGRAM_CAROUSEL_LIMIT} photos. FotoFairy will not
+            silently omit extras.
+          </p>
+        )}
         <div className="grid grid-cols-2 gap-2">
           <Button
             variant="outline"
-            onClick={save}
-            disabled={saving || state.finalOrder.length === 0}
+            onClick={download}
+            disabled={downloading || state.finalOrder.length === 0}
             className="h-12 rounded-2xl border-ink/15 bg-white/70 font-semibold"
           >
-            <Save className="mr-2 h-4 w-4" /> {saving ? "Saving…" : "Save collection"}
+            <Download className="mr-2 h-4 w-4" />
+            {downloading ? "Zipping…" : "Download images"}
           </Button>
           <Button
             variant="outline"
@@ -5491,13 +5725,570 @@ function ExportStage() {
             ← Edit order
           </Button>
         </div>
+        <div className="grid grid-cols-2 gap-2">
+          <Button
+            variant="outline"
+            onClick={() => {
+              void copyTextToClipboard(collectionTitleMetadata.displayTitle ?? collectionCaption)
+                .then(() => toast.success("Caption copied"))
+                .catch(() => toast.error("Couldn’t copy caption"));
+            }}
+            className="h-12 rounded-2xl border-ink/15 bg-white/70 font-semibold"
+          >
+            <Copy className="mr-2 h-4 w-4" />
+            Copy Caption
+          </Button>
+          <Link
+            to="/projects"
+            className="inline-flex h-12 items-center justify-center rounded-2xl border border-ink/15 bg-white/70 text-sm font-semibold text-ink"
+          >
+            Saved Collections
+          </Link>
+        </div>
       </div>
 
       <p className="mt-6 text-center text-xs text-muted-foreground">
         Collections save privately when you are signed in.
       </p>
+      {instagramEnabled && (
+        <InstagramExportModal
+          open={instagramOpen}
+          onClose={() => setInstagramOpen(false)}
+          photos={state.finalOrder}
+          titleMetadata={collectionTitleMetadata}
+          pinnedCoverId={state.pinnedCoverId}
+          onMetadataChange={(metadata) =>
+            dispatch({
+              type: "setCollectionTitleMetadata",
+              metadata: {
+                ...state.collectionTitleMetadata,
+                ...metadata,
+              },
+            })
+          }
+        />
+      )}
       <DebugPanel />
     </section>
+  );
+}
+
+function InstagramExportModal({
+  open,
+  onClose,
+  photos,
+  titleMetadata,
+  pinnedCoverId,
+  onMetadataChange,
+}: {
+  open: boolean;
+  onClose: () => void;
+  photos: Photo[];
+  titleMetadata: CollectionTitleMetadata;
+  pinnedCoverId: string | null;
+  onMetadataChange: (metadata: CollectionTitleMetadata) => void;
+}) {
+  const coverPhoto = photos.find((photo) => photo.id === pinnedCoverId) ?? photos[0];
+  const [aspectRatio, setAspectRatio] = useState<InstagramExportAspect>(
+    titleMetadata.instagramExportAspectRatio ?? "portrait",
+  );
+  const [photoModes, setPhotoModes] = useState<Record<string, InstagramPhotoMode>>(
+    titleMetadata.instagramPhotoModes ?? {},
+  );
+  const [caption, setCaption] = useState(
+    titleMetadata.instagramExportCaption ??
+      titleMetadata.displayTitle ??
+      titleMetadata.userCaption ??
+      "FotoFairy collection",
+  );
+  const [hashtags, setHashtags] = useState(titleMetadata.instagramExportHashtags ?? "");
+  const [exporting, setExporting] = useState(false);
+  const [prepared, setPrepared] = useState<InstagramPreparedFile[]>([]);
+  const [progress, setProgress] = useState({ done: 0, total: photos.length, status: "Ready" });
+  const [failed, setFailed] = useState<{ index: number; photo: Photo; message: string } | null>(
+    null,
+  );
+  const [copied, setCopied] = useState(false);
+  const cancelRef = useRef(false);
+
+  useEffect(() => {
+    if (!open) return;
+    productEvent("instagram_export_opened", {
+      photoCount: photos.length,
+      exportFormat: aspectRatio,
+    });
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape" && !exporting) onClose();
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [aspectRatio, exporting, onClose, open, photos.length]);
+
+  function persistInstagramMetadata(partial: CollectionTitleMetadata) {
+    onMetadataChange({
+      ...titleMetadata,
+      instagramExportCaption: caption,
+      instagramExportHashtags: hashtags,
+      instagramExportAspectRatio: aspectRatio,
+      instagramPhotoModes: photoModes,
+      instagramExportOrder: photos.map((photo) => photo.id),
+      ...partial,
+    });
+  }
+
+  function clearPreparedFiles() {
+    prepared.forEach((file) => URL.revokeObjectURL(file.url));
+    setPrepared([]);
+  }
+
+  async function prepareExport() {
+    clearPreparedFiles();
+    setFailed(null);
+    setExporting(true);
+    cancelRef.current = false;
+    setProgress({
+      done: 0,
+      total: photos.length,
+      status: `Preparing 0 of ${photos.length} photos`,
+    });
+    productEvent("instagram_export_started", {
+      photoCount: photos.length,
+      exportFormat: aspectRatio,
+    });
+
+    const aspect = aspectForExport(aspectRatio, coverPhoto);
+    const results: InstagramPreparedFile[] = [];
+    let cursor = 0;
+    let completed = 0;
+
+    async function worker() {
+      while (cursor < photos.length && !cancelRef.current) {
+        const index = cursor++;
+        const photo = photos[index];
+        try {
+          const file = await exportPhotoForInstagram({
+            photo,
+            index,
+            aspect,
+            mode: photoModes[photo.id] ?? "fit",
+            title: titleMetadata.displayTitle ?? titleMetadata.userCaption ?? "FotoFairy",
+          });
+          results[index] = {
+            photoId: photo.id,
+            file,
+            url: URL.createObjectURL(file),
+          };
+          completed += 1;
+          setProgress({
+            done: completed,
+            total: photos.length,
+            status:
+              completed === photos.length
+                ? `${photos.length} of ${photos.length} photos ready`
+                : `Preparing ${completed} of ${photos.length} photos`,
+          });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : "Photo could not be prepared.";
+          console.warn("[instagram-export] photo export failed", {
+            photoId: photo.id,
+            sourceType: sourceForPhoto(photo).startsWith("blob:") ? "blob" : "durable-url",
+            sourcePath:
+              photo.previewStoragePath ??
+              photo.originalStoragePath ??
+              photo.sourceMetadata?.previewStoragePath ??
+              photo.sourceMetadata?.originalStoragePath ??
+              "url",
+            exportStage: "canvas-render",
+            failureReason: message,
+          });
+          productEvent("instagram_export_failed", {
+            photoCount: photos.length,
+            exportFormat: aspectRatio,
+            failureCategory: "photo_prepare_failed",
+          });
+          setFailed({ index, photo, message });
+          cancelRef.current = true;
+          break;
+        }
+      }
+    }
+
+    await Promise.all(
+      Array.from({ length: Math.min(INSTAGRAM_EXPORT_CONCURRENCY, photos.length) }, () => worker()),
+    );
+    setExporting(false);
+    if (cancelRef.current) return [];
+    const preparedResults = results.filter(Boolean);
+    setPrepared(preparedResults);
+    onMetadataChange({
+      ...titleMetadata,
+      instagramExportCaption: caption,
+      instagramExportHashtags: hashtags,
+      instagramExportAspectRatio: aspectRatio,
+      instagramPhotoModes: photoModes,
+      instagramExportOrder: photos.map((photo) => photo.id),
+      lastInstagramExportedAt: new Date().toISOString(),
+    });
+    productEvent("instagram_export_completed", {
+      photoCount: photos.length,
+      exportFormat: aspectRatio,
+    });
+    return preparedResults;
+  }
+
+  function cancelExport() {
+    cancelRef.current = true;
+    setExporting(false);
+    clearPreparedFiles();
+    productEvent("instagram_export_cancelled", {
+      photoCount: photos.length,
+      exportFormat: aspectRatio,
+    });
+  }
+
+  async function copyCaption() {
+    try {
+      await copyTextToClipboard(instagramCaptionText(caption, hashtags));
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1600);
+      toast.success("Caption copied");
+      productEvent("instagram_caption_copied", {
+        photoCount: photos.length,
+        exportFormat: aspectRatio,
+      });
+    } catch {
+      toast.error("Couldn’t copy caption");
+    }
+  }
+
+  async function downloadZip() {
+    const files = prepared.length ? prepared : await prepareExport();
+    if (!files.length || failed) return;
+    const zip = new JSZip();
+    files.forEach((entry) => zip.file(entry.file.name, entry.file));
+    zip.file("caption.txt", instagramCaptionText(caption, hashtags));
+    const blob = await zip.generateAsync({ type: "blob" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `${sanitizeFilePart(titleMetadata.displayTitle ?? "FotoFairy")}-instagram.zip`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    await copyCaption();
+    productEvent("instagram_download_fallback_used", {
+      photoCount: photos.length,
+      exportFormat: aspectRatio,
+    });
+  }
+
+  async function shareOrDownload() {
+    const files = prepared.length ? prepared : await prepareExport();
+    if (!files.length || failed) return;
+    const nativeFiles = files.map((entry) => entry.file);
+    const text = instagramCaptionText(caption, hashtags);
+    if (canNativeShareFiles(nativeFiles)) {
+      try {
+        await navigator.share({
+          title: "FotoFairy collection",
+          text,
+          files: nativeFiles,
+        });
+        productEvent("instagram_share_sheet_opened", {
+          photoCount: photos.length,
+          exportFormat: aspectRatio,
+        });
+        toast("Choose Instagram from the share menu.");
+        return;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (!/abort|cancel/i.test(message)) console.warn("[instagram-export] share failed", err);
+      }
+    }
+    await downloadZip();
+  }
+
+  const aspect = aspectForExport(aspectRatio, coverPhoto);
+  const size = canvasSizeForAspect(aspect);
+  const captionText = instagramCaptionText(caption, hashtags);
+
+  return (
+    <AnimatePresence>
+      {open && (
+        <motion.div
+          className="fixed inset-0 z-50 flex items-end justify-center bg-ink/45 px-3 pt-10 backdrop-blur-sm sm:items-center"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          onMouseDown={() => !exporting && onClose()}
+        >
+          <motion.div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="instagram-export-title"
+            className="flex max-h-[92dvh] w-full max-w-md flex-col overflow-hidden rounded-t-3xl bg-cream shadow-2xl sm:rounded-3xl"
+            initial={{ y: 40, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            exit={{ y: 40, opacity: 0 }}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-ink/10 px-4 py-3">
+              <div>
+                <div className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">
+                  Export
+                </div>
+                <h2 id="instagram-export-title" className="font-display text-2xl">
+                  Ready for Instagram
+                </h2>
+              </div>
+              <button
+                type="button"
+                onClick={onClose}
+                disabled={exporting}
+                className="grid h-9 w-9 place-items-center rounded-full bg-white text-ink disabled:opacity-50"
+                aria-label="Close Instagram export"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto px-4 py-4">
+              <div className="rounded-3xl bg-white/75 p-3">
+                <div
+                  className="mx-auto max-h-64 max-w-[14rem] overflow-hidden rounded-2xl bg-[#f8f3ea] shadow-inner"
+                  style={{ aspectRatio: `${aspect.width} / ${aspect.height}` }}
+                >
+                  {coverPhoto && (
+                    <img
+                      src={coverPhoto.previewUrl ?? coverPhoto.url}
+                      alt=""
+                      decoding="async"
+                      className="h-full w-full object-contain"
+                    />
+                  )}
+                </div>
+                <div className="mt-3 text-center text-sm font-semibold">
+                  {photos.length} photo{photos.length === 1 ? "" : "s"} · {size.width}×{size.height}
+                  px JPEG
+                </div>
+                <p className="mt-1 text-center text-xs text-muted-foreground">
+                  FotoFairy prepares these in your saved order. You’ll select them in the same order
+                  when Instagram opens.
+                </p>
+              </div>
+
+              <div className="mt-4">
+                <div className="text-xs font-bold uppercase tracking-wider text-muted-foreground">
+                  Instagram format
+                </div>
+                <div className="mt-2 grid grid-cols-2 gap-2">
+                  {(["portrait", "square", "landscape", "cover"] as InstagramExportAspect[]).map(
+                    (option) => {
+                      const optionMeta = aspectForExport(option, coverPhoto);
+                      return (
+                        <button
+                          key={option}
+                          type="button"
+                          onClick={() => {
+                            setAspectRatio(option);
+                            persistInstagramMetadata({
+                              instagramExportAspectRatio: option,
+                            });
+                            setPrepared([]);
+                          }}
+                          className={`rounded-2xl p-3 text-left ring-1 transition ${
+                            aspectRatio === option
+                              ? "bg-coral text-white ring-coral"
+                              : "bg-white/70 text-ink ring-ink/10"
+                          }`}
+                        >
+                          <div className="text-sm font-bold">{optionMeta.label}</div>
+                          <div className="mt-0.5 text-[11px] opacity-75">{optionMeta.hint}</div>
+                        </button>
+                      );
+                    },
+                  )}
+                </div>
+              </div>
+
+              <div className="mt-4">
+                <label
+                  htmlFor="instagram-caption"
+                  className="text-xs font-bold uppercase tracking-wider text-muted-foreground"
+                >
+                  Post caption
+                </label>
+                <textarea
+                  id="instagram-caption"
+                  value={caption}
+                  onChange={(event) => {
+                    const next = event.target.value;
+                    setCaption(next);
+                    persistInstagramMetadata({ instagramExportCaption: next });
+                    setPrepared([]);
+                  }}
+                  rows={4}
+                  className="mt-2 w-full resize-none rounded-2xl border border-ink/10 bg-white/80 px-3 py-2 text-sm outline-none focus:border-coral"
+                />
+                <label
+                  htmlFor="instagram-hashtags"
+                  className="mt-3 block text-xs font-bold uppercase tracking-wider text-muted-foreground"
+                >
+                  Hashtags
+                </label>
+                <input
+                  id="instagram-hashtags"
+                  value={hashtags}
+                  onChange={(event) => {
+                    const next = event.target.value;
+                    setHashtags(next);
+                    persistInstagramMetadata({ instagramExportHashtags: next });
+                    setPrepared([]);
+                  }}
+                  placeholder="#photodump"
+                  className="mt-2 h-11 w-full rounded-2xl border border-ink/10 bg-white/80 px-3 text-sm outline-none focus:border-coral"
+                />
+              </div>
+
+              <div className="mt-4">
+                <div className="flex items-center justify-between">
+                  <div className="text-xs font-bold uppercase tracking-wider text-muted-foreground">
+                    Export order
+                  </div>
+                  <span className="text-xs text-muted-foreground">
+                    {photos.length}/{INSTAGRAM_CAROUSEL_LIMIT}
+                  </span>
+                </div>
+                <div className="mt-2 flex gap-2 overflow-x-auto pb-1 no-scrollbar">
+                  {photos.map((photo, index) => {
+                    const mode = photoModes[photo.id] ?? "fit";
+                    return (
+                      <div key={photo.id} className="w-20 shrink-0">
+                        <div className="relative h-20 overflow-hidden rounded-2xl bg-muted">
+                          <img
+                            src={photo.previewUrl ?? photo.url}
+                            alt=""
+                            decoding="async"
+                            loading="lazy"
+                            className="h-full w-full object-cover"
+                          />
+                          <span className="absolute left-1 top-1 rounded-full bg-white/90 px-1.5 py-0.5 text-[10px] font-bold text-ink">
+                            {String(index + 1).padStart(2, "0")}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const nextModes = {
+                              ...photoModes,
+                              [photo.id]: mode === "fit" ? "fill" : "fit",
+                            };
+                            setPhotoModes(() => nextModes);
+                            persistInstagramMetadata({
+                              instagramPhotoModes: nextModes,
+                            });
+                            setPrepared([]);
+                          }}
+                          className="mt-1 w-full rounded-full bg-white px-2 py-1 text-[10px] font-bold text-ink ring-1 ring-ink/10"
+                        >
+                          {mode === "fit" ? "Fit full" : "Fill frame"}
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="mt-4 rounded-2xl bg-mint/20 p-3 text-xs leading-relaxed text-ink">
+                <div className="font-bold">Manual posting steps</div>
+                <ol className="mt-1 list-decimal space-y-1 pl-4 text-muted-foreground">
+                  <li>Share or save the numbered JPEGs.</li>
+                  <li>Choose Instagram from the share menu, or open Instagram manually.</li>
+                  <li>Select the photos in numbered order and paste your caption.</li>
+                </ol>
+              </div>
+
+              <div className="mt-3 text-xs text-muted-foreground" aria-live="polite">
+                {progress.status}
+              </div>
+              {exporting && (
+                <div className="mt-2 h-2 overflow-hidden rounded-full bg-ink/10">
+                  <div
+                    className="h-full rounded-full bg-mint transition-all"
+                    style={{ width: `${(progress.done / Math.max(1, progress.total)) * 100}%` }}
+                  />
+                </div>
+              )}
+              {failed && (
+                <div role="alert" className="mt-3 rounded-2xl bg-coral/10 p-3 text-xs text-coral">
+                  Photo {failed.index + 1} couldn’t be prepared: {failed.message}
+                  <div className="mt-2 flex gap-2">
+                    <button
+                      type="button"
+                      onClick={prepareExport}
+                      className="chip bg-white text-ink"
+                    >
+                      Retry
+                    </button>
+                    <button type="button" onClick={onClose} className="chip bg-white text-ink">
+                      Return to collection
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="border-t border-ink/10 bg-cream/95 p-4 pb-[calc(1rem+env(safe-area-inset-bottom))]">
+              <Button
+                onClick={shareOrDownload}
+                disabled={exporting || photos.length === 0 || Boolean(failed)}
+                className="h-14 w-full rounded-2xl bg-ink text-base font-semibold text-cream hover:bg-coral"
+              >
+                <Instagram className="mr-2 h-4 w-4" />
+                {prepared.length
+                  ? canNativeShareFiles(prepared.map((entry) => entry.file))
+                    ? "Share photos"
+                    : "Download photos"
+                  : "Prepare photos"}
+              </Button>
+              <div className="mt-2 grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={downloadZip}
+                  disabled={exporting}
+                  className="h-11 rounded-2xl bg-white text-sm font-bold text-ink ring-1 ring-ink/10 disabled:opacity-50"
+                >
+                  Save to device
+                </button>
+                <button
+                  type="button"
+                  onClick={copyCaption}
+                  className="h-11 rounded-2xl bg-white text-sm font-bold text-ink ring-1 ring-ink/10"
+                >
+                  {copied ? "Copied" : "Copy caption"}
+                </button>
+              </div>
+              {exporting && (
+                <button
+                  type="button"
+                  onClick={cancelExport}
+                  className="mt-2 w-full text-xs font-bold text-muted-foreground"
+                >
+                  Cancel export
+                </button>
+              )}
+              <p className="mt-2 text-center text-[11px] leading-relaxed text-muted-foreground">
+                FotoFairy prepares files only. It does not publish or log in to Instagram for you.
+              </p>
+              {captionText.length === 0 && (
+                <p className="mt-1 text-center text-[11px] text-muted-foreground">
+                  Caption is empty; that’s okay.
+                </p>
+              )}
+            </div>
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
   );
 }
 

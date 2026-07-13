@@ -21,6 +21,12 @@ export type CollectionTitleMetadata = {
   aiGeneratedTitle?: string;
   userCaption?: string;
   displayTitle?: string;
+  instagramExportCaption?: string;
+  instagramExportHashtags?: string;
+  instagramExportAspectRatio?: "portrait" | "square" | "landscape" | "cover";
+  instagramPhotoModes?: Record<string, "fit" | "fill">;
+  instagramExportOrder?: string[];
+  lastInstagramExportedAt?: string;
 };
 
 export type SaveDraftInput = {
