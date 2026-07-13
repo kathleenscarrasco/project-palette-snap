@@ -71,7 +71,14 @@ import type {
   UploadItem,
   VibeFocus,
 } from "@/lib/dumpdeck/types";
-import { UploadGrid } from "@/components/dumpdeck/upload-grid";
+import {
+  INPUT_ACCEPT,
+  UploadGrid,
+  friendlyDecodeError,
+  isHeicFile,
+  isSupportedPhotoFile,
+  readImage,
+} from "@/components/dumpdeck/upload-grid";
 import { PhotoCard } from "@/components/dumpdeck/photo-card";
 import { SortableGrid } from "@/components/dumpdeck/sortable-grid";
 import { ScoreBadge } from "@/components/dumpdeck/score-badge";
@@ -85,6 +92,9 @@ const LOCAL_SCAN_CONCURRENCY = 5;
 const LOCAL_SCAN_BATCH_SIZE = 15;
 const LOCAL_SCAN_TIMEOUT_MS = 30_000;
 const LOCAL_SCAN_MAX_ATTEMPTS = 2;
+const MERGED_PREPARE_CONCURRENCY = 8;
+const MERGED_LOCAL_SCAN_CONCURRENCY = 5;
+const MERGED_STORAGE_CONCURRENCY = 4;
 
 function analysisOf(photo: Photo) {
   return photo.unifiedAnalysis?.analysis;
@@ -137,6 +147,12 @@ function activeDraftId() {
 
 function projectUploadCountKey(projectId: string) {
   return `dumpdeck:project:${projectId}:uploadCount`;
+}
+
+function mergedUploadFlowEnabled() {
+  if (import.meta.env.VITE_MERGED_UPLOAD_FLOW === "true") return true;
+  if (typeof window === "undefined") return false;
+  return new URLSearchParams(window.location.search).get("mergedUploadFlow") === "1";
 }
 
 function safeSessionItem(key: string) {
@@ -237,6 +253,7 @@ function Shell() {
   const { state, dispatch } = useDumpDeck();
   const { user, isAuthed, loading } = useAuth();
   const navigate = useNavigate();
+  const useMergedUploadFlow = mergedUploadFlowEnabled();
   const [draftHydrationChecked, setDraftHydrationChecked] = useState(false);
   const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const hydrationCompleteRef = useRef(false);
@@ -522,7 +539,8 @@ function Shell() {
           className="mt-6"
         >
           {state.stage === "setup" && <SetupStage />}
-          {state.stage === "upload" && <UploadStage />}
+          {state.stage === "upload" &&
+            (useMergedUploadFlow ? <MergedUploadAnalyzeStage /> : <UploadStage />)}
           {state.stage === "analyze" && <AnalyzeStage />}
           {state.stage === "similar" && <SimilarStage />}
           {state.stage === "results" && <ResultsStage />}
@@ -1230,6 +1248,691 @@ function UploadStage() {
           ← Back to vibe
         </button>
       </div>
+    </section>
+  );
+}
+
+type MergedRow = AnalysisRow & {
+  fileName: string;
+  file?: File;
+  storageStatus?: "queued" | "uploading" | "uploaded" | "failed" | "skipped";
+  localPreviewUrl?: string;
+};
+
+function MergedUploadAnalyzeStage() {
+  const { state, dispatch } = useDumpDeck();
+  const inputRef = useRef<HTMLInputElement>(null);
+  const rowsRef = useRef<MergedRow[]>([]);
+  const processingRunRef = useRef(0);
+  const storageQueueRef = useRef<UploadItem[]>([]);
+  const storageActiveRef = useRef(0);
+  const storageStartedAtRef = useRef(0);
+  const [rows, setRows] = useState<MergedRow[]>([]);
+  const [dragOver, setDragOver] = useState(false);
+  const [showScanHelp, setShowScanHelp] = useState(false);
+  const [pipelineVersion, setPipelineVersion] = useState("");
+  const [phase, setPhase] = useState<AnalysisPhase>("loading");
+  const [storageUploaded, setStorageUploaded] = useState(0);
+  const [storageFailed, setStorageFailed] = useState(0);
+  const [loadingSamples, setLoadingSamples] = useState(false);
+
+  useEffect(() => {
+    rowsRef.current = rows;
+  }, [rows]);
+
+  const items = rows.map((row) => row.item).filter(Boolean);
+  const scanState = useMemo(() => buildCanonicalScanState(rows), [rows]);
+  const quickScanProgress = scanState.totalCount
+    ? scanState.scannedCount / Math.max(1, scanState.totalCount)
+    : 0;
+  const canStartSorting = scanState.complete && scanState.usableCount >= 4 && phase !== "preparing";
+  const scanHelpText = scanState.totalCount > 0 ? scanTooltipSummary(scanState) : "";
+  const unusableRows = rows.filter((row) => rowHasQuickScanResult(row) && !rowIsUsable(row));
+  const sampleRows = rows.filter((row) => row.item || row.localPreviewUrl).slice(0, 9);
+  const taglinePhotos = useMemo(
+    () => rows.map((row) => row.photo).filter((photo): photo is Photo => !!photo),
+    [rows],
+  );
+  const friendlyLine = useAnalyzingTagline({
+    items,
+    photos: taglinePhotos,
+    phase,
+    active: rows.length > 0 && !canStartSorting,
+  });
+
+  function updateRows(updater: (current: MergedRow[]) => MergedRow[]) {
+    let nextRows = rowsRef.current;
+    setRows((current) => {
+      const next = updater(current);
+      rowsRef.current = next;
+      nextRows = next;
+      return next;
+    });
+    return nextRows;
+  }
+
+  function enqueueStorageUpload(item: UploadItem) {
+    storageQueueRef.current.push(item);
+    if (!storageStartedAtRef.current) storageStartedAtRef.current = performance.now();
+    pumpStorageUploads();
+  }
+
+  function pumpStorageUploads() {
+    while (
+      storageActiveRef.current < MERGED_STORAGE_CONCURRENCY &&
+      storageQueueRef.current.length > 0
+    ) {
+      const item = storageQueueRef.current.shift()!;
+      storageActiveRef.current += 1;
+      updateRows((current) =>
+        current.map((row) =>
+          row.item.id === item.id ? { ...row, storageStatus: "uploading" } : row,
+        ),
+      );
+      void persistProjectUploads(activeProjectId(), [item])
+        .then((storedItems) => {
+          const stored = storedItems[0];
+          if (!stored) return;
+          setStorageUploaded((count) => count + 1);
+          updateRows((current) =>
+            current.map((row) => {
+              if (row.item.id !== item.id) return row;
+              const nextItem = {
+                ...row.item,
+                url: stored.previewUrl ?? stored.previewFileUrl ?? stored.url,
+                originalFileUrl: stored.originalFileUrl,
+                previewFileUrl: stored.previewFileUrl,
+                previewUrl: stored.previewUrl,
+                storageBucket: stored.storageBucket,
+                originalStoragePath: stored.originalStoragePath,
+                previewStoragePath: stored.previewStoragePath,
+                fileName: stored.fileName,
+                uploadedAt: stored.uploadedAt,
+              };
+              const nextPhoto = row.photo
+                ? {
+                    ...row.photo,
+                    url: nextItem.previewUrl ?? nextItem.url,
+                    originalFileUrl: nextItem.originalFileUrl,
+                    previewFileUrl: nextItem.previewFileUrl,
+                    previewUrl: nextItem.previewUrl,
+                    storageBucket: nextItem.storageBucket,
+                    originalStoragePath: nextItem.originalStoragePath,
+                    previewStoragePath: nextItem.previewStoragePath,
+                    fileName: nextItem.fileName,
+                    uploadedAt: nextItem.uploadedAt,
+                    sourceMetadata: {
+                      ...row.photo.sourceMetadata,
+                      storageBucket: nextItem.storageBucket,
+                      originalStoragePath: nextItem.originalStoragePath,
+                      previewStoragePath: nextItem.previewStoragePath,
+                      originalFileUrl: nextItem.originalFileUrl,
+                      previewFileUrl: nextItem.previewUrl ?? nextItem.previewFileUrl,
+                      fileName: nextItem.fileName,
+                      uploadedAt: nextItem.uploadedAt,
+                    },
+                  }
+                : row.photo;
+              return {
+                ...row,
+                item: nextItem,
+                photo: nextPhoto,
+                storageStatus: "uploaded",
+              };
+            }),
+          );
+          if (stored.previewStoragePath || stored.originalStoragePath) {
+            const storedPhoto = rowsRef.current.find((row) => row.item.id === item.id)?.photo;
+            if (storedPhoto) dispatch({ type: "updatePhotoSources", photos: [storedPhoto] });
+          }
+        })
+        .catch((err) => {
+          console.warn("[dumpdeck] merged storage upload failed", {
+            projectId: activeProjectId(),
+            id: item.id,
+            name: item.name,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          setStorageFailed((count) => count + 1);
+          updateRows((current) =>
+            current.map((row) =>
+              row.item.id === item.id
+                ? {
+                    ...row,
+                    storageStatus: "failed",
+                    error: row.error ?? "Storage upload is still needed before saving.",
+                  }
+                : row,
+            ),
+          );
+        })
+        .finally(() => {
+          storageActiveRef.current -= 1;
+          if (storageQueueRef.current.length || storageActiveRef.current) {
+            pumpStorageUploads();
+            return;
+          }
+          console.debug("[perf] merged storage upload summary", {
+            projectId: activeProjectId(),
+            totalPhotos: rowsRef.current.length,
+            uploaded: rowsRef.current.filter((row) => row.storageStatus === "uploaded").length,
+            failed: rowsRef.current.filter((row) => row.storageStatus === "failed").length,
+            storageUploadMs: Math.round(performance.now() - storageStartedAtRef.current),
+          });
+        });
+    }
+  }
+
+  async function scanPreparedItem(
+    item: UploadItem,
+    pipeline: typeof import("@/lib/dumpdeck/pipeline"),
+  ) {
+    updateRows((current) =>
+      current.map((row) => (row.item.id === item.id ? { ...row, status: "local_scanning" } : row)),
+    );
+    try {
+      const { photo, clipEmbeddingVector } = await withTimeout(
+        pipeline.processLocalImage({
+          ...item,
+          settings: state.settings,
+        }),
+        LOCAL_SCAN_TIMEOUT_MS,
+        `Quick scan for ${item.name}`,
+      );
+      const localSkipReason = localRemovalReason(photo);
+      updateRows((current) =>
+        current.map((row) =>
+          row.item.id === item.id
+            ? {
+                ...row,
+                status: localSkipReason ? "skipped" : "local_complete",
+                photo,
+                clipEmbeddingVector,
+                localSkipReason,
+                error: localSkipReason,
+              }
+            : row,
+        ),
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Local quick scan failed";
+      console.warn("[dumpdeck] merged quick scan failed", {
+        id: item.id,
+        name: item.name,
+        message,
+      });
+      updateRows((current) =>
+        current.map((row) =>
+          row.item.id === item.id
+            ? {
+                ...row,
+                status: "failed",
+                error: message,
+              }
+            : row,
+        ),
+      );
+    }
+  }
+
+  async function handleFiles(files: FileList | File[]) {
+    const selected = Array.from(files);
+    const runId = processingRunRef.current;
+    const accepted = selected.filter(isSupportedPhotoFile);
+    const rejected = selected.filter((file) => !isSupportedPhotoFile(file));
+    const selectedAt = performance.now();
+    const rejectedRows: MergedRow[] = rejected.map((file) => {
+      const item: UploadItem = {
+        id: crypto.randomUUID(),
+        url: "",
+        name: file.name,
+        width: 0,
+        height: 0,
+        byteSize: file.size,
+        mimeType: file.type || "application/octet-stream",
+        lastModified: file.lastModified,
+      };
+      return {
+        item,
+        fileName: file.name,
+        status: "failed",
+        attempts: 0,
+        geminiRequests: 0,
+        storageStatus: "skipped",
+        error:
+          file.type.startsWith("video/") || /\.(mov|mp4|m4v)$/i.test(file.name)
+            ? `${file.name} is video-only. FotoFairy analyzes still photos for now.`
+            : `${file.name} is not a supported photo format.`,
+      };
+    });
+    const placeholderRows: MergedRow[] = accepted.map((file) => ({
+      item: {
+        id: crypto.randomUUID(),
+        url: "",
+        name: file.name,
+        width: 0,
+        height: 0,
+        byteSize: file.size,
+        mimeType: file.type || "image/jpeg",
+        lastModified: file.lastModified,
+      },
+      file,
+      fileName: file.name,
+      status: "uploaded",
+      attempts: 0,
+      geminiRequests: 0,
+      storageStatus: "queued",
+      error: isHeicFile(file) ? "Preparing HEIC preview…" : undefined,
+    }));
+
+    setPhase("local-scanning");
+    updateRows((current) => [...current, ...placeholderRows, ...rejectedRows]);
+    if (!accepted.length) return;
+
+    const pipeline = await import("@/lib/dumpdeck/pipeline");
+    if (runId !== processingRunRef.current) return;
+    setPipelineVersion(pipeline.imagePipelineVersion);
+
+    let prepareCursor = 0;
+    const preparedItems: UploadItem[] = [];
+    let firstPreviewMs: number | null = null;
+
+    async function worker() {
+      while (prepareCursor < accepted.length && runId === processingRunRef.current) {
+        const file = accepted[prepareCursor++];
+        const row = placeholderRows.find((entry) => entry.file === file);
+        if (!row) continue;
+        try {
+          updateRows((current) =>
+            current.map((entry) =>
+              entry.item.id === row.item.id
+                ? {
+                    ...entry,
+                    error: isHeicFile(file) ? "Preparing iPhone photo…" : undefined,
+                  }
+                : entry,
+            ),
+          );
+          const item = await readImage(file);
+          if (firstPreviewMs === null) firstPreviewMs = Math.round(performance.now() - selectedAt);
+          preparedItems.push(item);
+          updateRows((current) =>
+            current.map((entry) =>
+              entry.item.id === row.item.id
+                ? {
+                    ...entry,
+                    item,
+                    localPreviewUrl: item.previewUrl ?? item.url,
+                    error: undefined,
+                    storageStatus: "queued",
+                  }
+                : entry,
+            ),
+          );
+          enqueueStorageUpload(item);
+          void scanPreparedItem(item, pipeline);
+          await yieldToBrowser();
+        } catch (err) {
+          const message = err instanceof Error ? err.message : friendlyDecodeError(file);
+          updateRows((current) =>
+            current.map((entry) =>
+              entry.item.id === row.item.id
+                ? {
+                    ...entry,
+                    status: "failed",
+                    error: message,
+                    storageStatus: "skipped",
+                  }
+                : entry,
+            ),
+          );
+        }
+      }
+    }
+
+    await Promise.all(
+      Array.from({ length: Math.min(MERGED_PREPARE_CONCURRENCY, accepted.length) }, () => worker()),
+    );
+    console.debug("[perf] merged file preparation summary", {
+      totalSelected: selected.length,
+      accepted: accepted.length,
+      rejected: rejected.length,
+      prepared: preparedItems.length,
+      timeToFirstPreviewMs: firstPreviewMs,
+      totalFileSelectionMs: Math.round(performance.now() - selectedAt),
+      prepareConcurrency: MERGED_PREPARE_CONCURRENCY,
+      quickScanConcurrency: MERGED_LOCAL_SCAN_CONCURRENCY,
+    });
+  }
+
+  async function useSamples() {
+    setLoadingSamples(true);
+    try {
+      const samples = await makeLocalSampleUploads();
+      const sampleRows = samples.map((item): MergedRow => ({
+        item,
+        fileName: item.name,
+        status: "uploaded",
+        attempts: 0,
+        geminiRequests: 0,
+        storageStatus: "skipped",
+        localPreviewUrl: item.previewUrl ?? item.url,
+      }));
+      updateRows((current) => [...current, ...sampleRows]);
+      setPhase("local-scanning");
+      const pipeline = await import("@/lib/dumpdeck/pipeline");
+      setPipelineVersion(pipeline.imagePipelineVersion);
+      let cursor = 0;
+      async function worker() {
+        while (cursor < samples.length) {
+          const item = samples[cursor++];
+          await scanPreparedItem(item, pipeline);
+        }
+      }
+      await Promise.all(
+        Array.from({ length: Math.min(MERGED_LOCAL_SCAN_CONCURRENCY, samples.length) }, () =>
+          worker(),
+        ),
+      );
+      toast.success("Loaded local sample photos");
+    } catch (err) {
+      console.error("[dumpdeck] sample photo generation failed", err);
+      toast.error("Could not load sample photos");
+    } finally {
+      setLoadingSamples(false);
+    }
+  }
+
+  async function startSorting() {
+    if (!canStartSorting) return;
+    setPhase("preparing");
+    const sortingStartedAt = performance.now();
+    try {
+      const processed = rowsRef.current
+        .filter((row) => row.status !== "failed" && row.status !== "skipped" && row.photo?.analysis)
+        .map((row) => ({
+          photo: row.photo!,
+          clipEmbeddingVector: row.clipEmbeddingVector,
+        }));
+      if (processed.length < 4) {
+        setPhase("blocked");
+        toast.error("At least 4 scanned photos are needed to start sorting.");
+        return;
+      }
+
+      const { photos: clusteredPhotos } = assignDuplicateClusters(processed);
+      const { photos: rankedPhotos } = rankPhotos(clusteredPhotos, { settings: state.settings });
+      const { photos: out, events, collections } = organizePhotos(rankedPhotos);
+      void Promise.all([
+        saveDuplicateClusterAssignments(out, pipelineVersion),
+        savePhotoRankings(out, pipelineVersion),
+      ]).catch((err) => console.warn("[dumpdeck] metadata cache save failed", err));
+
+      const groups = buildDuplicateGroupsForPhotos(out);
+      const hasGroups = groups.some((group) => group.photos.length > 1);
+      const projectId = activeProjectId();
+      if (projectId) {
+        sessionStorage.setItem(projectUploadCountKey(projectId), String(rowsRef.current.length));
+        localStorage.setItem(projectUploadCountKey(projectId), String(rowsRef.current.length));
+      }
+      sessionStorage.setItem("dumpdeck:lastUploadCount", String(rowsRef.current.length));
+      dispatch({ type: "clearRemoved" });
+      dispatch({ type: "setPhotos", photos: out });
+
+      console.debug("[perf] merged sort preparation summary", {
+        totalPhotosSelected: rowsRef.current.length,
+        quickScanResolved: scanState.scannedCount,
+        usablePhotos: scanState.usableCount,
+        skippedOrFailed: rowsRef.current.filter((row) => !rowIsUsable(row)).length,
+        storageUploaded,
+        storageFailed,
+        duplicateGroups: groups.filter((group) => group.photos.length > 1).length,
+        events,
+        collections,
+        totalSortingPreparationMs: Math.round(performance.now() - sortingStartedAt),
+      });
+
+      if (hasGroups) {
+        dispatch({ type: "setStage", stage: "similar" });
+        return;
+      }
+      const shortlist = rankingShortlist(out, MAX_KEEP);
+      const cutEntries = removedByRanking(out, shortlist);
+      if (cutEntries.length) dispatch({ type: "addRemoved", entries: cutEntries });
+      dispatch({ type: "setShortlist", photos: shortlist });
+      dispatch({ type: "setStage", stage: "results" });
+    } catch (err) {
+      console.error("[dumpdeck] merged sorting preparation failed", err);
+      setPhase("ready");
+      toast.error("Sorting could not start. Please try again.");
+    }
+  }
+
+  const heading =
+    rows.length === 0
+      ? "Drop in your photos"
+      : scanState.totalCount > 0
+        ? `${scanState.scannedCount} of ${scanState.totalCount} photo${scanState.totalCount === 1 ? "" : "s"} scanned`
+        : "Preparing your photos";
+
+  return (
+    <section className="text-center">
+      <Heading
+        eyebrow={rows.length ? "Step 1 + 2" : "Step 1"}
+        title={rows.length ? "Reading your camera roll" : "Drop in your photos"}
+        body={
+          rows.length ? friendlyLine : "Pick photos and FotoFairy will start scanning as they load."
+        }
+      />
+
+      <label
+        onDragOver={(event) => {
+          event.preventDefault();
+          setDragOver(true);
+        }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={(event) => {
+          event.preventDefault();
+          setDragOver(false);
+          if (event.dataTransfer.files) void handleFiles(event.dataTransfer.files);
+        }}
+        className={`mx-auto mt-6 flex cursor-pointer flex-col items-center justify-center rounded-3xl border-2 border-dashed px-6 py-8 transition ${
+          dragOver ? "border-coral bg-coral/5" : "border-ink/15 bg-white/55"
+        }`}
+      >
+        <input
+          ref={inputRef}
+          type="file"
+          accept={INPUT_ACCEPT}
+          multiple
+          className="sr-only"
+          onChange={(event) => event.target.files && void handleFiles(event.target.files)}
+        />
+        <div className="grid h-12 w-12 place-items-center rounded-2xl bg-coral text-white shadow-lg">
+          <Upload className="h-5 w-5" />
+        </div>
+        <div className="mt-3 font-display text-2xl">
+          {rows.length ? "Add more photos" : "Drop your camera roll"}
+        </div>
+        <div className="mt-1 text-sm text-muted-foreground">
+          Thumbnails appear first; scanning starts right away.
+        </div>
+      </label>
+
+      {rows.length > 0 && (
+        <>
+          <div className="relative mx-auto mt-8 grid h-64 w-64 grid-cols-3 gap-1.5">
+            {sampleRows.map((row) => (
+              <motion.div
+                key={row.item.id}
+                initial={{ opacity: 0, scale: 0.7 }}
+                animate={{ opacity: 1, scale: 1 }}
+                className="relative overflow-hidden rounded-xl bg-muted"
+              >
+                {row.item.url || row.localPreviewUrl ? (
+                  <img
+                    src={row.item.previewUrl ?? row.localPreviewUrl ?? row.item.url}
+                    alt=""
+                    decoding="async"
+                    className="h-full w-full object-cover"
+                  />
+                ) : (
+                  <div className="grid h-full w-full place-items-center text-[10px] text-muted-foreground">
+                    Reading
+                  </div>
+                )}
+                <span className="absolute bottom-1 left-1 rounded-full bg-white/85 px-1.5 py-0.5 text-[9px] font-semibold text-ink">
+                  {row.status === "failed"
+                    ? "Needs review"
+                    : rowHasQuickScanResult(row)
+                      ? "Scanned"
+                      : row.item.url
+                        ? "Scanning"
+                        : "Loading"}
+                </span>
+              </motion.div>
+            ))}
+            {!canStartSorting && (
+              <motion.div
+                aria-hidden
+                animate={{ y: [0, 240, 0] }}
+                transition={{ duration: 2.2, repeat: Infinity, ease: "easeInOut" }}
+                className="pointer-events-none absolute inset-x-0 h-8 rounded-full bg-gradient-to-b from-transparent via-coral/60 to-transparent blur-sm"
+              />
+            )}
+          </div>
+
+          <div className="mx-auto mt-8 max-w-sm">
+            <div className="h-2 overflow-hidden rounded-full bg-ink/10">
+              <motion.div
+                className={`h-full rounded-full ${canStartSorting ? "bg-mint" : "bg-coral"}`}
+                animate={{ width: `${Math.round(quickScanProgress * 100)}%` }}
+              />
+            </div>
+            <div className="relative mx-auto mt-4 flex max-w-full items-center justify-center gap-2 px-2">
+              <div className="text-center font-display text-2xl leading-tight text-ink sm:text-3xl">
+                {heading}
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowScanHelp((open) => !open)}
+                aria-expanded={showScanHelp}
+                aria-label="What does this scan status mean?"
+                className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-white/80 text-ink shadow-sm ring-1 ring-ink/10 transition hover:bg-white"
+              >
+                <HelpCircle className="h-4 w-4" />
+              </button>
+              <AnimatePresence>
+                {showScanHelp && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 4, scale: 0.98 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={{ opacity: 0, y: 4, scale: 0.98 }}
+                    className="absolute left-1/2 top-full z-20 mt-3 w-[min(20rem,calc(100vw-3rem))] -translate-x-1/2 rounded-2xl bg-white p-3 text-left text-xs leading-relaxed text-ink shadow-xl ring-1 ring-ink/10"
+                  >
+                    <p>{scanHelpText}</p>
+                    <p className="mt-2 text-muted-foreground">
+                      Usable means the photo loaded successfully and passed the basic scan.
+                      Screenshots, corrupted files, unsupported formats, or failed uploads may be
+                      skipped.
+                    </p>
+                    {unusableRows.length > 0 && (
+                      <div className="mt-2 border-t border-ink/10 pt-2">
+                        <div className="font-semibold">Skipped reasons</div>
+                        <ul className="mt-1 max-h-24 space-y-1 overflow-y-auto">
+                          {unusableRows.map((row) => (
+                            <li key={row.item.id}>
+                              <span className="font-semibold">{row.item.name}:</span>{" "}
+                              <span>{rowFinalReason(row)}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+            {canStartSorting && (
+              <div className="mt-4 rounded-2xl bg-mint/20 px-4 py-3 text-left text-xs leading-relaxed text-ink">
+                <div className="font-semibold">Your photos are ready to review.</div>
+                <p className="mt-1 text-muted-foreground">
+                  Storage and deeper AI details can keep finishing quietly while you start sorting.
+                </p>
+              </div>
+            )}
+          </div>
+
+          {unusableRows.length > 0 && (
+            <div className="mx-auto mt-5 max-w-sm rounded-3xl bg-coral/10 p-3 text-left">
+              <div className="text-sm font-semibold text-coral">
+                {unusableRows.length} photo{unusableRows.length === 1 ? "" : "s"} need attention
+              </div>
+              <ul className="mt-2 max-h-28 space-y-1 overflow-y-auto text-xs text-ink/75">
+                {unusableRows.map((row) => (
+                  <li key={row.item.id}>
+                    <span className="font-semibold">{row.item.name}</span>: {rowFinalReason(row)}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          <div className="mx-auto mt-5 max-w-sm space-y-2">
+            <Button
+              onClick={startSorting}
+              disabled={!canStartSorting}
+              className="h-14 w-full rounded-2xl bg-ink text-base font-semibold text-cream hover:bg-coral disabled:opacity-55"
+            >
+              {phase === "preparing"
+                ? "Preparing your collection…"
+                : canStartSorting
+                  ? "Start Sorting"
+                  : "Start Sorting unlocks after quick scan"}
+            </Button>
+            {!canStartSorting && (
+              <p className="px-3 text-xs leading-relaxed text-muted-foreground">
+                Do not refresh FotoFairy until after you start sorting.
+              </p>
+            )}
+            <div className="flex justify-center gap-2">
+              <button
+                type="button"
+                onClick={() => inputRef.current?.click()}
+                className="chip bg-white/80"
+              >
+                + Add more
+              </button>
+              <button
+                type="button"
+                onClick={() => dispatch({ type: "setStage", stage: "setup" })}
+                className="chip"
+              >
+                ← Back to vibe
+              </button>
+            </div>
+            {(storageUploaded > 0 || storageFailed > 0 || storageActiveRef.current > 0) && (
+              <p className="text-xs text-muted-foreground">
+                {storageUploaded} saved to your project
+                {storageFailed ? ` · ${storageFailed} still need storage retry` : ""}
+              </p>
+            )}
+          </div>
+        </>
+      )}
+
+      {isLocalDevAuth && (
+        <div className="mt-3">
+          <button
+            type="button"
+            onClick={useSamples}
+            disabled={loadingSamples}
+            className="chip bg-mint/50 text-ink disabled:opacity-60"
+          >
+            {loadingSamples ? "Loading samples…" : "Use local sample photos"}
+          </button>
+        </div>
+      )}
     </section>
   );
 }

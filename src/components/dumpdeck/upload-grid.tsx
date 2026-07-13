@@ -14,7 +14,7 @@ const ACCEPTED_PHOTO_TYPES = new Set([
   "image/heif",
   "image/gif",
 ]);
-const INPUT_ACCEPT = [
+export const INPUT_ACCEPT = [
   "image/jpeg",
   "image/png",
   "image/webp",
@@ -70,7 +70,7 @@ function makePreviewUrl(img: HTMLImageElement, maxSide = 1600): Promise<string> 
   });
 }
 
-async function readImage(file: File): Promise<UploadItem> {
+export async function readImage(file: File): Promise<UploadItem> {
   const startedAt = performance.now();
   const fingerprint = await fingerprintFile(file);
   const source = await prepareImageSource(file);
@@ -198,7 +198,7 @@ async function prepareImageSource(file: File): Promise<PreparedImageSource> {
   }
 }
 
-function isHeicFile(file: File) {
+export function isHeicFile(file: File) {
   return /\.(heic|heif)$/i.test(file.name) || /heic|heif/i.test(file.type);
 }
 
@@ -211,12 +211,12 @@ function mimeTypeFromName(name: string) {
   return "";
 }
 
-function isSupportedPhotoFile(file: File) {
+export function isSupportedPhotoFile(file: File) {
   const type = file.type.toLowerCase();
   return ACCEPTED_PHOTO_TYPES.has(type) || ACCEPTED_PHOTO_EXTENSIONS.test(file.name);
 }
 
-function friendlyDecodeError(file: File) {
+export function friendlyDecodeError(file: File) {
   if (/\.(heic|heif)$/i.test(file.name) || /heic|heif/i.test(file.type)) {
     return `${file.name} could not be converted from HEIC/HEIF. Try exporting it as JPEG/WebP and uploading again.`;
   }
