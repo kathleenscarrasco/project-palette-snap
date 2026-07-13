@@ -1760,10 +1760,9 @@ function AnalyzeStage() {
   const canStartSorting =
     quickScanComplete && phase !== "loading" && phase !== "preparing" && scanState.usableCount >= 4;
 
-  const progressLabel = canStartSorting
-    ? `Scanned ${scanState.totalCount} of ${scanState.totalCount} photo${scanState.totalCount === 1 ? "" : "s"}`
-    : scanState.totalCount > 0
-      ? `Scanning ${scanState.scannedCount} of ${scanState.totalCount} photo${scanState.totalCount === 1 ? "" : "s"}`
+  const progressLabel =
+    scanState.totalCount > 0
+      ? `${scanState.scannedCount} of ${scanState.totalCount} photo${scanState.totalCount === 1 ? "" : "s"} scanned`
       : failedRows.length
         ? `${failedRows.length} photo${failedRows.length === 1 ? "" : "s"} couldn't be scanned`
         : phase === "preparing"

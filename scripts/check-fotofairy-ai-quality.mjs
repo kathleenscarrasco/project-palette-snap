@@ -15,11 +15,12 @@ const organization = await readFile("src/lib/dumpdeck/pipeline/organization.ts",
 const taglines = await readFile("src/lib/dumpdeck/analyzing-taglines.ts", "utf8");
 
 check(
-  "completed scans render canonical Scanned X of Y label",
-  app.includes(
-    "canStartSorting\n    ? `Scanned ${scanState.totalCount} of ${scanState.totalCount} photo",
-  ),
-  "prevents stale Scanned 0/N headings",
+  "large scan heading uses only canonical quick-scan count",
+  app.includes("${scanState.scannedCount} of ${scanState.totalCount} photo") &&
+    app.includes("} scanned`") &&
+    !app.includes("`Scanning ${scanState.scannedCount}") &&
+    !app.includes("`Scanned ${scanState.totalCount}"),
+  "for 75 quick-scanned photos and 10 deep analyses, heading stays 75 of 75 photos scanned",
 );
 check(
   "duplicate review initializes from suggested best",
