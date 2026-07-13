@@ -5,9 +5,9 @@ export type DuplicateSensitivity = "strict" | "balanced" | "aggressive";
 
 const DUPLICATE_COSINE_THRESHOLD = 0.96;
 const NEAR_DUPLICATE_SCORE_THRESHOLD: Record<DuplicateSensitivity, number> = {
-  strict: 0.94,
-  balanced: 0.91,
-  aggressive: 0.87,
+  strict: 0.96,
+  balanced: 0.93,
+  aggressive: 0.9,
 };
 
 export type DuplicateClusterInput = {
@@ -49,13 +49,17 @@ export function assignDuplicateClusters(
       const metadata = duplicateConfidence(items[i].photo, items[j].photo);
       const embeddingSimilarity = a && b && a.length === b.length ? cosineSimilarity(a, b) : 0;
       const visuallyNearIdentical =
-        metadata.pixel >= 0.9 && metadata.composition >= 0.88 && metadata.crop >= 0.92;
+        metadata.pixel >= 0.92 && metadata.composition >= 0.9 && metadata.crop >= 0.94;
+      const strongPixelComposition =
+        metadata.pixel >= 0.88 && metadata.composition >= 0.86 && metadata.crop >= 0.9;
+      const strongContext =
+        metadata.scene >= 0.7 &&
+        metadata.people >= 0.76 &&
+        (metadata.objects >= 0.45 || metadata.subject >= 0.72);
       const sameBurstMoment =
-        timeDistance(items[i].photo, items[j].photo) <= 1000 * 60 * 10 &&
-        metadata.pixel >= 0.82 &&
-        metadata.composition >= 0.75 &&
-        metadata.people >= 0.7 &&
-        metadata.scene >= 0.62;
+        timeDistance(items[i].photo, items[j].photo) <= 1000 * 60 * 4 &&
+        strongPixelComposition &&
+        strongContext;
       if (
         isExactDuplicate(items[i].photo, items[j].photo) ||
         (visuallyNearIdentical &&
@@ -129,7 +133,21 @@ export function buildDuplicateGroupsForPhotos(photos: Photo[]): DuplicateSimilar
   });
 
   return Array.from(groups.values()).map((group, index) => {
-    const sorted = [...group].sort((a, b) => b.overall - a.overall);
+    const sorted = [...group].sort(compareDuplicateBest);
+    const best = sorted[0];
+    if (group.length > 1) {
+      console.debug("[dumpdeck] duplicate best selection", {
+        groupId: index,
+        selectedId: best?.id,
+        selectedName: best?.name,
+        candidates: sorted.map((photo) => ({
+          id: photo.id,
+          name: photo.name,
+          score: duplicateBestScore(photo),
+          bestSelectionReason: duplicateBestReasons(photo),
+        })),
+      });
+    }
     return {
       id: index,
       kind: group.every((photo) => isExactDuplicate(group[0], photo)) ? "exact" : "near-dup",
@@ -178,12 +196,13 @@ function duplicateConfidence(a: Photo, b: Photo) {
   const pixel = pixelSimilarity(a, b);
   const crop = cropSimilarity(a, b);
   const composition = compositionSimilarity(a, b);
-  const sameVisualFrame = pixel >= 0.9 && composition >= 0.88 && aspect >= 0.92;
-  const supporting = scene * 0.1 + objects * 0.08 + people * 0.09 + crop * 0.12;
+  const subject = subjectConsistency(a, b);
+  const sameVisualFrame = pixel >= 0.92 && composition >= 0.9 && aspect >= 0.94;
+  const supporting = scene * 0.08 + objects * 0.07 + people * 0.08 + subject * 0.09 + crop * 0.1;
   const score = sameVisualFrame
-    ? pixel * 0.42 + composition * 0.26 + aspect * 0.13 + supporting
-    : pixel * 0.35 + composition * 0.2 + supporting * 0.45;
-  return { score: clamp(score), scene, objects, people, aspect, pixel, crop, composition };
+    ? pixel * 0.43 + composition * 0.27 + aspect * 0.14 + supporting
+    : pixel * 0.38 + composition * 0.23 + crop * 0.16 + supporting * 0.23;
+  return { score: clamp(score), scene, objects, people, subject, aspect, pixel, crop, composition };
 }
 
 function sceneSimilarity(a: Photo, b: Photo) {
@@ -216,6 +235,41 @@ function peopleSimilarity(a: Photo, b: Photo) {
   const count = 1 - Math.min(1, Math.abs(aPeople - bPeople) / 4);
   const bothPeople = aPeople > 0 && bPeople > 0 ? 0.25 : 0;
   return clamp(count * 0.75 + bothPeople);
+}
+
+function subjectConsistency(a: Photo, b: Photo) {
+  const aObjects = meaningfulSubjectSet(a);
+  const bObjects = meaningfulSubjectSet(b);
+  if (!aObjects.size && !bObjects.size) {
+    const aPeople = a.faceAnalysis?.numberOfFaces ?? a.peopleCount;
+    const bPeople = b.faceAnalysis?.numberOfFaces ?? b.peopleCount;
+    return aPeople === bPeople && aPeople > 0 ? 0.72 : 0.35;
+  }
+  const shared = [...aObjects].filter((label) => bObjects.has(label)).length;
+  const total = new Set([...aObjects, ...bObjects]).size || 1;
+  return shared / total;
+}
+
+function meaningfulSubjectSet(photo: Photo) {
+  return new Set(
+    (photo.detectedObjects ?? [])
+      .filter((object) => object.confidence >= 0.5)
+      .map((object) => object.labelNormalized.toLowerCase())
+      .filter(
+        (label) =>
+          ![
+            "water",
+            "sky",
+            "outdoor",
+            "indoor",
+            "nature",
+            "landscape",
+            "person",
+            "people",
+            "text",
+          ].some((generic) => label.includes(generic)),
+      ),
+  );
 }
 
 function aspectSimilarity(a: Photo, b: Photo) {
@@ -281,6 +335,7 @@ function duplicateReason(photos: Photo[]) {
   if (sim.crop >= 0.92) reasons.push("same crop/aspect");
   if (sim.people >= 0.75) reasons.push("same face count/layout");
   if (sim.objects >= 0.55) reasons.push("same main objects");
+  if (sim.subject >= 0.72) reasons.push("same primary subject");
   if (timeSpanMinutes(photos) <= 10) reasons.push("captured within the same burst");
   return reasons.length
     ? `Grouped by ${reasons.join(", ")}.`
@@ -312,7 +367,66 @@ function groupConfidence(photos: Photo[]) {
 }
 
 function bestDuplicatePhoto(photos: Photo[]) {
-  return [...photos].sort((a, b) => b.overall - a.overall)[0];
+  return [...photos].sort(compareDuplicateBest)[0];
+}
+
+function compareDuplicateBest(a: Photo, b: Photo) {
+  const diff = duplicateBestScore(b) - duplicateBestScore(a);
+  if (Math.abs(diff) > 0.0001) return diff;
+  return stablePhotoKey(a).localeCompare(stablePhotoKey(b));
+}
+
+function stablePhotoKey(photo: Photo) {
+  return photo.fingerprint ?? photo.id ?? photo.name;
+}
+
+function duplicateBestScore(photo: Photo) {
+  const quality = photo.imageQuality?.overallTechnicalQuality ?? photo.scores.quality * 100;
+  const aesthetic = photo.aestheticScore?.score ?? photo.scores.aesthetic * 10;
+  const sharpness = photo.imageQuality?.sharpness ?? photo.analysis.sharpness * 100;
+  const exposure = photo.imageQuality?.exposure ?? exposureScore(photo);
+  const blurPenalty = photo.imageQuality?.motionBlur ?? (1 - photo.analysis.sharpness) * 100;
+  const people = photo.faceAnalysis?.numberOfFaces ?? photo.peopleCount;
+  const faceQuality = people > 0 ? faceBestScore(photo) : 62;
+  const composition = photo.ranking?.scoreBreakdown?.aesthetic ?? photo.scores.aesthetic * 100;
+  return (
+    quality * 0.28 +
+    sharpness * 0.2 +
+    exposure * 0.14 +
+    aesthetic * 6 * 0.14 +
+    faceQuality * (people > 0 ? 0.14 : 0.04) +
+    composition * 0.1 -
+    blurPenalty * 0.12
+  );
+}
+
+function exposureScore(photo: Photo) {
+  const brightness = photo.analysis.brightness;
+  return clamp(1 - Math.abs(brightness - 0.5) * 1.7) * 100;
+}
+
+function faceBestScore(photo: Photo) {
+  const faces = photo.faceAnalysis?.faces ?? [];
+  if (!faces.length) return photo.peopleCount > 0 ? 60 : 50;
+  const values = faces.map((face) => {
+    const smile = face.smiling ? 12 : 0;
+    const eyes = face.eyesOpen ? 16 : -8;
+    const visibility =
+      face.faceVisibility === "clear" ? 18 : face.faceVisibility === "partial" ? 4 : -10;
+    return 56 + smile + eyes + visibility;
+  });
+  return Math.max(...values);
+}
+
+function duplicateBestReasons(photo: Photo) {
+  const reasons: string[] = [];
+  if ((photo.imageQuality?.sharpness ?? photo.analysis.sharpness * 100) >= 68)
+    reasons.push("higher sharpness");
+  if ((photo.imageQuality?.exposure ?? exposureScore(photo)) >= 68) reasons.push("better exposure");
+  if (faceBestScore(photo) >= 78) reasons.push("stronger expression/face clarity");
+  if ((photo.aestheticScore?.score ?? photo.scores.aesthetic * 10) >= 7)
+    reasons.push("stronger composition");
+  return reasons.length ? reasons : ["highest duplicate quality score"];
 }
 
 function hammingDistance(a: string, b: string) {

@@ -35,6 +35,7 @@ type SemanticMetadata = {
   isPetDominant: boolean;
   isFoodConfident: boolean;
   isOutfitConfident: boolean;
+  isSelfieConfident: boolean;
 };
 
 type PairSignal = {
@@ -47,9 +48,9 @@ type TitleCandidate = {
   confidence: number;
 };
 
-const EVENT_CONFIDENCE_THRESHOLD = 0.48;
-const EVENT_STRONG_CONFIDENCE_THRESHOLD = 0.62;
-const COLLECTION_CONFIDENCE_THRESHOLD = 0.42;
+const EVENT_CONFIDENCE_THRESHOLD = 0.6;
+const EVENT_STRONG_CONFIDENCE_THRESHOLD = 0.74;
+const COLLECTION_CONFIDENCE_THRESHOLD = 0.66;
 const GENERIC_TITLES = new Set([
   "photo moment",
   "memory",
@@ -128,7 +129,9 @@ function buildEventGroups(photos: Photo[], metadata: Map<string, SemanticMetadat
     }
   }
 
-  return groups.map((group, index) => {
+  const conservativeGroups = splitWeakGroups(groups, metadata);
+
+  return conservativeGroups.map((group, index) => {
     const photos = [...group].sort((a, b) => rankingScore(b) - rankingScore(a));
     const cover = photos[0];
     const confidence = groupConfidence(photos, metadata, eventPairSignal);
@@ -188,6 +191,60 @@ function buildCollections(
       photos,
     };
   });
+}
+
+function splitWeakGroups(groups: Photo[][], metadata: Map<string, SemanticMetadata>): Photo[][] {
+  const out: Photo[][] = [];
+  for (const group of groups) {
+    if (group.length <= 1) {
+      out.push(group);
+      continue;
+    }
+    const confidence = groupConfidence(group, metadata, eventPairSignal);
+    const cohesion = groupCohesion(group, metadata);
+    const suspiciousLargeGroup =
+      group.length > 10 && (confidence < 0.78 || cohesion.visualP25 < 0.78);
+    const weakGroup =
+      confidence < EVENT_CONFIDENCE_THRESHOLD ||
+      cohesion.visualP25 < 0.62 ||
+      cohesion.signalP25 < 0.56 ||
+      cohesion.locationConsistency < 0.55 ||
+      cohesion.subjectConsistency < 0.42;
+    if (weakGroup || suspiciousLargeGroup) {
+      console.debug("[dumpdeck] split weak organization group", {
+        memberIds: group.map((photo) => photo.id),
+        memberNames: group.map((photo) => photo.name),
+        confidence,
+        cohesion,
+        splitDecision: "standalone",
+      });
+      group.forEach((photo) => out.push([photo]));
+      continue;
+    }
+    out.push(group);
+  }
+  return out;
+}
+
+function groupCohesion(photos: Photo[], metadata: Map<string, SemanticMetadata>) {
+  const visual = pairScores(photos, visualSimilarity);
+  const signals = pairScores(photos, (a, b) => eventPairSignal(a, b, metadata).score);
+  const locations = locationCounts(photos, metadata);
+  const subjects = subjectCounts(photos, metadata);
+  return {
+    visualMean: average(visual),
+    visualP25: percentile(visual, 0.25),
+    signalMean: average(signals),
+    signalP25: percentile(signals, 0.25),
+    locationConsistency: topEntry(locations)?.[1]
+      ? topEntry(locations)![1] / Math.max(1, photos.length)
+      : 0,
+    subjectConsistency: topEntry(subjects)?.[1]
+      ? topEntry(subjects)![1] / Math.max(1, photos.length)
+      : 0,
+    peopleCountDistribution: peopleCountDistribution(photos, metadata),
+    semanticLabelDistribution: Object.fromEntries(subjects),
+  };
 }
 
 function eventAffinity(
@@ -253,6 +310,22 @@ function eventPairSignal(a: Photo, b: Photo, metadata: Map<string, SemanticMetad
   score += lighting * 0.05;
   if (lighting >= 0.78) reasons.push("similar lighting");
 
+  const strongSignalCount = [
+    time.score >= 0.68,
+    visual >= 0.82,
+    location >= 0.8,
+    subjects >= 0.62,
+    people >= 0.85 && Math.max(aMeta.faceCount, bMeta.faceCount) > 0,
+    color >= 0.8 && lighting >= 0.78,
+  ].filter(Boolean).length;
+  const hasVisualAnchor = visual >= 0.82 || a.duplicateClusterId === b.duplicateClusterId;
+  const hasTimeVisualSupport =
+    time.score >= 0.88 && visual >= 0.72 && (subjects >= 0.55 || location >= 0.8);
+
+  if (strongSignalCount < 2 || (!hasVisualAnchor && !hasTimeVisualSupport)) {
+    return { score: Math.min(clamp(score), 0.44), reasons: reasons.slice(0, 5) };
+  }
+
   return { score: clamp(score), reasons: reasons.slice(0, 5) };
 }
 
@@ -263,7 +336,15 @@ function collectionAffinity(
 ) {
   const targetPhotos = event.photos;
   const scores = group.map((candidate) => {
-    const timeClose = eventTimeDistance(candidate, event) <= 1000 * 60 * 60 * 24 * 7 ? 0.28 : 0;
+    const distance = eventTimeDistance(candidate, event);
+    const timeClose =
+      distance <= 1000 * 60 * 15
+        ? 0.24
+        : distance <= 1000 * 60 * 90
+          ? 0.12
+          : distance <= 1000 * 60 * 60 * 8
+            ? 0.04
+            : 0;
     const location = jaccard(
       new Set(
         candidate.photos.map((photo) => metadata.get(photo.id)?.locationType).filter(Boolean),
@@ -274,9 +355,11 @@ function collectionAffinity(
       eventSubjectSet(candidate, metadata),
       eventSubjectSet(event, metadata),
     );
-    const travel = isTravelEvent(candidate, metadata) && isTravelEvent(event, metadata) ? 0.16 : 0;
+    const travel = isTravelEvent(candidate, metadata) && isTravelEvent(event, metadata) ? 0.04 : 0;
     const visual = averageCrossScore(candidate.photos, targetPhotos, visualSimilarity);
-    return timeClose + location * 0.28 + subjects * 0.18 + travel + visual * 0.1;
+    const compatible = visual >= 0.72 || timeClose >= 0.12 || (location >= 0.8 && subjects >= 0.45);
+    if (!compatible) return Math.min(0.38, visual * 0.18 + location * 0.12 + subjects * 0.08);
+    return timeClose + location * 0.24 + subjects * 0.2 + travel + visual * 0.22;
   });
   return scores.length ? Math.max(...scores) : 0;
 }
@@ -289,7 +372,13 @@ function eventTitle(photos: Photo[], metadata: Map<string, SemanticMetadata>): T
   const hasPeople = photos.some((photo) => (metadata.get(photo.id)?.faceCount ?? 0) > 0);
   const faceCount = maxFaceCount(photos, metadata);
   const peopleDescriptor =
-    faceCount >= 3 ? "Group Photos" : faceCount === 2 ? "Couple Photos" : "Portraits";
+    faceCount >= 4
+      ? "Group Photos"
+      : faceCount === 3
+        ? "Three-Person Photos"
+        : faceCount === 2
+          ? "Two-Person Photos"
+          : "Solo Portraits";
 
   if (topSubject?.[0] === "cats" || topSubject?.[0] === "dogs" || topSubject?.[0] === "pets") {
     return { title: `${titleCase(topSubject[0])}`, confidence: topSubject[1] / photos.length };
@@ -305,7 +394,7 @@ function eventTitle(photos: Photo[], metadata: Map<string, SemanticMetadata>): T
   }
   if (topLocation?.[0] === "restaurant") {
     return {
-      title: hasPeople ? "Friends at Dinner" : "Restaurant Details",
+      title: hasPeople ? "Dinner Photos" : "Restaurant Details",
       confidence: 0.78,
     };
   }
@@ -357,7 +446,7 @@ function collectionTitle(
   const subjects = subjectCounts(photos, metadata);
   const topLocation = topEntry(locations);
   const topSubject = topEntry(subjects);
-  if (isTripCollection(events, metadata)) {
+  if (isTripCollection(events, metadata) && collectionConfidence(events, metadata) >= 0.74) {
     if (topLocation?.[0] === "beach" || topLocation?.[0] === "ocean") {
       return { title: "Beach Trip", confidence: 0.82 };
     }
@@ -388,11 +477,17 @@ function validateTitle(
   const lower = title.toLowerCase();
   const subjects = subjectCounts(photos, metadata);
   const topSubject = topEntry(subjects);
-  const hasFoodEvidence = photos.some((photo) => metadata.get(photo.id)?.isFoodConfident);
-  const hasOutfitEvidence = photos.some((photo) => metadata.get(photo.id)?.isOutfitConfident);
-  const petDominant =
-    photos.filter((photo) => metadata.get(photo.id)?.isPetDominant).length >=
-    Math.ceil(photos.length * 0.45);
+  const hasFoodEvidence = evidenceRatio(photos, metadata, (meta) => meta.isFoodConfident) >= 0.7;
+  const hasOutfitEvidence =
+    evidenceRatio(photos, metadata, (meta) => meta.isOutfitConfident) >= 0.75;
+  const hasSelfieEvidence =
+    evidenceRatio(photos, metadata, (meta) => meta.isSelfieConfident) >= 0.75;
+  const petDominant = evidenceRatio(photos, metadata, (meta) => meta.isPetDominant) >= 0.7;
+  const beachEvidence =
+    evidenceRatio(photos, metadata, (meta) => ["beach", "ocean"].includes(meta.locationType)) >=
+    0.7;
+  const architectureEvidence =
+    evidenceRatio(photos, metadata, (meta) => meta.primarySubjects.has("architecture")) >= 0.65;
 
   if (
     /food|dinner|drink|brunch|restaurant/.test(lower) &&
@@ -403,6 +498,18 @@ function validateTitle(
   }
   if (/outfit|fashion|clothing/.test(lower) && !hasOutfitEvidence) {
     title = petDominant ? petTitle(photos, metadata) : broaderGroundedTitle(photos, metadata);
+  }
+  if (/selfie/.test(lower) && !hasSelfieEvidence) {
+    title = broaderGroundedTitle(photos, metadata);
+  }
+  if (/couple|boyfriend|girlfriend|husband|wife|family|sibling|mom|dad/i.test(title)) {
+    title = neutralPeopleTitle(photos, metadata);
+  }
+  if (/beach|ocean/.test(lower) && !beachEvidence) {
+    title = broaderGroundedTitle(photos, metadata);
+  }
+  if (/architecture|building|old town/.test(lower) && !architectureEvidence && photos.length > 1) {
+    title = broaderGroundedTitle(photos, metadata);
   }
   if (petDominant && !/pet|cat|dog/.test(title.toLowerCase())) title = petTitle(photos, metadata);
   if (candidate.confidence < 0.5 || GENERIC_TITLES.has(title.toLowerCase())) {
@@ -467,7 +574,7 @@ function eventExplanation(photos: Photo[], metadata: Map<string, SemanticMetadat
     reasons.push(`same ${maxFaceCount(photos, metadata)} face count`);
   }
   if (average(objectPairs) >= 0.65) reasons.push("matching subjects/objects");
-  return reasons.length ? reasons : ["shared visual and semantic context"];
+  return reasons.length ? reasons : ["specific visual and timing signals"];
 }
 
 function collectionExplanation(events: EventGroup[], metadata: Map<string, SemanticMetadata>) {
@@ -478,7 +585,7 @@ function collectionExplanation(events: EventGroup[], metadata: Map<string, Seman
   if (isTripCollection(events, metadata)) reasons.push("travel scenes close together");
   const subject = topEntry(subjectCounts(photos, metadata));
   if (subject && subject[0] !== "unknown") reasons.push(`recurring ${prettySubject(subject[0])}`);
-  return reasons.length ? reasons : ["related camera-roll context"];
+  return reasons.length ? reasons : ["specific event context"];
 }
 
 function buildSemanticMetadata(photo: Photo): SemanticMetadata {
@@ -500,7 +607,9 @@ function buildSemanticMetadata(photo: Photo): SemanticMetadata {
   const isOutfitConfident =
     !isPetDominant &&
     (photo.tags.includes("Outfit") || photo.photoType === "outfit") &&
-    [...objects].some((object) => OUTFIT_OBJECTS.has(object));
+    [...objects].some((object) => OUTFIT_OBJECTS.has(object)) &&
+    hasProminentPersonFraming(photo);
+  const isSelfieConfident = hasSelfieFraming(photo, faceCount);
   return {
     photo,
     locationType: location.type,
@@ -516,6 +625,7 @@ function buildSemanticMetadata(photo: Photo): SemanticMetadata {
     isPetDominant,
     isFoodConfident,
     isOutfitConfident,
+    isSelfieConfident,
   };
 }
 
@@ -560,8 +670,8 @@ function inferLocationType(photo: Photo, labels: Set<string>, objects: Set<strin
 function inferPrimarySubjects(photo: Photo, labels: Set<string>, objects: Set<string>) {
   const subjects = new Set<string>();
   const faceCount = photo.faceAnalysis?.numberOfFaces ?? photo.peopleCount ?? 0;
-  if (faceCount >= 3) subjects.add("friends");
-  else if (faceCount === 2) subjects.add("couple");
+  if (faceCount >= 3) subjects.add("group_people");
+  else if (faceCount === 2) subjects.add("two_people");
   else if (faceCount === 1) subjects.add("person");
   if (objects.has("cats")) subjects.add("cats");
   if (objects.has("dogs")) subjects.add("dogs");
@@ -579,12 +689,16 @@ function inferPrimarySubjects(photo: Photo, labels: Set<string>, objects: Set<st
     !subjects.has("cats") &&
     !subjects.has("dogs") &&
     (photo.tags.includes("Outfit") || photo.photoType === "outfit") &&
-    [...objects].some((object) => OUTFIT_OBJECTS.has(object))
+    [...objects].some((object) => OUTFIT_OBJECTS.has(object)) &&
+    hasProminentPersonFraming(photo)
   ) {
     subjects.add("outfit");
   }
   meaningfulObjects(photo).forEach((object) => subjects.add(normalizeSubject(object)));
-  if (!subjects.size) subjects.add(photo.photoType === "random" ? "unknown" : photo.photoType);
+  if (!subjects.size) {
+    if (photo.photoType === "selfie" && hasSelfieFraming(photo, faceCount)) subjects.add("selfie");
+    else subjects.add(photo.photoType === "random" ? "unknown" : photo.photoType);
+  }
   return subjects;
 }
 
@@ -671,6 +785,28 @@ function maxFaceCount(photos: Photo[], metadata: Map<string, SemanticMetadata>) 
   return Math.max(0, ...photos.map((photo) => metadata.get(photo.id)?.faceCount ?? 0));
 }
 
+function evidenceRatio(
+  photos: Photo[],
+  metadata: Map<string, SemanticMetadata>,
+  predicate: (metadata: SemanticMetadata) => boolean,
+) {
+  if (!photos.length) return 0;
+  const matches = photos.filter((photo) => {
+    const meta = metadata.get(photo.id);
+    return meta ? predicate(meta) : false;
+  }).length;
+  return matches / photos.length;
+}
+
+function neutralPeopleTitle(photos: Photo[], metadata: Map<string, SemanticMetadata>) {
+  const faceCount = maxFaceCount(photos, metadata);
+  if (faceCount >= 4) return "Group Photos";
+  if (faceCount === 3) return "Three-Person Photos";
+  if (faceCount === 2) return "Two-Person Photos";
+  if (faceCount === 1) return "Solo Portraits";
+  return "People Photos";
+}
+
 function hasLocation(photos: Photo[], metadata: Map<string, SemanticMetadata>, location: string) {
   return photos.some((photo) => metadata.get(photo.id)?.locationType === location);
 }
@@ -698,7 +834,42 @@ function isSunsetEvent(photos: Photo[]) {
 function commonLocation(photos: Photo[], metadata: Map<string, SemanticMetadata>) {
   const top = topEntry(locationCounts(photos, metadata));
   if (!top) return undefined;
-  return top[1] >= Math.ceil(photos.length * 0.45) ? top[0] : undefined;
+  return top[1] >= Math.ceil(photos.length * 0.7) ? top[0] : undefined;
+}
+
+function hasProminentPersonFraming(photo: Photo) {
+  const boxes = photo.analysis.peopleBoxes?.length
+    ? photo.analysis.peopleBoxes
+    : (photo.analysis.faceBoxes ?? []);
+  if (!boxes.length) return false;
+  const imageArea = Math.max(1, photo.width * photo.height);
+  const largestArea = Math.max(...boxes.map((box) => box.w * box.h));
+  const largestRatio = largestArea / imageArea;
+  const portraitish = photo.height >= photo.width * 1.05;
+  return largestRatio >= 0.08 || (portraitish && largestRatio >= 0.045);
+}
+
+function hasSelfieFraming(photo: Photo, faceCount: number) {
+  if (faceCount <= 0) return false;
+  const boxes = photo.analysis.faceBoxes ?? [];
+  if (!boxes.length) return photo.photoType === "selfie" && photo.photoTypeConfidence >= 0.72;
+  const imageArea = Math.max(1, photo.width * photo.height);
+  const faceArea = boxes.reduce((sum, box) => sum + box.w * box.h, 0) / imageArea;
+  const closeLargest = Math.max(...boxes.map((box) => box.w * box.h)) / imageArea;
+  return (
+    (photo.photoType === "selfie" && photo.photoTypeConfidence >= 0.65 && faceArea >= 0.08) ||
+    faceArea >= 0.16 ||
+    closeLargest >= 0.12
+  );
+}
+
+function peopleCountDistribution(photos: Photo[], metadata: Map<string, SemanticMetadata>) {
+  const counts = new Map<string, number>();
+  photos.forEach((photo) => {
+    const count = String(metadata.get(photo.id)?.faceCount ?? 0);
+    counts.set(count, (counts.get(count) ?? 0) + 1);
+  });
+  return Object.fromEntries(counts);
 }
 
 function eventSubjectSet(event: EventGroup, metadata: Map<string, SemanticMetadata>) {
@@ -947,6 +1118,16 @@ function timeRange(photos: Photo[]) {
 function average(values: number[]) {
   if (!values.length) return 0;
   return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function percentile(values: number[], percentileValue: number) {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = Math.min(
+    sorted.length - 1,
+    Math.max(0, Math.floor((sorted.length - 1) * percentileValue)),
+  );
+  return sorted[index];
 }
 
 function rankingScore(photo: Photo) {

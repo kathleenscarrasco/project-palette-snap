@@ -1764,18 +1764,17 @@ function AnalyzeStage() {
   const canStartSorting =
     quickScanComplete && phase !== "loading" && phase !== "preparing" && scanState.usableCount >= 4;
 
-  const progressLabel =
-    phase === "preparing"
-      ? "Preparing your collection…"
-      : scanState.complete
-        ? `Scanned ${scanState.totalCount} of ${scanState.totalCount} photo${scanState.totalCount === 1 ? "" : "s"}`
-        : scanState.totalCount > 0
-          ? `Scanned ${scanState.scannedCount}/${scanState.totalCount} photos`
-          : failedRows.length
-            ? `${failedRows.length} photo${failedRows.length === 1 ? "" : "s"} couldn't be scanned`
-            : retryingCount > 0
-              ? "Taking a little longer on the best candidates…"
-              : "Preparing analysis…";
+  const progressLabel = scanState.complete
+    ? `${scanState.totalCount} photo${scanState.totalCount === 1 ? "" : "s"} scanned`
+    : scanState.totalCount > 0
+      ? `Scanning ${scanState.scannedCount} of ${scanState.totalCount} photo${scanState.totalCount === 1 ? "" : "s"}`
+      : failedRows.length
+        ? `${failedRows.length} photo${failedRows.length === 1 ? "" : "s"} couldn't be scanned`
+        : phase === "preparing"
+          ? "Preparing your collection…"
+          : retryingCount > 0
+            ? "Taking a little longer on the best candidates…"
+            : "Preparing analysis…";
   const scanHelpText = scanState.totalCount > 0 ? scanTooltipSummary(scanState) : "";
   const taglinePhotos = useMemo(
     () => rows.map((row) => row.photo).filter((photo): photo is Photo => !!photo),
@@ -2825,7 +2824,7 @@ function SimilarStage() {
   const [picked, setPicked] = useState<Record<number, Set<string>>>(() => {
     const out: Record<number, Set<string>> = {};
     similarGroups.forEach((g) => {
-      out[g.id] = new Set([g.photos[0].id]);
+      out[g.id] = new Set([g.suggestedBestPhotoId || g.photos[0].id]);
     });
     return out;
   });
@@ -2859,7 +2858,10 @@ function SimilarStage() {
   function keepAiPick(groupId: number) {
     const g = similarGroups.find((x) => x.id === groupId);
     if (!g) return;
-    setPicked((cur) => ({ ...cur, [groupId]: new Set([g.photos[0].id]) }));
+    setPicked((cur) => ({
+      ...cur,
+      [groupId]: new Set([g.suggestedBestPhotoId || g.photos[0].id]),
+    }));
     toast.success("Keeping AI's pick for this group");
   }
 
@@ -2872,7 +2874,9 @@ function SimilarStage() {
 
   function keepAllAi() {
     const next: Record<number, Set<string>> = {};
-    similarGroups.forEach((g) => (next[g.id] = new Set([g.photos[0].id])));
+    similarGroups.forEach(
+      (g) => (next[g.id] = new Set([g.suggestedBestPhotoId || g.photos[0].id])),
+    );
     setPicked(next);
     toast.success("Applied AI picks to every group");
   }
@@ -3010,7 +3014,7 @@ function SimilarStage() {
               <div className="grid grid-cols-3 gap-1.5">
                 {g.photos.map((p, idx) => {
                   const isPicked = sel.has(p.id);
-                  const isAiPick = idx === 0;
+                  const isAiPick = p.id === g.suggestedBestPhotoId;
                   const photoBadges = badges[p.id] ?? [];
                   return (
                     <div

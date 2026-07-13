@@ -10,7 +10,8 @@
     "preview": "node scripts/preview-netlify.mjs",
     "lint": "eslint .",
     "format": "prettier --write .",
-    "check:supabase": "node scripts/check-supabase-readiness.mjs"
+    "check:supabase": "node scripts/check-supabase-readiness.mjs",
+    "check:ai-quality": "node scripts/check-fotofairy-ai-quality.mjs"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
