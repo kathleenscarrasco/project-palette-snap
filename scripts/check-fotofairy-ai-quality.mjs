@@ -16,7 +16,7 @@ const organization = await readFile("src/lib/dumpdeck/pipeline/organization.ts",
 check(
   "completed scans render canonical Scanned X of Y label",
   app.includes(
-    "scanState.complete\n    ? `Scanned ${scanState.scannedCount} of ${scanState.totalCount} photo",
+    "canStartSorting\n    ? `Scanned ${scanState.totalCount} of ${scanState.totalCount} photo",
   ),
   "prevents stale Scanned 0/N headings",
 );
