@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useMemo, useReducer, type ReactNode } from "react";
 import type { CollectionTitleMetadata, DuplicateDecisionDraft } from "./drafts";
-import type { Photo, RemovedPhoto, Settings, Stage } from "./types";
+import type { Photo, PhotoFraming, RemovedPhoto, Settings, Stage } from "./types";
 
 type State = {
   stage: Stage;
@@ -25,6 +25,7 @@ type Action =
   | { type: "setKept"; photos: Photo[] }
   | { type: "setFinalOrder"; photos: Photo[] }
   | { type: "updatePhotoSources"; photos: Photo[] }
+  | { type: "updatePhotoFraming"; id: string; framing: PhotoFraming | null }
   | { type: "addRemoved"; entries: RemovedPhoto[] }
   | { type: "setDuplicateDecisions"; decisions: DuplicateDecisionDraft[] }
   | { type: "setPinnedCover"; id: string | null }
@@ -84,6 +85,26 @@ function reducer(state: State, action: Action): State {
     case "updatePhotoSources": {
       const replacements = new Map(action.photos.map((photo) => [photo.id, photo] as const));
       const replacePhoto = (photo: Photo) => replacements.get(photo.id) ?? photo;
+      return {
+        ...state,
+        photos: state.photos.map(replacePhoto),
+        shortlist: state.shortlist.map(replacePhoto),
+        kept: state.kept.map(replacePhoto),
+        finalOrder: state.finalOrder.map(replacePhoto),
+        removed: state.removed.map((entry) => ({
+          ...entry,
+          photo: replacePhoto(entry.photo),
+        })),
+      };
+    }
+    case "updatePhotoFraming": {
+      const replacePhoto = (photo: Photo) =>
+        photo.id === action.id
+          ? {
+              ...photo,
+              framing: action.framing ?? undefined,
+            }
+          : photo;
       return {
         ...state,
         photos: state.photos.map(replacePhoto),

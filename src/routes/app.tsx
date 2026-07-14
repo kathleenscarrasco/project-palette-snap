@@ -7,6 +7,7 @@ import {
   useRef,
   useState,
   type Dispatch,
+  type PointerEvent as ReactPointerEvent,
   type SetStateAction,
 } from "react";
 import {
@@ -23,6 +24,7 @@ import {
   Palmtree,
   Pin,
   RotateCcw,
+  RotateCw,
   Save,
   Shuffle,
   Sparkles,
@@ -32,6 +34,9 @@ import {
   UtensilsCrossed,
   Wand2,
   X,
+  ZoomIn,
+  ZoomOut,
+  Crop,
 } from "lucide-react";
 
 import JSZip from "jszip";
@@ -73,6 +78,7 @@ import {
 import { persistProjectUploads } from "@/lib/dumpdeck/storage";
 import type {
   Photo,
+  PhotoFraming,
   PostFormat,
   RemovedPhoto,
   Settings,
@@ -171,6 +177,13 @@ function instagramShareEnabled() {
   if (typeof window === "undefined") return false;
   const params = new URLSearchParams(window.location.search);
   return params.get("instagramShare") !== "0";
+}
+
+function finalFramingEditorEnabled() {
+  if (import.meta.env.VITE_FINAL_FRAMING_EDITOR_ENABLED === "false") return false;
+  if (import.meta.env.VITE_FINAL_FRAMING_EDITOR_ENABLED === "true") return true;
+  if (typeof window === "undefined") return false;
+  return new URLSearchParams(window.location.search).get("framingEditor") !== "0";
 }
 
 function safeSessionItem(key: string) {
@@ -425,6 +438,7 @@ function Shell() {
         photo.id,
         photo.previewStoragePath ?? photo.sourceMetadata?.previewStoragePath ?? "",
         photo.originalStoragePath ?? photo.sourceMetadata?.originalStoragePath ?? "",
+        photo.framing ?? null,
       ]),
       shortlist: state.shortlist.map((photo) => photo.id),
       kept: state.kept.map((photo) => photo.id),
@@ -5103,10 +5117,389 @@ function RemovedCategories({
   );
 }
 
+/* ───────────── Framing ───────────── */
+function normalizedRotation(value: number): PhotoFraming["rotationDegrees"] {
+  const normalized = (((Math.round(value / 90) * 90) % 360) + 360) % 360;
+  return (
+    normalized === 0 || normalized === 90 || normalized === 180 || normalized === 270
+      ? normalized
+      : 0
+  ) as PhotoFraming["rotationDegrees"];
+}
+
+function defaultFraming(): PhotoFraming {
+  return {
+    rotationDegrees: 0,
+    cropAspectRatio: "original",
+    zoom: 1,
+    offsetX: 0,
+    offsetY: 0,
+    fitMode: "cover",
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function framingFor(photo: Photo): PhotoFraming {
+  return {
+    ...defaultFraming(),
+    ...photo.framing,
+    rotationDegrees: normalizedRotation(photo.framing?.rotationDegrees ?? 0),
+    zoom: Math.max(0.5, Math.min(4, photo.framing?.zoom ?? 1)),
+    offsetX: Math.max(-1, Math.min(1, photo.framing?.offsetX ?? 0)),
+    offsetY: Math.max(-1, Math.min(1, photo.framing?.offsetY ?? 0)),
+  };
+}
+
+function aspectNumberForFraming(
+  photo: Photo,
+  framing: PhotoFraming,
+  collectionFormat?: PostFormat,
+) {
+  if (framing.cropAspectRatio === "4:5") return 4 / 5;
+  if (framing.cropAspectRatio === "1:1") return 1;
+  if (framing.cropAspectRatio === "landscape") return 1.91;
+  if (framing.cropAspectRatio === "match") {
+    return (
+      aspectForPostFormat(collectionFormat).width / aspectForPostFormat(collectionFormat).height
+    );
+  }
+  const rotated = framing.rotationDegrees === 90 || framing.rotationDegrees === 270;
+  const width = rotated ? photo.height : photo.width;
+  const height = rotated ? photo.width : photo.height;
+  return Math.max(0.1, width / Math.max(1, height));
+}
+
+function aspectCssForFraming(photo: Photo, framing: PhotoFraming, collectionFormat?: PostFormat) {
+  const ratio = aspectNumberForFraming(photo, framing, collectionFormat);
+  return `${ratio} / 1`;
+}
+
+function FramedPhotoPreview({
+  photo,
+  collectionFormat,
+  className = "",
+  imgClassName = "",
+}: {
+  photo: Photo;
+  collectionFormat?: PostFormat;
+  className?: string;
+  imgClassName?: string;
+}) {
+  const framing = framingFor(photo);
+  const source = sourceForPhoto(photo);
+  return (
+    <div
+      className={`relative overflow-hidden bg-muted ${className}`}
+      style={{ aspectRatio: aspectCssForFraming(photo, framing, collectionFormat) }}
+    >
+      {source ? (
+        <img
+          src={source}
+          alt=""
+          decoding="async"
+          loading="lazy"
+          draggable={false}
+          className={`absolute inset-0 h-full w-full select-none ${imgClassName}`}
+          style={{
+            objectFit: framing.fitMode === "contain" ? "contain" : "cover",
+            transform: `translate(${framing.offsetX * 35}%, ${framing.offsetY * 35}%) rotate(${framing.rotationDegrees}deg) scale(${framing.zoom})`,
+            transformOrigin: "center",
+          }}
+        />
+      ) : (
+        <div className="grid h-full w-full place-items-center text-xs text-muted-foreground">
+          Missing image
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FramingEditorModal({
+  photo,
+  collectionFormat,
+  onClose,
+  onSave,
+}: {
+  photo: Photo;
+  collectionFormat?: PostFormat;
+  onClose: () => void;
+  onSave: (framing: PhotoFraming | null) => void;
+}) {
+  const [draft, setDraft] = useState<PhotoFraming>(() => framingFor(photo));
+  const [dragStart, setDragStart] = useState<{
+    x: number;
+    y: number;
+    offsetX: number;
+    offsetY: number;
+  } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const frameRef = useRef<HTMLDivElement | null>(null);
+  const original = useMemo(() => framingFor(photo), [photo]);
+  const dirty = JSON.stringify(draft) !== JSON.stringify(original);
+  const source = sourceForPhoto(photo);
+
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        attemptClose();
+      }
+      if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+        event.preventDefault();
+        save();
+      }
+      if (event.key.startsWith("Arrow")) {
+        event.preventDefault();
+        const step = event.shiftKey ? 0.04 : 0.015;
+        setDraft((current) => ({
+          ...current,
+          offsetX: Math.max(
+            -1,
+            Math.min(
+              1,
+              current.offsetX +
+                (event.key === "ArrowRight" ? step : event.key === "ArrowLeft" ? -step : 0),
+            ),
+          ),
+          offsetY: Math.max(
+            -1,
+            Math.min(
+              1,
+              current.offsetY +
+                (event.key === "ArrowDown" ? step : event.key === "ArrowUp" ? -step : 0),
+            ),
+          ),
+          updatedAt: new Date().toISOString(),
+        }));
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
+
+  function attemptClose() {
+    if (dirty && !window.confirm("Discard unsaved framing changes?")) return;
+    onClose();
+  }
+
+  function update(partial: Partial<PhotoFraming>) {
+    setDraft((current) => ({
+      ...current,
+      ...partial,
+      rotationDegrees:
+        partial.rotationDegrees !== undefined
+          ? normalizedRotation(partial.rotationDegrees)
+          : current.rotationDegrees,
+      zoom: Math.max(0.5, Math.min(4, partial.zoom ?? current.zoom)),
+      offsetX: Math.max(-1, Math.min(1, partial.offsetX ?? current.offsetX)),
+      offsetY: Math.max(-1, Math.min(1, partial.offsetY ?? current.offsetY)),
+      updatedAt: new Date().toISOString(),
+    }));
+  }
+
+  function save() {
+    if (!source) {
+      setError("This photo couldn’t be opened for editing.");
+      return;
+    }
+    onSave(draft);
+  }
+
+  function reset() {
+    setDraft(defaultFraming());
+  }
+
+  function fit() {
+    update({ zoom: 1, offsetX: 0, offsetY: 0, fitMode: "contain" });
+  }
+
+  function onPointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setDragStart({
+      x: event.clientX,
+      y: event.clientY,
+      offsetX: draft.offsetX,
+      offsetY: draft.offsetY,
+    });
+  }
+
+  function onPointerMove(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!dragStart || !frameRef.current) return;
+    const rect = frameRef.current.getBoundingClientRect();
+    const dx = (event.clientX - dragStart.x) / Math.max(1, rect.width);
+    const dy = (event.clientY - dragStart.y) / Math.max(1, rect.height);
+    update({
+      offsetX: dragStart.offsetX + dx * 1.8,
+      offsetY: dragStart.offsetY + dy * 1.8,
+    });
+  }
+
+  function onPointerUp() {
+    setDragStart(null);
+  }
+
+  const cropOptions: { id: PhotoFraming["cropAspectRatio"]; label: string }[] = [
+    { id: "original", label: "Original" },
+    { id: "4:5", label: "Portrait 4:5" },
+    { id: "1:1", label: "Square" },
+    { id: "landscape", label: "Landscape" },
+    { id: "match", label: "Match collection" },
+  ];
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center bg-ink/70 p-0 backdrop-blur-sm sm:items-center sm:p-4">
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="framing-editor-title"
+        className="flex h-[100dvh] w-full max-w-3xl flex-col overflow-hidden bg-cream shadow-2xl sm:h-auto sm:max-h-[92dvh] sm:rounded-3xl"
+      >
+        <div className="flex items-center justify-between border-b border-ink/10 px-4 py-3">
+          <button type="button" onClick={attemptClose} className="chip bg-white text-ink">
+            Cancel
+          </button>
+          <div className="text-center">
+            <h2 id="framing-editor-title" className="font-display text-2xl">
+              Edit framing
+            </h2>
+            <p className="text-[11px] text-muted-foreground">Preview of final framing</p>
+          </div>
+          <button type="button" onClick={save} className="chip bg-ink text-cream">
+            Save
+          </button>
+        </div>
+
+        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-4 py-4">
+          <div className="grid min-h-[42dvh] place-items-center rounded-3xl bg-neutral-950/90 p-4">
+            <div
+              ref={frameRef}
+              className="relative max-h-[52dvh] w-full max-w-xl touch-none overflow-hidden rounded-2xl border-2 border-white/80 bg-black shadow-2xl"
+              style={{ aspectRatio: aspectCssForFraming(photo, draft, collectionFormat) }}
+              onPointerDown={onPointerDown}
+              onPointerMove={onPointerMove}
+              onPointerUp={onPointerUp}
+              onPointerCancel={onPointerUp}
+              onWheel={(event) => {
+                event.preventDefault();
+                update({ zoom: draft.zoom + (event.deltaY < 0 ? 0.08 : -0.08) });
+              }}
+              onDoubleClick={() => update({ zoom: draft.zoom > 1.05 ? 1 : 1.8 })}
+            >
+              <FramedPhotoPreview
+                photo={{ ...photo, framing: draft }}
+                collectionFormat={collectionFormat}
+                className="h-full w-full"
+              />
+              <div className="pointer-events-none absolute inset-0 border border-white/45" />
+            </div>
+          </div>
+
+          {error && (
+            <div className="mt-3 rounded-2xl bg-coral/10 px-3 py-2 text-sm text-coral">{error}</div>
+          )}
+
+          <div className="mt-4">
+            <div className="flex items-center justify-between">
+              <label htmlFor="framing-zoom" className="text-xs font-bold uppercase tracking-wider">
+                Zoom
+              </label>
+              <span className="text-xs text-muted-foreground" aria-live="polite">
+                {Math.round(draft.zoom * 100)}%
+              </span>
+            </div>
+            <input
+              id="framing-zoom"
+              type="range"
+              min="0.5"
+              max="4"
+              step="0.01"
+              value={draft.zoom}
+              onChange={(event) => update({ zoom: Number(event.target.value) })}
+              className="mt-2 w-full accent-coral"
+            />
+          </div>
+
+          <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-5">
+            {cropOptions.map((option) => (
+              <button
+                key={option.id}
+                type="button"
+                onClick={() => update({ cropAspectRatio: option.id })}
+                className={`rounded-2xl px-3 py-2 text-sm font-bold ring-1 transition ${
+                  draft.cropAspectRatio === option.id
+                    ? "bg-coral text-white ring-coral"
+                    : "bg-white text-ink ring-ink/10"
+                }`}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+
+          <div className="mt-4 grid grid-cols-5 gap-2 pb-[calc(1rem+env(safe-area-inset-bottom))]">
+            <button
+              type="button"
+              onClick={() =>
+                update({ rotationDegrees: normalizedRotation(draft.rotationDegrees - 90) })
+              }
+              className="grid h-12 place-items-center rounded-2xl bg-white font-bold ring-1 ring-ink/10"
+              aria-label="Rotate left"
+            >
+              <RotateCcw className="h-5 w-5" />
+            </button>
+            <button
+              type="button"
+              onClick={() =>
+                update({ rotationDegrees: normalizedRotation(draft.rotationDegrees + 90) })
+              }
+              className="grid h-12 place-items-center rounded-2xl bg-white font-bold ring-1 ring-ink/10"
+              aria-label="Rotate right"
+            >
+              <RotateCw className="h-5 w-5" />
+            </button>
+            <button
+              type="button"
+              onClick={() => update({ zoom: draft.zoom - 0.15 })}
+              className="grid h-12 place-items-center rounded-2xl bg-white font-bold ring-1 ring-ink/10"
+              aria-label="Zoom out"
+            >
+              <ZoomOut className="h-5 w-5" />
+            </button>
+            <button
+              type="button"
+              onClick={() => update({ zoom: draft.zoom + 0.15 })}
+              className="grid h-12 place-items-center rounded-2xl bg-white font-bold ring-1 ring-ink/10"
+              aria-label="Zoom in"
+            >
+              <ZoomIn className="h-5 w-5" />
+            </button>
+            <button
+              type="button"
+              onClick={reset}
+              className="grid h-12 place-items-center rounded-2xl bg-white font-bold ring-1 ring-ink/10"
+              aria-label="Reset framing"
+            >
+              Reset
+            </button>
+          </div>
+
+          <button type="button" onClick={fit} className="chip mx-auto mb-4 bg-white text-ink">
+            Fit full image
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ───────────── Final ───────────── */
 function FinalStage() {
   const { state, dispatch } = useDumpDeck();
   const [ordering, setOrdering] = useState(false);
+  const [editingFraming, setEditingFraming] = useState<Photo | null>(null);
+  const framingEnabled = finalFramingEditorEnabled();
+  const collectionFormat = state.settings.formats[0] ?? "portrait";
   const pinnedCover = state.finalOrder.find((photo) => photo.id === state.pinnedCoverId);
 
   function removeSlide(id: string) {
@@ -5215,31 +5608,48 @@ function FinalStage() {
           {state.finalOrder.map((photo, index) => {
             const pinned = photo.id === state.pinnedCoverId;
             return (
-              <button
+              <div
                 key={photo.id}
-                type="button"
-                onClick={() => (pinned ? unpinCover() : pinCover(photo.id))}
                 className={`relative h-20 w-16 shrink-0 overflow-hidden rounded-2xl bg-muted transition ${
                   pinned ? "ring-4 ring-coral" : "ring-1 ring-ink/10"
                 }`}
-                aria-label={pinned ? `Unpin ${photo.name} as cover` : `Pin ${photo.name} as cover`}
               >
-                <img
-                  src={photo.previewUrl ?? photo.url}
-                  alt=""
-                  decoding="async"
-                  loading="lazy"
-                  className="h-full w-full object-cover"
-                />
+                <button
+                  type="button"
+                  onClick={() => (pinned ? unpinCover() : pinCover(photo.id))}
+                  className="absolute inset-0"
+                  aria-label={
+                    pinned ? `Unpin ${photo.name} as cover` : `Pin ${photo.name} as cover`
+                  }
+                >
+                  <FramedPhotoPreview
+                    photo={photo}
+                    collectionFormat={collectionFormat}
+                    className="h-full w-full"
+                  />
+                </button>
                 <span className="absolute left-1 top-1 rounded-full bg-white/90 px-1.5 py-0.5 text-[10px] font-bold text-ink">
                   {index + 1}
                 </span>
+                {framingEnabled && (
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setEditingFraming(photo);
+                    }}
+                    className="absolute right-1 top-1 grid h-6 w-6 place-items-center rounded-full bg-white/90 text-ink shadow-sm"
+                    aria-label={`Edit framing for ${photo.name}`}
+                  >
+                    <Crop className="h-3 w-3" />
+                  </button>
+                )}
                 {pinned && (
                   <span className="absolute inset-x-1 bottom-1 inline-flex items-center justify-center gap-1 rounded-full bg-coral px-1.5 py-0.5 text-[9px] font-bold text-white">
                     <Pin className="h-2.5 w-2.5" /> Cover
                   </span>
                 )}
-              </button>
+              </div>
             );
           })}
         </div>
@@ -5255,6 +5665,7 @@ function FinalStage() {
             })
           }
           onRemove={removeSlide}
+          onEditFraming={framingEnabled ? (photo) => setEditingFraming(photo) : undefined}
         />
       </div>
 
@@ -5266,6 +5677,18 @@ function FinalStage() {
           Finalize & export →
         </Button>
       </StickyAction>
+      {editingFraming && (
+        <FramingEditorModal
+          photo={editingFraming}
+          collectionFormat={collectionFormat}
+          onClose={() => setEditingFraming(null)}
+          onSave={(framing) => {
+            dispatch({ type: "updatePhotoFraming", id: editingFraming.id, framing });
+            setEditingFraming(null);
+            toast.success("Framing saved");
+          }}
+        />
+      )}
     </section>
   );
 }
@@ -5387,6 +5810,64 @@ function imageFromUrl(src: string) {
   });
 }
 
+async function renderSavedFramingToCanvas({
+  photo,
+  aspect,
+  width = INSTAGRAM_EXPORT_WIDTH,
+}: {
+  photo: Photo;
+  aspect?: { width: number; height: number };
+  width?: number;
+}) {
+  const source = sourceForPhoto(photo);
+  if (!source) throw new Error("Photo is missing a usable image source.");
+  if (source.startsWith("blob:")) {
+    throw new Error("Photo still uses a temporary browser URL. Save/reopen before exporting.");
+  }
+
+  const image = await imageFromUrl(source);
+  const framing = framingFor(photo);
+  const cropAspect =
+    aspect?.width && aspect?.height
+      ? aspect.width / aspect.height
+      : aspectNumberForFraming(photo, framing);
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = Math.max(1, Math.round(width / cropAspect));
+  const ctx = canvas.getContext("2d", { alpha: false });
+  if (!ctx) throw new Error("Browser could not create a framing canvas.");
+
+  ctx.fillStyle = "#f8f3ea";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const rotated = framing.rotationDegrees === 90 || framing.rotationDegrees === 270;
+  const effectiveWidth = rotated ? image.naturalHeight : image.naturalWidth;
+  const effectiveHeight = rotated ? image.naturalWidth : image.naturalHeight;
+  const fitScale =
+    framing.fitMode === "contain"
+      ? Math.min(canvas.width / effectiveWidth, canvas.height / effectiveHeight)
+      : Math.max(canvas.width / effectiveWidth, canvas.height / effectiveHeight);
+  const scale = fitScale * framing.zoom;
+  const offsetX = framing.offsetX * canvas.width * 0.35;
+  const offsetY = framing.offsetY * canvas.height * 0.35;
+
+  ctx.save();
+  ctx.translate(canvas.width / 2 + offsetX, canvas.height / 2 + offsetY);
+  ctx.rotate((framing.rotationDegrees * Math.PI) / 180);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(
+    image,
+    (-image.naturalWidth * scale) / 2,
+    (-image.naturalHeight * scale) / 2,
+    image.naturalWidth * scale,
+    image.naturalHeight * scale,
+  );
+  ctx.restore();
+
+  return canvas;
+}
+
 async function exportPhotoForInstagram({
   photo,
   index,
@@ -5398,13 +5879,7 @@ async function exportPhotoForInstagram({
   aspect: { width: number; height: number };
   mode: InstagramPhotoMode;
 }) {
-  const source = sourceForPhoto(photo);
-  if (!source) throw new Error("Photo is missing a usable image source.");
-  if (source.startsWith("blob:")) {
-    throw new Error("Photo still uses a temporary browser URL. Save/reopen before exporting.");
-  }
-
-  const image = await imageFromUrl(source);
+  const framedCanvas = await renderSavedFramingToCanvas({ photo });
   const canvas = document.createElement("canvas");
   const size = canvasSizeForAspect(aspect);
   canvas.width = size.width;
@@ -5414,32 +5889,32 @@ async function exportPhotoForInstagram({
   ctx.fillStyle = "#f8f3ea";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  const imageRatio = image.naturalWidth / Math.max(1, image.naturalHeight);
+  const imageRatio = framedCanvas.width / Math.max(1, framedCanvas.height);
   const canvasRatio = canvas.width / Math.max(1, canvas.height);
   const scale =
     mode === "fill"
-      ? Math.max(canvas.width / image.naturalWidth, canvas.height / image.naturalHeight)
+      ? Math.max(canvas.width / framedCanvas.width, canvas.height / framedCanvas.height)
       : Math.min(
           1,
-          Math.min(canvas.width / image.naturalWidth, canvas.height / image.naturalHeight),
+          Math.min(canvas.width / framedCanvas.width, canvas.height / framedCanvas.height),
         );
-  let drawWidth = image.naturalWidth * scale;
-  let drawHeight = image.naturalHeight * scale;
+  let drawWidth = framedCanvas.width * scale;
+  let drawHeight = framedCanvas.height * scale;
 
   if (mode === "fit") {
     const fitScale =
       imageRatio > canvasRatio
-        ? canvas.width / image.naturalWidth
-        : canvas.height / image.naturalHeight;
-    drawWidth = image.naturalWidth * Math.min(1, fitScale);
-    drawHeight = image.naturalHeight * Math.min(1, fitScale);
+        ? canvas.width / framedCanvas.width
+        : canvas.height / framedCanvas.height;
+    drawWidth = framedCanvas.width * Math.min(1, fitScale);
+    drawHeight = framedCanvas.height * Math.min(1, fitScale);
   }
 
   const x = (canvas.width - drawWidth) / 2;
   const y = (canvas.height - drawHeight) / 2;
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
-  ctx.drawImage(image, x, y, drawWidth, drawHeight);
+  ctx.drawImage(framedCanvas, x, y, drawWidth, drawHeight);
 
   const blob = await new Promise<Blob>((resolve, reject) => {
     canvas.toBlob(
@@ -5450,6 +5925,8 @@ async function exportPhotoForInstagram({
   });
   canvas.width = 1;
   canvas.height = 1;
+  framedCanvas.width = 1;
+  framedCanvas.height = 1;
 
   const fileName = `FotoFairy-${String(index + 1).padStart(2, "0")}.jpg`;
   return new File([blob], fileName, { type: "image/jpeg", lastModified: Date.now() });
@@ -5558,6 +6035,7 @@ function ExportStage() {
     captionCopied: false,
   });
   const shareEnabled = instagramShareEnabled();
+  const collectionFormat = state.settings.formats[0] ?? "portrait";
   const aiGeneratedTitle = useMemo(
     () =>
       state.collectionTitleMetadata?.aiGeneratedTitle ??
@@ -5753,12 +6231,10 @@ function ExportStage() {
               className="relative overflow-hidden rounded-3xl bg-muted shadow-xl"
               style={{ aspectRatio: aspect }}
             >
-              <img
-                src={p.previewUrl ?? p.url}
-                alt=""
-                decoding="async"
-                loading="lazy"
-                className="h-full w-full object-cover"
+              <FramedPhotoPreview
+                photo={p}
+                collectionFormat={collectionFormat}
+                className="h-full w-full"
               />
               <button
                 type="button"

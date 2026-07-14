@@ -62,3 +62,10 @@ Direct Instagram API publishing is intentionally disabled until a Meta developer
 app, OAuth redirect, eligible Creator/Business test account, App Review, privacy
 policy, and data-deletion flow are ready. See
 [docs/instagram-v2-publishing.md](docs/instagram-v2-publishing.md).
+
+## Final photo framing
+
+`VITE_FINAL_FRAMING_EDITOR_ENABLED=true` enables nondestructive framing on the
+final collection screen. FotoFairy stores framing metadata on each saved photo
+and applies it during preview, download, and Instagram export without replacing
+the original uploaded file.

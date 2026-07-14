@@ -333,6 +333,17 @@ export type Photo = {
   unifiedAnalysis?: UnifiedImageAnalysis;
   kept?: boolean;
   sourceMetadata?: ImageSourceMetadata;
+  framing?: PhotoFraming;
+};
+
+export type PhotoFraming = {
+  rotationDegrees: 0 | 90 | 180 | 270;
+  cropAspectRatio: "original" | "4:5" | "1:1" | "landscape" | "match";
+  zoom: number;
+  offsetX: number;
+  offsetY: number;
+  fitMode: "contain" | "cover";
+  updatedAt: string;
 };
 
 export type ImageSourceMetadata = {
